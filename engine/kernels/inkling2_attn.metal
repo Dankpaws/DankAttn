@@ -21,6 +21,10 @@ static inline uint frag_off(uint m, uint k, uint K) {
   return ((m >> 4) * (K >> 5) + (k >> 5)) * 512 + l * 16 + i;
 }
 
+#ifndef ATT_FAST
+#define ATT_FAST 1
+#endif
+
 struct AttnPfArgs {
   uint M, nh, nkv, hd, rel_extent, pos0, cap, window;
 };
@@ -193,10 +197,10 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
 
     const bool maybe_rel = (pos_hi >= j0) && ((pos_lo < j0 + a.rel_extent) || (pos_hi - j0 < a.rel_extent));
 #if ATT_LOCAL
-    const bool full_tile = (j0 + 31u <= pos_lo) && (pos_hi - j0 < a.window) &&
+    const bool full_tile = ATT_FAST && (j0 + 31u <= pos_lo) && (pos_hi - j0 < a.window) &&
                            (pos_hi - j0 < a.rel_extent) && (row0 + 16u <= a.M);
 #else
-    const bool full_tile = (!maybe_rel) && (j0 + 31u <= pos_lo) && (row0 + 16u <= a.M);
+    const bool full_tile = ATT_FAST && (!maybe_rel) && (j0 + 31u <= pos_lo) && (row0 + 16u <= a.M);
 #endif
     float s[16];
     if (full_tile) {
@@ -257,7 +261,7 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
       float bs = 0.0f;
       for (int i = 0; i < 16; i++) {
         if (((i >> 2) & 1) == r) {
-          const float p = (full_tile || s[i] > -1e29f) ? exp(s[i] - mn) : 0.0f;
+          const float p = (s[i] > -1e29f) ? exp(s[i] - mn) : 0.0f;
           s[i] = p;
           bs += p;
         }

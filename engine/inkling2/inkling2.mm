@@ -581,9 +581,10 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   std::string attn_src = read_text(kdir + "inkling2_attn.metal");
   std::string mm_src = read_text(kdir + "mm2.metal");
 
-  p_attn_pf_local = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}});
-  p_attn_pf_global_bf16 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}});
-  p_attn_pf_global_kv8 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}});
+  const char* pf_fast = (getenv("INK_PF_FAST") && atoi(getenv("INK_PF_FAST")) == 0) ? "0" : "1";
+  p_attn_pf_local = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}, {"ATT_FAST", pf_fast}});
+  p_attn_pf_global_bf16 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}, {"ATT_FAST", pf_fast}});
+  p_attn_pf_global_kv8 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}, {"ATT_FAST", pf_fast}});
   p_attn_dec_local = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}});
   p_attn_dec_global_bf16 = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}});
   p_attn_dec_global_kv8 = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}});

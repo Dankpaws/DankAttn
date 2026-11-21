@@ -71,6 +71,32 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (cmd == "lgdump") {
+      // lgdump <ids.bin> <n> <out.bin>: final-row logits after chunked prefill (MP) and after sequential M=1.
+      if (argc < 6) mtl::die("lgdump <ids.bin> <n> <out.bin>");
+      auto all = read_ids_bin(argv[3]);
+      const uint32_t n = std::min<uint32_t>(uint32_t(atoi(argv[4])), uint32_t(all.size()));
+      std::vector<float> l_pf, l_seq;
+      std::vector<uint32_t> chunk;
+      uint32_t pf_tok = 0;
+      for (uint32_t i = 0; i < n; i += ink2::MP) {
+        const uint32_t c = std::min(ink2::MP, n - i);
+        chunk.assign(all.begin() + i, all.begin() + i + c);
+        pf_tok = M.step(chunk, nullptr, (i + c == n) ? &l_pf : nullptr).back();
+      }
+      M.reset();
+      uint32_t seq_tok = 0;
+      for (uint32_t i = 0; i < n; i++) seq_tok = M.step({all[i]}, nullptr, (i + 1 == n) ? &l_seq : nullptr)[0];
+      float md = 0.0f;
+      for (size_t i = 0; i < l_pf.size(); i++) md = std::max(md, std::fabs(l_pf[i] - l_seq[i]));
+      FILE* f = fopen(argv[5], "wb");
+      fwrite(l_pf.data(), 4, l_pf.size(), f);
+      fwrite(l_seq.data(), 4, l_seq.size(), f);
+      fclose(f);
+      printf("lgdump n=%u pf_tok=%u seq_tok=%u max_logit_diff=%.3e\n", n, pf_tok, seq_tok, md);
+      return 0;
+    }
+
     if (cmd == "vtest") {
       std::vector<float> l_batch, l_seq;
       auto ob = M.step(paris_ids, nullptr, &l_batch);
