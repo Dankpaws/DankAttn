@@ -55,6 +55,7 @@ struct KvConvArgs {
 };
 struct AttnArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, is_local, n_splits, kv8; };
 struct AttnPfArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window; };
+struct AttnDecArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, n_splits; };
 struct PostConvArgs { uint32_t M, H, ks, is_boundary, is_mlp, b_slot, b_stride; };
 struct RouteArgs { uint32_t M, H, E, topk; float route_scale; };
 struct PlanArgs { uint32_t M, E, topk, gx_gu, gx_dn; };
@@ -186,6 +187,12 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   dir = pack_dir;
   cap = max_cap;
   use_kv8 = kv8;
+  {
+    NSString* dname = [C.dev name];
+    const bool big_gpu = dname && ([dname containsString:@"Ultra"] || [dname containsString:@"Max"]);
+    nsp_local = big_gpu ? 12u : 8u;
+    nsp_global = big_gpu ? 24u : 8u;
+  }
 
   NSData* jd = [NSData dataWithContentsOfFile:@((dir + "/manifest.json").c_str())];
   if (!jd) mtl::die(("cannot read " + dir + "/manifest.json").c_str());
@@ -412,6 +419,8 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_moe_out = C.buf(MP * H * sizeof(float));
   b_logits = C.buf(MAXM * vocab_pad * sizeof(float));
   b_tok_out = C.buf(MAXM * sizeof(uint32_t));
+  b_argmax_v = C.buf(MAXM * 64u * sizeof(float));
+  b_argmax_i = C.buf(MAXM * 64u * sizeof(uint32_t));
   b_dummy = C.buf(64);
 
   // Optional DSpark MTP drafter overlay
@@ -509,6 +518,9 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_attn_pf_local = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}});
   p_attn_pf_global_bf16 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}});
   p_attn_pf_global_kv8 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}});
+  p_attn_dec_local = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}});
+  p_attn_dec_global_bf16 = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}});
+  p_attn_dec_global_kv8 = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}});
 
   p_embed = C.pipe(ink_src, "ink_embed");
   p_attn_res = C.pipe(ink_src, "ink_attn_res");
@@ -524,7 +536,8 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_scores = C.pipe(ink_src, "ink_moe_scores");
   p_route = C.pipe(ink_src, "ink_moe_route");
   p_moe_accum = C.pipe(ink_src, "ink_moe_accum");
-  p_softcap_argmax = C.pipe(ink_src, "ink_softcap_argmax");
+  p_softcap_argmax_p1 = C.pipe(ink_src, "ink_softcap_argmax_p1");
+  p_softcap_argmax_p2 = C.pipe(ink_src, "ink_softcap_argmax_p2");
   p_copy = C.pipe(ink_src, "ink_copy_f32");
   p_topk_pf = C.pipe(ink_src, "ink_moe_topk_pf");
   p_plan_pf = C.pipe(ink_src, "ink_moe_plan_pf");
@@ -883,8 +896,11 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       barrier();
       flush_prof("attn");
     } else {
-      AttnArgs aa{M, nh, nkv, hd, rel_extent, pos, st.cap, window, ly.is_local ? 1u : 0u, ASPLITS, st.kv8 ? 1u : 0u};
-      [enc setComputePipelineState:p_attn_split];
+      const uint32_t nsp = ly.is_local ? nsp_local : nsp_global;
+      AttnDecArgs da{M, nh, nkv, hd, rel_extent, pos, st.cap, window, nsp};
+      id<MTLComputePipelineState> p_dec = ly.is_local ? p_attn_dec_local
+                                                      : (st.kv8 ? p_attn_dec_global_kv8 : p_attn_dec_global_bf16);
+      [enc setComputePipelineState:p_dec];
       [enc setBuffer:b_Q offset:0 atIndex:0];
       [enc setBuffer:(st.k_cache ? st.k_cache : b_dummy) offset:0 atIndex:1];
       [enc setBuffer:(st.v_cache ? st.v_cache : b_dummy) offset:0 atIndex:2];
@@ -894,10 +910,11 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       [enc setBuffer:(st.k_sc ? st.k_sc : b_dummy) offset:0 atIndex:6];
       [enc setBuffer:(st.v_i8 ? st.v_i8 : b_dummy) offset:0 atIndex:7];
       [enc setBuffer:(st.v_sc ? st.v_sc : b_dummy) offset:0 atIndex:8];
-      [enc setBytes:&aa length:sizeof(aa) atIndex:9];
-      [enc dispatchThreadgroups:MTLSizeMake(M, nh, ASPLITS) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc setBytes:&da length:sizeof(da) atIndex:9];
+      [enc dispatchThreadgroups:MTLSizeMake(M, nkv, nsp) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       barrier();
 
+      AttnArgs aa{M, nh, nkv, hd, rel_extent, pos, st.cap, window, ly.is_local ? 1u : 0u, nsp, st.kv8 ? 1u : 0u};
       [enc setComputePipelineState:p_attn_reduce];
       [enc setBuffer:b_attn_part offset:0 atIndex:0];
       [enc setBuffer:b_gate offset:0 atIndex:1];
@@ -1184,13 +1201,20 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     barrier();
     flush_prof("lm_head");
 
-    [enc setComputePipelineState:p_softcap_argmax];
+    [enc setComputePipelineState:p_softcap_argmax_p1];
     [enc setBuffer:b_logits offset:0 atIndex:0];
-    [enc setBuffer:b_tok_out offset:0 atIndex:1];
-    [enc setBytes:&vocab_valid length:4 atIndex:2];
-    [enc setBytes:&vocab_pad length:4 atIndex:3];
-    [enc setBytes:&logit_softcap length:4 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc setBuffer:b_argmax_v offset:0 atIndex:1];
+    [enc setBuffer:b_argmax_i offset:0 atIndex:2];
+    [enc setBytes:&vocab_valid length:4 atIndex:3];
+    [enc setBytes:&vocab_pad length:4 atIndex:4];
+    [enc setBytes:&logit_softcap length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 64, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+    [enc setComputePipelineState:p_softcap_argmax_p2];
+    [enc setBuffer:b_argmax_v offset:0 atIndex:0];
+    [enc setBuffer:b_argmax_i offset:0 atIndex:1];
+    [enc setBuffer:b_tok_out offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     flush_prof("argmax");
   } else {
     [enc setComputePipelineState:p_rms_frag];
@@ -1208,13 +1232,20 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     barrier();
     flush_prof("lm_head");
 
-    [enc setComputePipelineState:p_softcap_argmax];
+    [enc setComputePipelineState:p_softcap_argmax_p1];
     [enc setBuffer:b_logits offset:0 atIndex:0];
-    [enc setBuffer:b_tok_out offset:0 atIndex:1];
-    [enc setBytes:&vocab_valid length:4 atIndex:2];
-    [enc setBytes:&vocab_pad length:4 atIndex:3];
-    [enc setBytes:&logit_softcap length:4 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc setBuffer:b_argmax_v offset:0 atIndex:1];
+    [enc setBuffer:b_argmax_i offset:0 atIndex:2];
+    [enc setBytes:&vocab_valid length:4 atIndex:3];
+    [enc setBytes:&vocab_pad length:4 atIndex:4];
+    [enc setBytes:&logit_softcap length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(M, 64, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+    [enc setComputePipelineState:p_softcap_argmax_p2];
+    [enc setBuffer:b_argmax_v offset:0 atIndex:0];
+    [enc setBuffer:b_argmax_i offset:0 atIndex:1];
+    [enc setBuffer:b_tok_out offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     flush_prof("argmax");
   }
 

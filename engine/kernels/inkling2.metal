@@ -356,7 +356,7 @@ kernel void ink_kv_conv_cache(device const float* in_kv [[buffer(0)]],
     y = ((sw0 + dw[0]) * x + (sw1 + dw[1]) * h2 + (sw2 + dw[2]) * h1 + (sw3 + dw[3]) * h0 + x) * inv_denom;
   }
 
-  threadgroup float sm[4];
+  threadgroup float sm[4], sm2[4];
   float n2 = simd_sum(y * y);
   if ((tid & 31u) == 0u) sm[tid >> 5] = n2;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -369,16 +369,16 @@ kernel void ink_kv_conv_cache(device const float* in_kv [[buffer(0)]],
   const uint slot = (a.pos0 + m) % a.cap;
   if (a.kv8) {
     float am = simd_max(fabs(v));
-    if ((tid & 31u) == 0u) sm[tid >> 5] = am;
+    if ((tid & 31u) == 0u) sm2[tid >> 5] = am;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-      const float mx = max(max(sm[0], sm[1]), max(sm[2], sm[3]));
+      const float mx = max(max(sm2[0], sm2[1]), max(sm2[2], sm2[3]));
       const half sc = half(max(mx / 127.0f, 1e-6f));
-      sm[0] = float(sc);
+      sm2[0] = float(sc);
       kv_sc[size_t(slot) * a.nkv + h] = sc;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int q = int(clamp(rint(v / sm[0]), -127.0f, 127.0f));
+    const int q = int(clamp(rint(v / sm2[0]), -127.0f, 127.0f));
     kv_i8[(size_t(slot) * a.nkv + h) * a.hd + tid] = char(q);
   } else {
     kv_cache[(size_t(slot) * a.nkv + h) * a.hd + tid] = bfloat(v);
@@ -693,35 +693,63 @@ kernel void ink_moe_accum(device const float* exp_y [[buffer(0)]],
   out[size_t(row) * H + c] = acc;
 }
 
-// 11. Final logit softcap (30.0 * tanh(x / 30.0)) + greedy argmax.
-// Grid: (M, 1, 1), TG: 256 threads.
-kernel void ink_softcap_argmax(device float* logits [[buffer(0)]], device uint* tok_out [[buffer(1)]],
-                               constant uint& V_valid [[buffer(2)]], constant uint& V_pad [[buffer(3)]],
-                               constant float& cap [[buffer(4)]],
-                               uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                               uint tpg [[threads_per_threadgroup]]) {
+// 11. Parallel 2-stage final logit softcap (30.0 * tanh(x / 30.0)) + greedy argmax.
+// Stage 1: Grid (M, 64, 1), TG 256 threads -> 16,384 threads/row!
+kernel void ink_softcap_argmax_p1(device float* logits [[buffer(0)]],
+                                  device float* part_v [[buffer(1)]],
+                                  device uint* part_i [[buffer(2)]],
+                                  constant uint& V_valid [[buffer(3)]], constant uint& V_pad [[buffer(4)]],
+                                  constant float& cap [[buffer(5)]],
+                                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   threadgroup float sm_v[8];
   threadgroup uint sm_i[8];
+  const uint row = tg.x, blk = tg.y;
   device float* lr = logits + size_t(row) * V_pad;
   float bv = -1e30f;
   uint bi = 0u;
   const float inv_cap = 1.0f / cap;
-  for (uint v = tid; v < V_valid; v += tpg) {
+  const uint stride = 64u * 256u;
+  for (uint v = blk * 256u + tid; v < V_valid; v += stride) {
     const float val = tanh(lr[v] * inv_cap) * cap;
     lr[v] = val;
-    if (val > bv) { bv = val; bi = v; }
+    if (val > bv || (val == bv && v < bi)) { bv = val; bi = v; }
   }
   for (ushort d = 16; d > 0; d >>= 1) {
     const float ov = simd_shuffle_down(bv, d);
     const uint oi = simd_shuffle_down(bi, d);
-    if (ov > bv) { bv = ov; bi = oi; }
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
   }
   if ((tid & 31u) == 0u) { sm_v[tid >> 5] = bv; sm_i[tid >> 5] = bi; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0u) {
     float fv = sm_v[0]; uint fi = sm_i[0];
-    for (uint i = 1; i < (tpg >> 5); i++) if (sm_v[i] > fv) { fv = sm_v[i]; fi = sm_i[i]; }
-    tok_out[row] = fi;
+    for (uint i = 1; i < 8u; i++) {
+      if (sm_v[i] > fv || (sm_v[i] == fv && sm_i[i] < fi)) { fv = sm_v[i]; fi = sm_i[i]; }
+    }
+    part_v[size_t(row) * 64u + blk] = fv;
+    part_i[size_t(row) * 64u + blk] = fi;
+  }
+}
+
+// Stage 2: Grid (M, 1, 1), TG 64 threads -> reduces 64 partials to tok_out[row].
+kernel void ink_softcap_argmax_p2(device const float* part_v [[buffer(0)]],
+                                  device const uint* part_i [[buffer(1)]],
+                                  device uint* tok_out [[buffer(2)]],
+                                  uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float sm_v[2];
+  threadgroup uint sm_i[2];
+  float bv = part_v[size_t(row) * 64u + tid];
+  uint bi = part_i[size_t(row) * 64u + tid];
+  for (ushort d = 16; d > 0; d >>= 1) {
+    const float ov = simd_shuffle_down(bv, d);
+    const uint oi = simd_shuffle_down(bi, d);
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+  }
+  if ((tid & 31u) == 0u) { sm_v[tid >> 5] = bv; sm_i[tid >> 5] = bi; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    const bool pick1 = (sm_v[1] > sm_v[0]) || (sm_v[1] == sm_v[0] && sm_i[1] < sm_i[0]);
+    tok_out[row] = pick1 ? sm_i[1] : sm_i[0];
   }
 }
 

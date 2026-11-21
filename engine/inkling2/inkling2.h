@@ -15,7 +15,7 @@ constexpr uint32_t MAXM = 16;   // rows per decode / verify step (mm2)
 constexpr uint32_t MP = 256;    // max rows per chunked prefill step (mmp / mmpg)
 constexpr uint32_t PF_COMPACT = 4096;  // max compact padded MoE rows for MP=256 (256*8 + 128*15 = 3968)
 constexpr uint32_t MAX_BLOCKS = 12;
-constexpr uint32_t ASPLITS = 8; // fixed attention key splits (bit-exact across M)
+constexpr uint32_t ASPLITS = 24; // max attention key splits (fixed per layer -> bit-exact across M)
 
 struct Lin {
   id<MTLBuffer> w = nil, s = nil;
@@ -78,6 +78,7 @@ struct Model {
   uint32_t E = 128, topk = 8, I_moe = 1152, ks = 4, n_per_block = 6;
   uint32_t core_start = 6, core_end = 18, num_passes = 3, gate_rank = 64;
   uint32_t eos = 200006, cap = 32768;
+  uint32_t nsp_local = 8, nsp_global = 8;
   bool use_kv8 = true;
   float eps = 1e-6f, qk_clip = 22.627417f, rel_clip = 8.0f;
   float log_n_floor = 8192.0f, log_alpha = 0.1f, route_scale = 8.0f;
@@ -112,7 +113,8 @@ struct Model {
   id<MTLComputePipelineState> p_embed, p_attn_res, p_mg_prep, p_mg_down, p_mg_apply, p_rms_frag;
   id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
-  id<MTLComputePipelineState> p_scores, p_route, p_moe_accum, p_softcap_argmax, p_copy;
+  id<MTLComputePipelineState> p_attn_dec_local, p_attn_dec_global_bf16, p_attn_dec_global_kv8;
+  id<MTLComputePipelineState> p_scores, p_route, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
   id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
   id<MTLComputePipelineState> p_mmp_w8;
@@ -133,7 +135,7 @@ struct Model {
   id<MTLBuffer> b_qgrs, b_k_raw, b_v_raw, b_Q, b_rel_logits, b_gate, b_sinks, b_o_out;
   id<MTLBuffer> b_top_idx, b_top_w, b_slots, b_nslots, b_rmask;
   id<MTLBuffer> b_roff, b_rcnt, b_rlist, b_rpos, b_wtile, b_ind_gu, b_ind_dn;
-  id<MTLBuffer> b_moe_y, b_moe_out, b_logits, b_tok_out;
+  id<MTLBuffer> b_moe_y, b_moe_out, b_logits, b_tok_out, b_argmax_v, b_argmax_i;
   id<MTLBuffer> b_dummy;
 
   // DSpark scratch buffers

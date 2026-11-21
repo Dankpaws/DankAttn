@@ -277,3 +277,151 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
     out_frag[frag_off(qr, h * HD + dd, K_tot)] = bfloat(val);
   }
 }
+
+// GQA G=3 Shared-KV Split-K Decode/Verify Attention (compile-time ATT_LOCAL / ATT_KV8, modulo-free ring).
+// Each TG handles 1 KV head x 3 Q heads -> 3x fewer KV cache DRAM reads, 100% bit-exact across M.
+// Grid: (M, nkv, n_splits), TG: 128 threads (4 simdgroups).
+struct AttnDecArgs {
+  uint M, nh, nkv, hd, rel_extent, pos0, cap, window, n_splits;
+};
+kernel void ink_attn_split_gqa(device const float4* Q [[buffer(0)]],         // [M, nh, 32]
+                               device const bfloat4* K_cache [[buffer(1)]],  // [cap, nkv, 32]
+                               device const bfloat4* V_cache [[buffer(2)]],  // [cap, nkv, 32]
+                               device const float* rel_logits [[buffer(3)]], // [M, nh, rel_extent]
+                               device float* part_out [[buffer(4)]],         // [M, nh, n_splits, 130]
+                               device const char4* K_i8 [[buffer(5)]],
+                               device const half* K_sc [[buffer(6)]],
+                               device const char4* V_i8 [[buffer(7)]],
+                               device const half* V_sc [[buffer(8)]],
+                               constant AttnDecArgs& a [[buffer(9)]],
+                               uint3 tg [[threadgroup_position_in_grid]],
+                               ushort tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, kvh = tg.y, sp = tg.z;
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint h0 = kvh * 3u;
+  const uint pos = a.pos0 + row;
+#if ATT_LOCAL
+  const uint t_start = (pos + 1u > a.window) ? (pos + 1u - a.window) : 0u;
+#else
+  const uint t_start = 0u;
+#endif
+  const uint total_k = pos - t_start + 1u;
+  const uint per_sp = (total_k + a.n_splits - 1u) / a.n_splits;
+  const uint t_lo = t_start + sp * per_sp;
+  const uint t_hi = min(pos + 1u, t_lo + per_sp);
+
+  const float scale = rsqrt(float(a.hd));
+  const size_t q_base = size_t(row) * a.nh + h0;
+  const float4 q0 = Q[(q_base + 0u) * 32u + lane] * scale;
+  const float4 q1 = Q[(q_base + 1u) * 32u + lane] * scale;
+  const float4 q2 = Q[(q_base + 2u) * 32u + lane] * scale;
+  device const float* rl0 = rel_logits + (q_base + 0u) * a.rel_extent;
+  device const float* rl1 = rel_logits + (q_base + 1u) * a.rel_extent;
+  device const float* rl2 = rel_logits + (q_base + 2u) * a.rel_extent;
+
+  float m0 = -1e30f, l0 = 0.0f; float4 o0 = float4(0.0f);
+  float m1 = -1e30f, l1 = 0.0f; float4 o1 = float4(0.0f);
+  float m2 = -1e30f, l2 = 0.0f; float4 o2 = float4(0.0f);
+
+  uint t = t_lo + sg;
+  uint slot = (t < t_hi) ? (t % a.cap) : 0u;
+  for (; t < t_hi; t += 4u) {
+    const size_t sc_off = size_t(slot) * a.nkv + kvh;
+    const size_t kv_off = sc_off * 32u + lane;
+#if ATT_KV8
+    const float4 k4 = float4(K_i8[kv_off]);
+    const float ksc = float(K_sc[sc_off]);
+    float s0 = simd_sum(dot(q0, k4)) * ksc;
+    float s1 = simd_sum(dot(q1, k4)) * ksc;
+    float s2 = simd_sum(dot(q2, k4)) * ksc;
+#else
+    const float4 k4 = float4(K_cache[kv_off]);
+    float s0 = simd_sum(dot(q0, k4));
+    float s1 = simd_sum(dot(q1, k4));
+    float s2 = simd_sum(dot(q2, k4));
+#endif
+    const uint dist = pos - t;
+    if (dist < a.rel_extent) {
+      s0 += rl0[dist];
+      s1 += rl1[dist];
+      s2 += rl2[dist];
+    }
+#if ATT_KV8
+    const float4 v4 = float4(V_i8[kv_off]);
+    const float vsc = float(V_sc[sc_off]);
+#else
+    const float4 v4 = float4(V_cache[kv_off]);
+#endif
+    {
+      const float mn = max(m0, s0);
+      const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f;
+      const float p = exp(s0 - mn);
+#if ATT_KV8
+      o0 = fma(p * vsc, v4, o0 * al);
+#else
+      o0 = fma(p, v4, o0 * al);
+#endif
+      l0 = l0 * al + p;
+      m0 = mn;
+    }
+    {
+      const float mn = max(m1, s1);
+      const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f;
+      const float p = exp(s1 - mn);
+#if ATT_KV8
+      o1 = fma(p * vsc, v4, o1 * al);
+#else
+      o1 = fma(p, v4, o1 * al);
+#endif
+      l1 = l1 * al + p;
+      m1 = mn;
+    }
+    {
+      const float mn = max(m2, s2);
+      const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f;
+      const float p = exp(s2 - mn);
+#if ATT_KV8
+      o2 = fma(p * vsc, v4, o2 * al);
+#else
+      o2 = fma(p, v4, o2 * al);
+#endif
+      l2 = l2 * al + p;
+      m2 = mn;
+    }
+    slot += 4u;
+    if (slot >= a.cap) slot -= a.cap;
+  }
+
+  threadgroup float sm_m[3][4], sm_l[3][4];
+  threadgroup float4 sm_o[3][4][32];
+
+  if (lane == 0u) {
+    sm_m[0][sg] = m0; sm_l[0][sg] = l0;
+    sm_m[1][sg] = m1; sm_l[1][sg] = l1;
+    sm_m[2][sg] = m2; sm_l[2][sg] = l2;
+  }
+  sm_o[0][sg][lane] = o0;
+  sm_o[1][sg][lane] = o1;
+  sm_o[2][sg][lane] = o2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (sg < 3u) {
+    const uint g = sg;
+    float fm = -1e30f, fl = 0.0f;
+    float4 fo = float4(0.0f);
+    for (uint s = 0; s < 4u; s++) {
+      const float sl = sm_l[g][s];
+      if (sl <= 0.0f) continue;
+      const float smv = sm_m[g][s];
+      const float mn = max(fm, smv);
+      const float a0 = (fl > 0.0f) ? exp(fm - mn) : 0.0f;
+      const float a1 = exp(smv - mn);
+      fo = fo * a0 + sm_o[g][s][lane] * a1;
+      fl = fl * a0 + sl * a1;
+      fm = mn;
+    }
+    device float* dst = part_out + ((size_t(row) * a.nh + h0 + g) * a.n_splits + sp) * 130u;
+    if (lane == 0u) { dst[0] = fm; dst[1] = fl; }
+    ((device float4*)(dst + 2u))[lane] = fo;
+  }
+}
