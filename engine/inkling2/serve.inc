@@ -24,10 +24,11 @@
 
 namespace iserve {
 
-constexpr uint32_t END = 0xFFFFFFFFu, ERR = 0xFFFFFFFEu, READY = 0xFFFFFFFDu;
+constexpr uint32_t END = 0xFFFFFFFFu, ERR = 0xFFFFFFFEu, READY = 0xFFFFFFFDu, CAND_SEP = 0xFFFFFFFCu;
 
 struct Req {
   uint32_t rid = 0, max_new = 0, flags = 0;
+  uint32_t fpr_lanes = 0, fpr_quorum = 0, fpr_opts = 0;  // flags & 2: Fork-Prune-Resolve
   std::vector<uint32_t> ids, stops, force;
   uint32_t budget = 0, think_end = 0;
   float temp = 0, top_p = 1, min_p = -1.0f;
@@ -79,7 +80,13 @@ void reader() {
     struct { float temp, top_p; uint32_t top_k; uint64_t seed; } __attribute__((packed)) sp;
     if (!rd(&sp, sizeof sp)) break;
     q->temp = sp.temp; q->top_p = sp.top_p; q->top_k = sp.top_k; q->seed = sp.seed;
-    if (q->flags & 2) { uint32_t g3[3]; if (!rd(g3, 12)) break; }
+    if (q->flags & 2) {
+      uint32_t g3[3];
+      if (!rd(g3, 12)) break;
+      q->fpr_lanes = g3[0];
+      q->fpr_quorum = g3[1];
+      q->fpr_opts = g3[2];
+    }
     if (q->flags & 4) {
       uint32_t t3[3];
       if (!rd(t3, 12)) break;
@@ -183,6 +190,7 @@ static int pick_lane(const ink2::Model& m, const std::vector<uint32_t>& ids, con
   auto& H = lane_hist();
   for (int i = 0; i < int(busy.size()); i++) {
     if (busy[i]) continue;
+    if (ids.size() + ink2::MAXM + 1u >= m.lane_global_cap(i)) continue;
     const auto& h = H[i];
     const auto& ck = lane_ckpt()[i];
     uint32_t c = 0;
@@ -201,19 +209,322 @@ static int pick_lane(const ink2::Model& m, const std::vector<uint32_t>& ids, con
   return best;
 }
 
-static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vector<bool>& busy) {
+static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t draft_k, float draft_cut, bool use_lookup) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const uint32_t K = std::max(2u, std::min(q->fpr_lanes ? q->fpr_lanes : n_lanes, n_lanes));
+  const uint32_t Q = (q->fpr_quorum == 0u) ? K : std::max(1u, std::min(q->fpr_quorum, K));
+  const uint32_t mode = q->fpr_opts & 0xFu;        // 0 = select, 1 = candidates
+  const uint32_t prune_lvl = (q->fpr_opts >> 4) & 0xFu;
+  const bool spec = (q->flags & 1) && m.has_mtp;
+  auto is_stop = [&](uint32_t t) {
+    return t == m.eos || std::find(q->stops.begin(), q->stops.end(), t) != q->stops.end();
+  };
+
+  // Stage 0: Prefill once on Lane 0 (with full prefix reuse / rewind!)
+  m.use_lane(0);
+  auto& h0 = lane_hist()[0];
+  auto& ck0 = lane_ckpt()[0];
+  uint32_t reuse = 0;
+  bool rw = false;
+  if (!h0.empty() && h0.size() < q->ids.size() && std::equal(h0.begin(), h0.end(), q->ids.begin())) {
+    reuse = uint32_t(h0.size());
+  } else if (ck0.pos > 0 && ck0.pos < q->ids.size() && ck0.pos <= h0.size() &&
+             h0.size() - ck0.pos <= m.rewind_slack() &&
+             std::equal(h0.begin(), h0.begin() + ck0.pos, q->ids.begin())) {
+    reuse = ck0.pos;
+    rw = true;
+  }
+  if (reuse == 0) { m.reset(); h0.clear(); }
+  else if (rw) { m.rewind(reuse, ck0.conv); h0.resize(reuse); }
+
+  ink2::Model::Samp base_sp;
+  base_sp.temp = q->temp > 0 ? q->temp : 0.0f;
+  base_sp.top_p = (q->top_p > 0.0f && q->top_p <= 1.0f) ? q->top_p : 1.0f;
+  base_sp.top_k = q->top_k;
+  base_sp.min_p = q->min_p >= 0.0f ? q->min_p : 0.0f;
+  base_sp.seed = q->seed;
+  m.samp = base_sp;
+
+  double pms = 0.0;
+  uint32_t b0 = 0;
+  float conf0 = 0.0f;
+  for (size_t i = reuse; i < q->ids.size(); i += ink2::MP) {
+    if (q->cancel.load()) break;
+    std::vector<uint32_t> c(q->ids.begin() + long(i), q->ids.begin() + long(std::min(q->ids.size(), i + ink2::MP)));
+    double g = 0;
+    b0 = m.step(c, &g).back();
+    conf0 = m.last_conf.empty() ? 0.0f : m.last_conf.back();
+    pms += g;
+    if (m.has_mtp) m.mtp_commit(uint32_t(c.size()));
+    h0.insert(h0.end(), c.begin(), c.end());
+  }
+  if (q->cancel.load()) {
+    const float wall = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count() * 1e3f;
+    put(q->rid, END);
+    uint32_t s6[6] = {reuse, uint32_t(q->ids.size()), 0u, 0u, 0u, 0u};
+    float f2[2] = {float(pms), wall};
+    fwrite(s6, 4, 6, stdout); fwrite(f2, 4, 2, stdout); fflush(stdout);
+    std::lock_guard<std::mutex> g(mu); live.erase(q->rid);
+    return;
+  }
+
+  const uint32_t fork_pos = m.pos;
+  ck0.pos = fork_pos;
+  m.save_conv(ck0.conv);
+
+  // Zero-copy Split-KV fork from Lane 0 -> Lanes 1..K-1
+  for (uint32_t k = 1; k < K; k++) {
+    m.fork_lane(0, int(k));
+    ink2::Model::Samp spk = base_sp;
+    if (spk.temp <= 0.0f) { spk.temp = 0.8f; if (spk.min_p <= 0.0f) spk.min_p = 0.02f; }
+    spk.seed = q->seed + k;
+    m.lanes_[k].samp = spk;
+    lane_hist()[k] = h0;
+  }
+
+  struct FprLane {
+    int lane = 0;
+    uint32_t b = 0;
+    float b_conf = 0.0f;
+    std::vector<uint32_t> toks;
+    std::vector<float> confs;
+    bool done = false, pruned = false, length = false;
+    uint32_t rounds = 0, accepted = 0;
+    std::unique_ptr<opus_lookup::Lookup> lk;
+  };
+  std::vector<FprLane> fls(K);
+  for (uint32_t k = 0; k < K; k++) {
+    fls[k].lane = int(k);
+    fls[k].b = b0;
+    fls[k].b_conf = conf0;
+    fls[k].lk = std::make_unique<opus_lookup::Lookup>();
+  }
+
+  auto push_tok = [&](FprLane& fl, uint32_t t, float cf) -> bool {
+    fl.toks.push_back(t);
+    fl.confs.push_back(cf);
+    if (is_stop(t)) { fl.done = true; return true; }
+    const uint32_t lcap = m.lane_global_cap(fl.lane);
+    const uint32_t used = (fl.lane == 0) ? m.lane_pos(0) : (m.lane_pos(fl.lane) - fork_pos);
+    if (fl.toks.size() >= q->max_new || used + ink2::MAXM + 1u >= lcap) {
+      fl.length = true;
+      fl.done = true;
+      return true;
+    }
+    return false;
+  };
+
+  uint32_t n_finished = 0, n_pruned = 0;
+  uint32_t tot_rounds = 0, tot_acc = 0;
+
+  // Stage 1: Parallel Exploration + Online DeepConf Pruning + Quorum
+  while (n_finished < Q && !q->cancel.load()) {
+    std::vector<uint32_t> step_idx;
+    for (uint32_t k = 0; k < K; k++) {
+      if (fls[k].done || fls[k].pruned) continue;
+      if (push_tok(fls[k], fls[k].b, fls[k].b_conf)) n_finished++;
+      else step_idx.push_back(k);
+    }
+    if (n_finished >= Q || step_idx.empty()) break;
+
+    const uint32_t budget = std::max(1u, ink2::MAXM / uint32_t(step_idx.size()));
+    std::vector<std::pair<int, std::vector<uint32_t>>> batches;
+    for (uint32_t k : step_idx) {
+      FprLane& fl = fls[k];
+      m.use_lane(fl.lane);
+      std::vector<uint32_t> drafts;
+      auto& h = lane_hist()[fl.lane];
+      if (spec && budget > 1u) {
+        if (use_lookup && h.size() >= 4) {
+          fl.lk->sync(h, false);
+          std::vector<uint32_t> tail;
+          const size_t tlen = std::min<size_t>(h.size(), 63);
+          tail.insert(tail.end(), h.end() - long(tlen), h.end());
+          tail.push_back(fl.b);
+          uint32_t mlen = 0;
+          const uint32_t mpos = fl.lk->find(h, tail, &mlen);
+          if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
+            const uint32_t cap_lk = std::min<uint32_t>(budget - 1u, uint32_t(h.size() - mpos));
+            for (uint32_t j = 0; j < cap_lk; j++) drafts.push_back(h[mpos + j]);
+          }
+        }
+        if (drafts.empty()) {
+          std::vector<float> dprobs;
+          drafts = m.draft(fl.b, std::min(draft_k, budget - 1u), &dprobs, nullptr, 0u);
+          uint32_t keep = 0;
+          while (keep < drafts.size() && (draft_cut <= 0.0f || dprobs[keep] >= draft_cut)) keep++;
+          drafts.resize(std::min<uint32_t>(keep, budget - 1u));
+        }
+      }
+      std::vector<uint32_t> v{fl.b};
+      v.insert(v.end(), drafts.begin(), drafts.end());
+      batches.push_back({fl.lane, std::move(v)});
+    }
+    const auto out = m.step_lanes(batches);
+
+    uint32_t r0 = 0;
+    for (size_t j = 0; j < step_idx.size(); j++) {
+      FprLane& fl = fls[step_idx[j]];
+      const auto& v = batches[j].second;
+      const uint32_t mrows = uint32_t(v.size());
+      uint32_t acc = 0;
+      while (acc + 1u < mrows && out[r0 + acc] == v[acc + 1u]) acc++;
+      bool stop = false;
+      uint32_t emitted = 0;
+      while (emitted < acc && !stop) {
+        const float cf = (r0 + emitted < m.last_conf.size()) ? m.last_conf[r0 + emitted] : 0.0f;
+        stop = push_tok(fl, v[1u + emitted], cf);
+        emitted++;
+      }
+      const uint32_t keep = 1u + emitted;
+      m.use_lane(fl.lane);
+      m.rollback(keep, mrows);
+      if (m.has_mtp) {
+        m.tap_row0 = r0;
+        m.mtp_commit(keep);
+        m.tap_row0 = 0;
+      }
+      auto& h = lane_hist()[fl.lane];
+      h.insert(h.end(), v.begin(), v.begin() + keep);
+      fl.b = out[r0 + keep - 1u];
+      fl.b_conf = (r0 + keep - 1u < m.last_conf.size()) ? m.last_conf[r0 + keep - 1u] : 0.0f;
+      fl.rounds++;
+      fl.accepted += keep;
+      tot_rounds++;
+      tot_acc += keep;
+      if (stop) n_finished++;
+      r0 += mrows;
+    }
+
+    // Online DeepConf confidence pruning (drop clearly spiraling lanes early when n_alive > remaining needed)
+    if (prune_lvl > 0u) {
+      std::vector<std::pair<float, uint32_t>> alive_sc;
+      uint32_t min_len = 0xFFFFFFFFu;
+      for (uint32_t k = 0; k < K; k++) {
+        if (fls[k].done || fls[k].pruned) continue;
+        min_len = std::min(min_len, uint32_t(fls[k].confs.size()));
+        const size_t n = fls[k].confs.size();
+        const size_t w = std::min<size_t>(n, 64u);
+        float s = 0.0f;
+        for (size_t i = n - w; i < n; i++) s += fls[k].confs[i];
+        alive_sc.push_back({w ? s / float(w) : 0.0f, k});
+      }
+      const uint32_t need = (Q > n_finished) ? (Q - n_finished) : 0u;
+      if (min_len >= 128u && alive_sc.size() > need && alive_sc.size() >= 2u) {
+        std::sort(alive_sc.begin(), alive_sc.end());
+        const float med = alive_sc[alive_sc.size() / 2].first;
+        const float thr = (prune_lvl == 1u ? 0.72f : 0.82f) * med;
+        if (alive_sc[0].first < thr) {
+          fls[alive_sc[0].second].pruned = true;
+          n_pruned++;
+        }
+      }
+    }
+  }
+
+  // Stage 2: Resolve
+  auto tail_conf = [](const FprLane& fl) {
+    const size_t n = fl.confs.size();
+    const size_t w = std::min<size_t>(n, 128u);
+    if (w == 0) return 0.0f;
+    double s = 0.0;
+    for (size_t i = n - w; i < n; i++) s += fl.confs[i];
+    return float(s / double(w));
+  };
+
+  std::vector<uint32_t> cands;
+  for (uint32_t k = 0; k < K; k++) if (fls[k].done && !fls[k].pruned) cands.push_back(k);
+  if (cands.empty()) {
+    for (uint32_t k = 0; k < K; k++) if (!fls[k].pruned) cands.push_back(k);
+  }
+  if (cands.empty()) cands.push_back(0u);
+
+  uint32_t n_emit = 0;
+  bool out_len = false;
+  int win_lane = int(cands[0]);
+  float win_conf = 0.0f;
+
+  if (q->cancel.load()) {
+    m.use_lane(0);
+    m.rewind(fork_pos, ck0.conv);
+    lane_hist()[0] = q->ids;
+  } else if (mode == 0u) {
+    // Mode 0: in-engine Self-Certainty + Consensus selection
+    auto tail_sig = [&](const FprLane& fl) {
+      std::vector<uint32_t> sig;
+      for (uint32_t t : fl.toks) if (!is_stop(t)) sig.push_back(t);
+      if (sig.size() > 48u) sig.erase(sig.begin(), sig.end() - 48);
+      return sig;
+    };
+    std::vector<std::vector<uint32_t>> sigs;
+    for (uint32_t k : cands) sigs.push_back(tail_sig(fls[k]));
+    float best_sc = -1e30f;
+    size_t best_i = 0;
+    for (size_t i = 0; i < cands.size(); i++) {
+      const auto& fl = fls[cands[i]];
+      const float tc = tail_conf(fl);
+      uint32_t peers = 0;
+      for (size_t j = 0; j < cands.size(); j++)
+        if (j != i && !sigs[i].empty() && sigs[i] == sigs[j]) peers++;
+      const float sc = tc + 0.5f * float(peers) - (fl.length ? 10.0f : 0.0f);
+      if (sc > best_sc) { best_sc = sc; best_i = i; win_conf = tc; }
+    }
+    const auto& win = fls[cands[best_i]];
+    win_lane = win.lane;
+    out_len = win.length;
+    for (uint32_t t : win.toks) { put(q->rid, t); n_emit++; }
+    if (win.lane != 0) {
+      m.promote_lane(win.lane, 0);
+      lane_hist()[0] = lane_hist()[win.lane];
+    }
+    m.use_lane(0);
+  } else {
+    // Mode 1: emit all surviving candidates separated by CAND_SEP, rewind Lane 0 to fork_pos for zero-prefill judge/synth!
+    for (uint32_t k : cands) {
+      const auto& fl = fls[k];
+      const float tc = tail_conf(fl);
+      const uint32_t cf = fl.length ? 1u : 0u;
+      put(q->rid, CAND_SEP);
+      fwrite(&tc, 4, 1, stdout);
+      fwrite(&cf, 4, 1, stdout);
+      for (uint32_t t : fl.toks) { put(q->rid, t); n_emit++; }
+    }
+    m.use_lane(0);
+    m.rewind(fork_pos, ck0.conv);
+    lane_hist()[0] = q->ids;
+  }
+
+  for (uint32_t k = 1; k < K; k++) lane_hist()[k].clear();
+  const float wall = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count() * 1e3f;
+  put(q->rid, END);
+  uint32_t s6[6] = {reuse, uint32_t(q->ids.size()), n_emit, tot_rounds, tot_acc, out_len ? 1u : 0u};
+  float f2[2] = {float(pms), wall};
+  fwrite(s6, 4, 6, stdout);
+  fwrite(f2, 4, 2, stdout);
+  fflush(stdout);
+  fprintf(stderr, "inkling2: rid %u FPR(%s) K=%u Q=%u pruned=%u prompt %zu (reused %u, prefill %.0f ms) emit %u (agg %u) in %.0f ms (win=L%d sc=%.2f)\n",
+          q->rid, mode == 0u ? "select" : "cands", K, Q, n_pruned, q->ids.size(), reuse, pms, n_emit, tot_acc, wall, win_lane, win_conf);
+  std::lock_guard<std::mutex> g(mu);
+  live.erase(q->rid);
+}
+
+static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vector<bool>& busy,
+                           uint32_t n_lanes, uint32_t draft_k, float draft_cut, bool use_lookup) {
   for (;;) {
     ReqP q;
     {
       std::lock_guard<std::mutex> g(mu);
       if (inbox.empty()) return;
-      if (std::find(busy.begin(), busy.end(), false) == busy.end()) return;
+      if (inbox.front()->flags & 2) {
+        if (!active.empty()) return;  // wait until all lanes are idle for FPR
+      } else {
+        if (std::find(busy.begin(), busy.end(), false) == busy.end()) return;
+      }
       q = inbox.front();
       inbox.pop_front();
     }
     std::string why;
     if (q->cancel.load()) why = "";
-    else if (q->flags & 2) why = "inkling2: fanout groups (flags & 2) are not supported";
     else if (q->flags & 32) why = "inkling2: image input is not supported by this engine";
     else if (q->ids.empty()) why = "empty prompt";
     else if (q->ids.size() + ink2::MAXM + 1 >= m.cap)
@@ -224,9 +535,18 @@ static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vec
       live.erase(q->rid);
       continue;
     }
+    if (q->flags & 2) {
+      run_fpr(m, q, n_lanes, draft_k, draft_cut, use_lookup);
+      continue;
+    }
     uint32_t reuse = 0;
     bool rw = false;
     const int ln = pick_lane(m, q->ids, busy, &reuse, &rw);
+    if (ln < 0) {
+      std::lock_guard<std::mutex> g(mu);
+      inbox.push_front(q);
+      return;
+    }
     m.use_lane(ln);
     auto& h = lane_hist()[ln];
     if (reuse == 0) {
@@ -277,15 +597,16 @@ static uint32_t feed(ink2::Model& m, Active& a, const std::vector<uint32_t>& tok
 int main(ink2::Model& m) {
   const uint32_t n_lanes = std::max<uint32_t>(1u, std::min<uint32_t>(ink2::MAXM,
       getenv("INK_LANES") ? uint32_t(atoi(getenv("INK_LANES"))) : 4u));
-  while (m.lanes_.size() < n_lanes) m.add_lane();
+  const uint32_t side_cap = getenv("INK_SIDE_CAP") ? uint32_t(atoi(getenv("INK_SIDE_CAP"))) : 0u;
+  while (m.lanes_.size() < n_lanes) m.add_lane(side_cap);
   lane_hist().assign(n_lanes, {});
   lane_ckpt().assign(n_lanes, {});
   const uint32_t draft_k = getenv("INK_DRAFT_K") ? uint32_t(atoi(getenv("INK_DRAFT_K"))) : 7u;
   const float draft_cut = getenv("INK_DRAFT_CUT") ? float(atof(getenv("INK_DRAFT_CUT"))) : 0.50f;
   const bool use_lookup = getenv("INK_LOOKUP") ? (atoi(getenv("INK_LOOKUP")) != 0) : true;
   const uint32_t pf_dec_chunk = getenv("INK_PF_DEC_CHUNK") ? uint32_t(atoi(getenv("INK_PF_DEC_CHUNK"))) : 256u;
-  fprintf(stderr, "inkling2: serving %u lanes x %u tokens (rewind slack %u), GPU state %.2f GB, DSpark %s\n", n_lanes,
-          m.cap, m.rewind_slack(), m.C.allocated / 1e9, m.has_mtp ? "on" : "off");
+  fprintf(stderr, "inkling2: serving %u lanes (L0=%u, side=%u, rewind slack %u), GPU state %.2f GB, DSpark %s\n", n_lanes,
+          m.cap, side_cap ? side_cap : m.cap, m.rewind_slack(), m.C.allocated / 1e9, m.has_mtp ? "on" : "off");
   std::thread rt(reader);
   put(0, READY);
   fflush(stdout);
@@ -294,7 +615,7 @@ int main(ink2::Model& m) {
   std::vector<bool> busy(n_lanes, false);
 
   for (;;) {
-    admit_requests(m, active, busy);
+    admit_requests(m, active, busy, n_lanes, draft_k, draft_cut, use_lookup);
     if (active.empty()) {
       std::unique_lock<std::mutex> g(mu);
       cv.wait(g, [&] { return closed || !inbox.empty(); });

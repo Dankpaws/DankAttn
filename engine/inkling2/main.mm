@@ -85,6 +85,130 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (cmd == "forktest") {
+      // forktest <ids.bin> <n_pref> <lanes> <n_gen>:
+      //   1. Prefill n_pref tokens on lane 0, fork into lanes 1..lanes-1 (side lanes with global_cap=2048).
+      //   2. Feed different continuations (sampled or distinct tokens) across lanes via step_lanes + DSpark.
+      //   3. Verify bit-exactness of logits, tokens, DSpark drafts, promote_lane(1, 0), and GPU Self-Certainty.
+      if (argc < 7) mtl::die("forktest <ids.bin> <n_pref> <lanes> <n_gen>");
+      auto all = read_ids_bin(argv[3]);
+      const uint32_t n_pref = uint32_t(atoi(argv[4]));
+      const uint32_t nl = uint32_t(atoi(argv[5]));
+      const uint32_t n_gen = uint32_t(atoi(argv[6]));
+      std::vector<uint32_t> pref(n_pref);
+      for (uint32_t i = 0; i < n_pref; i++) pref[i] = all[i % all.size()];
+      auto prefill = [&](const std::vector<uint32_t>& p, bool commit) {
+        uint32_t t = 0;
+        for (size_t i = 0; i < p.size(); i += ink2::MP) {
+          std::vector<uint32_t> c(p.begin() + i, p.begin() + std::min(p.size(), i + ink2::MP));
+          t = M.step(c).back();
+          if (commit && M.has_mtp) M.mtp_commit(uint32_t(c.size()));
+        }
+        return t;
+      };
+      // Build side lanes with small suffix cap (2048) to test Split-KV directly!
+      while (M.lanes_.size() < nl) M.add_lane(2048u);
+      const uint32_t V = M.vocab_valid;
+
+      // Reference: run each lane independently on lane 0 with seed = 100 + k, T=1.0
+      std::vector<std::vector<uint32_t>> ref_tok(nl);
+      std::vector<std::vector<float>> ref_lg(nl);
+      std::vector<std::vector<uint32_t>> ref_draft(nl);
+      for (uint32_t k = 0; k < nl; k++) {
+        M.use_lane(0);
+        M.reset();
+        ink2::Model::Samp sp;
+        sp.temp = 1.0f; sp.min_p = 0.02f; sp.seed = 100u + k;
+        M.samp = sp;
+        uint32_t t = prefill(pref, true);
+        std::vector<float> lg;
+        for (uint32_t g = 0; g < n_gen; g++) {
+          ref_tok[k].push_back(t);
+          t = M.step({t}, nullptr, &lg)[0];
+          if (M.has_mtp) M.mtp_commit(1u);
+          ref_lg[k].insert(ref_lg[k].end(), lg.begin(), lg.end());
+        }
+        ref_tok[k].push_back(t);
+        if (M.has_mtp) ref_draft[k] = M.draft(t, 4u);
+      }
+
+      // Forked run: prefill once on lane 0, fork into 1..nl-1!
+      M.use_lane(0);
+      M.reset();
+      ink2::Model::Samp sp0; sp0.temp = 1.0f; sp0.min_p = 0.02f; sp0.seed = 100u;
+      M.samp = sp0;
+      uint32_t t0_tok = prefill(pref, true);
+      auto tf0 = std::chrono::steady_clock::now();
+      for (uint32_t k = 1; k < nl; k++) {
+        M.fork_lane(0, int(k));
+        M.lanes_[k].samp = sp0;
+        M.lanes_[k].samp.seed = 100u + k;
+      }
+      const double fork_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf0).count();
+      // Note: lane 0's first sampled token used seed=100; lanes 1..nl-1 also start from ref_tok[k][0]
+      std::vector<uint32_t> cur(nl);
+      for (uint32_t k = 0; k < nl; k++) cur[k] = ref_tok[k][0];
+      uint32_t bad_tok = (t0_tok != ref_tok[0][0]) ? 1u : 0u, bad_lg = 0u, bad_dr = 0u;
+      float max_conf_err = 0.0f;
+      std::vector<float> lg;
+      for (uint32_t g = 0; g < n_gen; g++) {
+        std::vector<std::pair<int, std::vector<uint32_t>>> b;
+        for (uint32_t k = 0; k < nl; k++) b.push_back({int(k), {cur[k]}});
+        auto out = M.step_lanes(b, nullptr, &lg);
+        for (uint32_t k = 0; k < nl; k++) {
+          if (memcmp(lg.data() + size_t(k) * V, ref_lg[k].data() + size_t(g) * V, V * 4) != 0) bad_lg++;
+          if (out[k] != ref_tok[k][g + 1]) bad_tok++;
+          // Verify GPU Self-Certainty against CPU double-precision reference on last step
+          if (g + 1 == n_gen) {
+            const float* row_l = lg.data() + size_t(k) * V;
+            double mx = -1e30, sl = 0.0, se = 0.0;
+            for (uint32_t v = 0; v < V; v++) if (row_l[v] > mx) mx = row_l[v];
+            for (uint32_t v = 0; v < V; v++) { sl += row_l[v]; se += exp(double(row_l[v]) - mx); }
+            double cpu_sc = (mx + log(se)) - (sl / double(V)) - log(double(V));
+            max_conf_err = std::max(max_conf_err, float(fabs(cpu_sc - double(M.last_conf[k]))));
+          }
+          cur[k] = out[k];
+          if (M.has_mtp) {
+            M.use_lane(int(k));
+            M.tap_row0 = k;
+            M.mtp_commit(1u);
+            M.tap_row0 = 0;
+          }
+        }
+      }
+      if (M.has_mtp) {
+        for (uint32_t k = 0; k < nl; k++) {
+          M.use_lane(int(k));
+          auto dr = M.draft(cur[k], 4u);
+          if (dr != ref_draft[k]) bad_dr++;
+        }
+      }
+      // Test promote_lane(1, 0) + 1 more step vs independent
+      uint32_t bad_prom = 0u;
+      if (nl >= 2) {
+        auto tp0 = std::chrono::steady_clock::now();
+        M.promote_lane(1, 0);
+        const double prom_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+        M.use_lane(0);
+        M.samp = sp0; M.samp.seed = 101u;
+        std::vector<float> lg_p;
+        uint32_t next_p = M.step({cur[1]}, nullptr, &lg_p)[0];
+        // Independent check for lane 1 + 1 extra step
+        M.use_lane(0);
+        M.reset();
+        M.samp = sp0; M.samp.seed = 101u;
+        uint32_t t = prefill(pref, false);
+        for (uint32_t g = 0; g < n_gen; g++) t = M.step({t})[0];
+        std::vector<float> lg_ref;
+        uint32_t next_ref = M.step({t}, nullptr, &lg_ref)[0];
+        if (next_p != next_ref || memcmp(lg_p.data(), lg_ref.data(), V * 4) != 0) bad_prom = 1u;
+        printf("forktest: pref=%u lanes=%u gen=%u | fork=%.2f ms promote=%.2f ms | bad_tok=%u bad_lg=%u bad_draft=%u bad_prom=%u | conf_err=%.2e (sc[0]=%.3f) -> %s\n",
+               n_pref, nl, n_gen, fork_ms, prom_ms, bad_tok, bad_lg, bad_dr, bad_prom, max_conf_err, M.last_conf[0],
+               (bad_tok + bad_lg + bad_dr + bad_prom == 0 && max_conf_err < 1e-3f) ? "BIT-EXACT" : "DIFF");
+      }
+      return (bad_tok + bad_lg + bad_dr + bad_prom == 0 && max_conf_err < 1e-3f) ? 0 : 1;
+    }
+
     if (cmd == "ltest" || cmd == "lbench") {
       // ltest <ids.bin> <lanes> <n_gen>: lanes with different prompts decode jointly via step_lanes; each lane's
       //   tokens and per-step logits must match the same sequence run alone with step() (bit-exact).

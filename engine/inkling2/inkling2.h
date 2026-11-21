@@ -109,11 +109,16 @@ struct Model {
   // Per-logical-layer state of the active lane (`S`, `pos`); other lanes are parked in `lanes_`.
   std::vector<LogicalState> S;
   uint32_t pos = 0;
+  uint32_t fork_pos = 0;
+  int fork_src = -1;
   struct Lane {
     std::vector<LogicalState> S;  // empty while the lane is active (its state lives in Model::S)
     uint32_t pos = 0;
+    uint32_t fork_pos = 0;
+    int fork_src = -1;
     // DSpark context state (KV of the 3 MTP layers, context position, mixed feature); live copy in MtpL / Model
     std::vector<id<MTLBuffer>> mtp_k, mtp_v;
+    std::vector<uint32_t> mtp_cap;
     uint32_t mtp_ctx_pos = 0;
     id<MTLBuffer> mtp_f_rnn = nil;
     Samp samp;
@@ -122,12 +127,18 @@ struct Model {
   uint32_t tap_row0 = 0;
   std::vector<Lane> lanes_;
   int active_lane = 0;
-  void alloc_state(std::vector<LogicalState>& SS);
+  void alloc_state(std::vector<LogicalState>& SS, uint32_t global_cap = 0);
   // Add an independent sequence (own KV rings, sconv state, rollback history); returns its lane id.
-  int add_lane();
-  // Make lane k the target of step / reset / rollback / draft. DSpark state is not per-lane yet.
+  // global_cap > 0 allocates smaller global KV/MTP suffix buffers (for Split-KV forked lanes).
+  int add_lane(uint32_t global_cap = 0);
+  // Make lane k the target of step / reset / rollback / draft.
   void use_lane(int k);
+  // Zero-copy Split-KV fork on global layers + fast local SWA/sconv/MTP copy from src -> dst at src's current pos.
+  void fork_lane(int src, int dst);
+  // Promote a forked lane `src` (forked from `dst`) into standalone `dst` by copying its generated suffix [fork_pos..pos).
+  void promote_lane(int src, int dst);
   uint32_t lane_pos(int k) const { return k == active_lane ? pos : lanes_[k].pos; }
+  uint32_t lane_global_cap(int k) const;
   // Rewind support for the active lane: the sconv states at a position (saved right after a prefill) plus the
   // KV rings still holding the window before it. rewind(c) needs pos - c <= rewind_slack().
   void save_conv(std::vector<uint8_t>& out) const;
@@ -135,7 +146,9 @@ struct Model {
   uint32_t rewind_slack() const { return MP + ring_extra; }
   struct LaneRef {
     std::vector<LogicalState>* S;
+    std::vector<LogicalState>* pref_S;
     uint32_t* pos;
+    uint32_t fork_pos;
     uint32_t r0, m;  // rows [r0, r0 + m) of the step belong to this lane
     const Samp* sp;
   };
@@ -181,8 +194,10 @@ struct Model {
   id<MTLBuffer> b_qgrs, b_k_raw, b_v_raw, b_Q, b_rel_logits, b_rel_vec, b_gate, b_sinks, b_o_out;
   id<MTLBuffer> b_top_idx, b_top_w, b_slots, b_nslots, b_rmask;
   id<MTLBuffer> b_roff, b_rcnt, b_rlist, b_rpos, b_wtile, b_ind_gu, b_ind_dn;
-  id<MTLBuffer> b_moe_y, b_moe_out, b_logits, b_tok_out, b_argmax_v, b_argmax_i;
+  id<MTLBuffer> b_moe_y, b_moe_out, b_logits, b_tok_out, b_argmax_v, b_argmax_i, b_conf_out;
   id<MTLBuffer> b_dummy;
+  // Per-row Self-Certainty (KL from uniform over softcapped logits) from the last step / step_lanes call.
+  std::vector<float> last_conf;
 
   // DSpark scratch buffers
   id<MTLBuffer> b_taps;          // [4, MP, H] f32 captured target hidden states

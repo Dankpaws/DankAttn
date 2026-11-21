@@ -735,7 +735,7 @@ kernel void ink_q_rel_prep(device const float* qgrs [[buffer(0)]],
 //    Reads conv_state_in (read-only) and row M-1 writes conv_state_out (double-buffered, zero race).
 // Grid: (M, nkv, 1), TG: 128 threads.
 struct KvConvArgs {
-  uint M, nkv, hd, k_stride, pos0, cap, is_global, is_key, ks, kv8;
+  uint M, nkv, hd, k_stride, pos0, cap, is_global, is_key, ks, kv8, fork_pos;
   float qk_clip, eps;
 };
 kernel void ink_kv_conv_cache(device const float* in_kv [[buffer(0)]],
@@ -799,7 +799,7 @@ kernel void ink_kv_conv_cache(device const float* in_kv [[buffer(0)]],
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float v = y * sm[0];
-  const uint slot = (a.pos0 + m) % a.cap;
+  const uint slot = ((a.pos0 + m) - a.fork_pos) % a.cap;
   if (a.kv8) {
     float am = simd_max(fabs(v));
     if ((tid & 31u) == 0u) sm2[tid >> 5] = am;
@@ -1291,7 +1291,7 @@ kernel void ink_mtp_mix_norm(device const float4* taps [[buffer(0)]],   // [4][M
 // M2. MTP context KV write: k_norm_ctx (RMSNorm hd=128) + half-split RoPE (theta=1e6) -> MTP KV cache.
 // Grid: (M, nkv, 1), TG: 128 threads.
 struct MtpKvArgs {
-  uint nkv, hd, pos0, cap;
+  uint nkv, hd, pos0, cap, fork_pos;
   float eps, rope_theta;
 };
 kernel void ink_mtp_kv_ctx_cache(device const float* kv_ctx [[buffer(0)]],  // [M, 2 * nkv * hd]
@@ -1323,7 +1323,7 @@ kernel void ink_mtp_kv_ctx_cache(device const float* kv_ctx [[buffer(0)]],  // [
   const float cs = cos(freq), sn = sin(freq);
   const float k_rot = (tid < half_d) ? (kn[d] * cs - kn[d + half_d] * sn)
                                      : (kn[d + half_d] * cs + kn[d] * sn);
-  const uint slot = (a.pos0 + row) % a.cap;
+  const uint slot = ((a.pos0 + row) - a.fork_pos) % a.cap;
   const size_t out_off = (size_t(slot) * a.nkv + h) * a.hd + tid;
   k_cache[out_off] = bfloat(k_rot);
   v_cache[out_off] = bfloat(vr[tid]);
@@ -1410,7 +1410,7 @@ kernel void ink_mtp_qkv_rope(device const float* qkv [[buffer(0)]],
 // M5. GQA G=3 Shared-KV MTP Non-Causal Block Attention over [cached ctx] U [B block K/V].
 // Grid: (B, nkv, 1), TG: 128 threads (4 simdgroups, 3x fewer KV cache reads!).
 struct MtpAttnArgs {
-  uint B, nh, nkv, hd, ctx_len, cap, window, is_local;
+  uint B, nh, nkv, hd, ctx_len, cap, window, is_local, fork_pos;
 };
 kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
                          device const bfloat4* K_ctx [[buffer(1)]],
@@ -1419,6 +1419,8 @@ kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
                          device const bfloat4* V_blk [[buffer(4)]],
                          device bfloat* out_frag [[buffer(5)]],
                          constant MtpAttnArgs& a [[buffer(6)]],
+                         device const bfloat4* K_pref [[buffer(7)]],
+                         device const bfloat4* V_pref [[buffer(8)]],
                          uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   const uint row = tg.x, kvh = tg.y;
   const uint sg = tid >> 5, lane = tid & 31u;
@@ -1434,8 +1436,38 @@ kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
   float m1 = -1e30f, l1 = 0.0f; float4 o1 = float4(0.0f);
   float m2 = -1e30f, l2 = 0.0f; float4 o2 = float4(0.0f);
 
-  // 1) Attend to cached context KV (modulo-free ring index, 3x shared KV!)
+  // 1) Attend to cached context KV (supports zero-copy Split-KV prefix when !is_local && fork_pos > 0)
   uint t = t_start + sg;
+  if (!a.is_local && a.fork_pos > 0u) {
+    for (; t < a.ctx_len; t += 4u) {
+      const bool in_pref = (t < a.fork_pos);
+      const uint sl = in_pref ? t : ((t - a.fork_pos) % a.cap);
+      const size_t kv_off = (size_t(sl) * a.nkv + kvh) * 32u + lane;
+      const float4 k4 = float4(in_pref ? K_pref[kv_off] : K_ctx[kv_off]);
+      const float4 v4 = float4(in_pref ? V_pref[kv_off] : V_ctx[kv_off]);
+      {
+        const float s = simd_sum(dot(q0, k4));
+        const float mn = max(m0, s);
+        const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f;
+        const float p = exp(s - mn);
+        o0 = fma(p, v4, o0 * al); l0 = l0 * al + p; m0 = mn;
+      }
+      {
+        const float s = simd_sum(dot(q1, k4));
+        const float mn = max(m1, s);
+        const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f;
+        const float p = exp(s - mn);
+        o1 = fma(p, v4, o1 * al); l1 = l1 * al + p; m1 = mn;
+      }
+      {
+        const float s = simd_sum(dot(q2, k4));
+        const float mn = max(m2, s);
+        const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f;
+        const float p = exp(s - mn);
+        o2 = fma(p, v4, o2 * al); l2 = l2 * al + p; m2 = mn;
+      }
+    }
+  } else {
   uint slot = (t < a.ctx_len) ? (t % a.cap) : 0u;
   for (; t < a.ctx_len; t += 4u) {
     const size_t kv_off = (size_t(slot) * a.nkv + kvh) * 32u + lane;
@@ -1464,6 +1496,7 @@ kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
     }
     slot += 4u;
     if (slot >= a.cap) slot -= a.cap;
+  }
   }
   // 2) Attend to all B block tokens (non-causal!)
   for (uint b = sg; b < a.B; b += 4u) {
@@ -2083,45 +2116,78 @@ kernel void ink_moe_accum_pf(device const float4* exp_y [[buffer(0)]],
   out[size_t(row) * H4 + c4] = acc;
 }
 
-// Per-row sampling over softcapped logits (row stride ld). Rows with inv_t <= 0 keep the argmax already in out[].
+// Per-row sampling over softcapped logits (row stride ld) + Self-Certainty confidence (KL from uniform).
+// Rows with inv_t <= 0 keep the argmax already in out[] but still emit Self-Certainty into conf_out[m].
 // Grid: (M, 1, 1), TG: 1024 threads.
 struct SampRow { uint N, ld, pos, s0, s1; float inv_t, lmin, top_p; uint top_k; };
 kernel void ink_sample_rows(device const float* y [[buffer(0)]], device uint* out [[buffer(1)]],
-                            device const SampRow* sr [[buffer(2)]], uint m [[threadgroup_position_in_grid]],
+                            device const SampRow* sr [[buffer(2)]], device float* conf_out [[buffer(3)]],
+                            uint m [[threadgroup_position_in_grid]],
                             ushort tid [[thread_index_in_threadgroup]], ushort ntg [[threads_per_threadgroup]]) {
   const SampRow a = sr[m];
-  if (a.inv_t <= 0.0f) return;
-  threadgroup float bv[32], bm[32];
+  threadgroup float bv[32], bm[32], bse[32], bsl[32];
   threadgroup uint bi[32], pn[2];
   threadgroup atomic_uint hist[256];
   device const float* r = y + size_t(m) * a.ld;
+  const float scale = (a.inv_t > 0.0f) ? a.inv_t : 1.0f;
   float mx = -INFINITY;
-  for (uint i = tid; i < a.N; i += ntg) mx = max(mx, r[i] * a.inv_t);
+  for (uint i = tid; i < a.N; i += ntg) mx = max(mx, r[i] * scale);
   mx = simd_max(mx);
   if ((tid & 31) == 0) bm[tid / 32] = mx;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float M_ = bm[0];
   for (uint s = 1; s < ntg / 32; s++) M_ = max(M_, bm[s]);
+  const float M_raw = (a.inv_t > 0.0f) ? (M_ / a.inv_t) : M_;
+
+  float se = 0.0f, sl = 0.0f;
+  if (a.inv_t <= 0.0f) {
+    for (uint i = tid; i < a.N; i += ntg) {
+      const float raw = r[i];
+      se += exp(raw - M_raw);
+      sl += raw;
+    }
+    se = simd_sum(se);
+    sl = simd_sum(sl);
+    if ((tid & 31) == 0) { bse[tid / 32] = se; bsl[tid / 32] = sl; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+      float tse = 0.0f, tsl = 0.0f;
+      for (uint s = 0; s < ntg / 32; s++) { tse += bse[s]; tsl += bsl[s]; }
+      conf_out[m] = (M_raw + log(max(tse, 1e-30f))) - (tsl / float(a.N)) - log(float(a.N));
+    }
+    return;
+  }
+
   const float floor_ = s_trunc_floor(r, a.N, a.inv_t, M_, a.lmin, a.top_p, a.top_k, bm, hist, pn, tid, ntg);
   float v = -INFINITY;
   uint idx = 0;
   for (uint i = tid; i < a.N; i += ntg) {
-    const float l = r[i] * a.inv_t;
+    const float raw = r[i];
+    se += exp(raw - M_raw);
+    sl += raw;
+    const float l = raw * a.inv_t;
     if (l < floor_) continue;
     const float sc = l + s_gumbel(a.s0, a.s1, a.pos, i);
     if (sc > v) { v = sc; idx = i; }
   }
+  se = simd_sum(se);
+  sl = simd_sum(sl);
   for (ushort off = 16; off > 0; off >>= 1) {
     const float ov = simd_shuffle_down(v, off);
     const uint oi = simd_shuffle_down(idx, off);
     if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if ((tid & 31) == 0) { bv[tid / 32] = v; bi[tid / 32] = idx; }
+  if ((tid & 31) == 0) { bv[tid / 32] = v; bi[tid / 32] = idx; bse[tid / 32] = se; bsl[tid / 32] = sl; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) {
     float b = bv[0]; uint bix = bi[0];
-    for (uint s = 1; s < ntg / 32; s++) if (bv[s] > b || (bv[s] == b && bi[s] < bix)) { b = bv[s]; bix = bi[s]; }
+    float tse = 0.0f, tsl = 0.0f;
+    for (uint s = 0; s < ntg / 32; s++) {
+      tse += bse[s]; tsl += bsl[s];
+      if (s > 0 && (bv[s] > b || (bv[s] == b && bi[s] < bix))) { b = bv[s]; bix = bi[s]; }
+    }
     out[m] = bix;
+    conf_out[m] = (M_raw + log(max(tse, 1e-30f))) - (tsl / float(a.N)) - log(float(a.N));
   }
 }

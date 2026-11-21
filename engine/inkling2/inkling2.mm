@@ -54,19 +54,19 @@ struct QRelArgs {
   float qk_clip, rel_clip, log_n_floor, log_alpha;
 };
 struct KvConvArgs {
-  uint32_t M, nkv, hd, k_stride, pos0, cap, is_global, is_key, ks, kv8;
+  uint32_t M, nkv, hd, k_stride, pos0, cap, is_global, is_key, ks, kv8, fork_pos;
   float qk_clip, eps;
 };
 struct AttnArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, is_local, n_splits, kv8; };
 struct AttnPfArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window; };
-struct AttnDecArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, n_splits; };
+struct AttnDecArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, n_splits, fork_pos; };
 struct PostConvArgs { uint32_t M, H, ks, is_boundary, is_mlp, b_slot, b_stride; };
 struct RouteArgs { uint32_t M, H, E, topk; float route_scale; };
 struct PlanArgs { uint32_t M, E, topk, gx_gu, gx_dn; };
 struct MtpMixArgs { uint32_t H, M_stride, write_frag, write_f32, row_off; float eps; };
-struct MtpKvArgs { uint32_t nkv, hd, pos0, cap; float eps, rope_theta; };
+struct MtpKvArgs { uint32_t nkv, hd, pos0, cap, fork_pos; float eps, rope_theta; };
 struct MtpQkvArgs { uint32_t nh, nkv, hd, pos0; float eps, rope_theta; };
-struct MtpAttnArgs { uint32_t B, nh, nkv, hd, ctx_len, cap, window, is_local; };
+struct MtpAttnArgs { uint32_t B, nh, nkv, hd, ctx_len, cap, window, is_local, fork_pos; };
 struct RnnArgs { uint32_t H, R, step; };
 struct MtpPickArgs { uint32_t V_valid, V_pad, step; float cap; float inv_t; uint32_t s0, s1, pos0; };
 struct SampRow { uint32_t N, ld, pos, s0, s1; float inv_t, lmin, top_p; uint32_t top_k; };
@@ -456,6 +456,8 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_tok_out = C.buf(MAXM * sizeof(uint32_t));
   b_argmax_v = C.buf(MAXM * 64u * sizeof(float));
   b_argmax_i = C.buf(MAXM * 64u * sizeof(uint32_t));
+  b_conf_out = C.buf(MAXM * sizeof(float));
+  b_samp_rows = C.buf(MAXM * sizeof(SampRow));
   b_dummy = C.buf(64);
 
   // Optional DSpark MTP drafter overlay
@@ -619,6 +621,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
       {"WBITS", "80"}, {"GS", "32"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"},
       {"CONTIG_X", "1"}});
 
+  p_sample_rows = C.pipe(ink_src, "ink_sample_rows");
   if (has_mtp) {
     p_mtp_mix = C.pipe(ink_src, "ink_mtp_mix_norm");
     p_mtp_kv_ctx = C.pipe(ink_src, "ink_mtp_kv_ctx_cache");
@@ -631,7 +634,6 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     p_mtp_rnn_gates = C.pipe(ink_src, "ink_mtp_rnn_gates");
     p_mtp_add_argmax_p1 = C.pipe(ink_src, "ink_mtp_add_argmax_p1");
     p_mtp_add_argmax_p2 = C.pipe(ink_src, "ink_mtp_add_argmax_p2");
-  p_sample_rows = C.pipe(ink_src, "ink_sample_rows");
     const std::string mb = std::to_string(MtpL[0].mlp_gu.bits);
     p_mm_w6_gu = C.pipe(mm_src, "mm2", {{"WBITS", mb}, {"GS", "128"}, {"TILES", "1"}, {"EPI", "3"}});
     p_mm_w6_dn = C.pipe(mm_src, "mm2", {{"WBITS", mb}, {"GS", "128"}, {"TILES", "1"}});
@@ -668,14 +670,15 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
           dir.c_str(), mapped_bytes / 1e9, C.allocated / 1e9, nL, uint32_t(S.size()), num_passes, cap, int(use_kv8), int(has_mtp));
 }
 
-void Model::alloc_state(std::vector<LogicalState>& SS) {
+void Model::alloc_state(std::vector<LogicalState>& SS, uint32_t global_cap) {
+  const uint32_t gcap = global_cap ? global_cap : cap;
   const uint32_t n_core = core_end - core_start;
   const uint32_t n_logical = nL + (num_passes - 1u) * n_core;
   SS.resize(n_logical);
   auto init_logical = [&](uint32_t log_idx, uint32_t phys_idx) {
     auto& st = SS[log_idx];
     st.phys_idx = phys_idx;
-    st.cap = L[phys_idx].is_local ? (window + MP + ring_extra) : cap;
+    st.cap = L[phys_idx].is_local ? (window + MP + ring_extra) : gcap;
     st.kv8 = (!L[phys_idx].is_local) && use_kv8;
     if (st.kv8) {
       st.k_i8 = C.buf(size_t(st.cap) * nkv * hd);
@@ -707,12 +710,13 @@ void Model::alloc_state(std::vector<LogicalState>& SS) {
   for (uint32_t l = core_end; l < nL; l++) init_logical(li++, l);
 }
 
-int Model::add_lane() {
+int Model::add_lane(uint32_t global_cap) {
+  const uint32_t gcap = global_cap ? global_cap : cap;
   Lane ln;
   const size_t before = C.allocated;
-  alloc_state(ln.S);
+  alloc_state(ln.S, gcap);
   static const bool quiet = getenv("INK_QUIET") != nullptr;
-  if (!quiet) fprintf(stderr, "inkling2: lane %zu added (%.2f GB state, cap=%u)\n", lanes_.size(), (C.allocated - before) / 1e9, cap);
+  if (!quiet) fprintf(stderr, "inkling2: lane %zu added (%.2f GB state, cap=%u)\n", lanes_.size(), (C.allocated - before) / 1e9, gcap);
   for (auto& st : ln.S) {
     memset([st.k_conv contents], 0, [st.k_conv length]);
     memset([st.v_conv contents], 0, [st.v_conv length]);
@@ -733,9 +737,11 @@ int Model::add_lane() {
   }
   if (has_mtp) {
     for (auto& ml : MtpL) {
-      const size_t kvb = size_t(ml.cap) * nkv * hd * sizeof(uint16_t);
+      const uint32_t mcap = ml.is_local ? ml.cap : gcap;
+      const size_t kvb = size_t(mcap) * nkv * hd * sizeof(uint16_t);
       ln.mtp_k.push_back(C.buf(kvb));
       ln.mtp_v.push_back(C.buf(kvb));
+      ln.mtp_cap.push_back(mcap);
       if (rs) { [rs addAllocation:ln.mtp_k.back()]; [rs addAllocation:ln.mtp_v.back()]; }
     }
     ln.mtp_f_rnn = C.buf(MP * H * sizeof(float));
@@ -745,18 +751,31 @@ int Model::add_lane() {
   return int(lanes_.size()) - 1;
 }
 
+uint32_t Model::lane_global_cap(int k) const {
+  const auto& SS = (k == active_lane) ? S : lanes_[k].S;
+  for (const auto& st : SS) if (!L[st.phys_idx].is_local) return st.cap;
+  return cap;
+}
+
 void Model::use_lane(int k) {
   if (k < 0 || k >= int(lanes_.size())) mtl::die("use_lane: invalid lane");
   if (k == active_lane) return;
   auto park = [&](Lane& ln) {  // swap the live state with a lane's parked copy
     std::swap(S, ln.S);
     std::swap(pos, ln.pos);
+    std::swap(fork_pos, ln.fork_pos);
+    std::swap(fork_src, ln.fork_src);
     std::swap(samp, ln.samp);
     if (has_mtp) {
-      if (ln.mtp_k.size() != MtpL.size()) { ln.mtp_k.assign(MtpL.size(), nil); ln.mtp_v.assign(MtpL.size(), nil); }
+      if (ln.mtp_k.size() != MtpL.size()) {
+        ln.mtp_k.assign(MtpL.size(), nil);
+        ln.mtp_v.assign(MtpL.size(), nil);
+        ln.mtp_cap.assign(MtpL.size(), 0u);
+      }
       for (size_t l = 0; l < MtpL.size(); l++) {
         std::swap(MtpL[l].k_cache, ln.mtp_k[l]);
         std::swap(MtpL[l].v_cache, ln.mtp_v[l]);
+        std::swap(MtpL[l].cap, ln.mtp_cap[l]);
       }
       std::swap(mtp_ctx_pos, ln.mtp_ctx_pos);
       std::swap(b_mtp_f_rnn, ln.mtp_f_rnn);
@@ -768,6 +787,162 @@ void Model::use_lane(int k) {
   tap_row0 = 0;
 }
 
+void Model::fork_lane(int src, int dst) {
+  if (src < 0 || src >= int(lanes_.size()) || dst < 0 || dst >= int(lanes_.size()) || src == dst)
+    mtl::die("fork_lane: invalid lane");
+  auto& src_S = (src == active_lane) ? S : lanes_[src].S;
+  auto& dst_S = (dst == active_lane) ? S : lanes_[dst].S;
+  const uint32_t P = (src == active_lane) ? pos : lanes_[src].pos;
+  const int src_fsrc = (src == active_lane) ? fork_src : lanes_[src].fork_src;
+  if (src_fsrc >= 0) mtl::die("fork_lane: cannot fork from an already-forked lane");
+  (dst == active_lane ? pos : lanes_[dst].pos) = P;
+  (dst == active_lane ? fork_pos : lanes_[dst].fork_pos) = P;
+  (dst == active_lane ? fork_src : lanes_[dst].fork_src) = (P > 0u) ? src : -1;
+
+  for (size_t i = 0; i < src_S.size(); i++) {
+    const auto& ss = src_S[i];
+    auto& ds = dst_S[i];
+    memcpy([ds.k_conv contents], [ss.k_conv contents], [ss.k_conv length]);
+    memcpy([ds.v_conv contents], [ss.v_conv contents], [ss.v_conv length]);
+    memcpy([ds.attn_conv contents], [ss.attn_conv contents], [ss.attn_conv length]);
+    memcpy([ds.mlp_conv contents], [ss.mlp_conv contents], [ss.mlp_conv length]);
+  }
+
+  id<MTLCommandBuffer> cb = [C.q commandBuffer];
+  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+  const size_t kv_row_bf16 = size_t(nkv) * hd * sizeof(uint16_t);
+  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap) {
+    if (len == 0u) return;
+    const uint32_t t0 = (len > window) ? (len - window) : 0u;
+    const uint32_t n = len - t0;
+    const uint32_t s0 = t0 % rcap;
+    const uint32_t first = std::min(n, rcap - s0);
+    [blit copyFromBuffer:sb sourceOffset:size_t(s0) * kv_row_bf16
+                toBuffer:db destinationOffset:size_t(s0) * kv_row_bf16
+                    size:size_t(first) * kv_row_bf16];
+    if (n > first) {
+      [blit copyFromBuffer:sb sourceOffset:0 toBuffer:db destinationOffset:0
+                      size:size_t(n - first) * kv_row_bf16];
+    }
+  };
+  for (size_t i = 0; i < src_S.size(); i++) {
+    if (!L[src_S[i].phys_idx].is_local) continue;
+    blit_ring(src_S[i].k_cache, dst_S[i].k_cache, P, src_S[i].cap);
+    blit_ring(src_S[i].v_cache, dst_S[i].v_cache, P, src_S[i].cap);
+  }
+  if (has_mtp) {
+    const uint32_t mp = (src == active_lane) ? mtp_ctx_pos : lanes_[src].mtp_ctx_pos;
+    (dst == active_lane ? mtp_ctx_pos : lanes_[dst].mtp_ctx_pos) = mp;
+    id<MTLBuffer> sf = (src == active_lane) ? b_mtp_f_rnn : lanes_[src].mtp_f_rnn;
+    id<MTLBuffer> df = (dst == active_lane) ? b_mtp_f_rnn : lanes_[dst].mtp_f_rnn;
+    memcpy([df contents], [sf contents], size_t(H) * sizeof(float));
+    for (size_t l = 0; l < MtpL.size(); l++) {
+      if (!MtpL[l].is_local) continue;
+      id<MTLBuffer> sk = (src == active_lane) ? MtpL[l].k_cache : lanes_[src].mtp_k[l];
+      id<MTLBuffer> sv = (src == active_lane) ? MtpL[l].v_cache : lanes_[src].mtp_v[l];
+      id<MTLBuffer> dk = (dst == active_lane) ? MtpL[l].k_cache : lanes_[dst].mtp_k[l];
+      id<MTLBuffer> dv = (dst == active_lane) ? MtpL[l].v_cache : lanes_[dst].mtp_v[l];
+      const uint32_t rcap = (src == active_lane) ? MtpL[l].cap : lanes_[src].mtp_cap[l];
+      blit_ring(sk, dk, mp, rcap);
+      blit_ring(sv, dv, mp, rcap);
+    }
+  }
+  [blit endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  if (cb.error) mtl::die("GPU fork_lane error", cb.error);
+}
+
+void Model::promote_lane(int src, int dst) {
+  if (src < 0 || src >= int(lanes_.size()) || dst < 0 || dst >= int(lanes_.size()) || src == dst)
+    mtl::die("promote_lane: invalid lane");
+  const int fsrc = (src == active_lane) ? fork_src : lanes_[src].fork_src;
+  const uint32_t P = (src == active_lane) ? fork_pos : lanes_[src].fork_pos;
+  const uint32_t E = (src == active_lane) ? pos : lanes_[src].pos;
+  if (fsrc != dst || E < P) mtl::die("promote_lane: src is not forked from dst");
+  auto& src_S = (src == active_lane) ? S : lanes_[src].S;
+  auto& dst_S = (dst == active_lane) ? S : lanes_[dst].S;
+  const uint32_t n_gen = E - P;
+  if (n_gen > lane_global_cap(src) || E > lane_global_cap(dst)) mtl::die("promote_lane: suffix exceeds cap");
+
+  (dst == active_lane ? pos : lanes_[dst].pos) = E;
+  (dst == active_lane ? fork_pos : lanes_[dst].fork_pos) = 0;
+  (dst == active_lane ? fork_src : lanes_[dst].fork_src) = -1;
+
+  for (size_t i = 0; i < src_S.size(); i++) {
+    const auto& ss = src_S[i];
+    auto& ds = dst_S[i];
+    memcpy([ds.k_conv contents], [ss.k_conv contents], [ss.k_conv length]);
+    memcpy([ds.v_conv contents], [ss.v_conv contents], [ss.v_conv length]);
+    memcpy([ds.attn_conv contents], [ss.attn_conv contents], [ss.attn_conv length]);
+    memcpy([ds.mlp_conv contents], [ss.mlp_conv contents], [ss.mlp_conv length]);
+  }
+
+  id<MTLCommandBuffer> cb = [C.q commandBuffer];
+  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+  const size_t kv_row_bf16 = size_t(nkv) * hd * sizeof(uint16_t);
+  const size_t kv_row_i8 = size_t(nkv) * hd;
+  const size_t sc_row = size_t(nkv) * sizeof(uint16_t);
+  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap) {
+    if (len == 0u) return;
+    const uint32_t t0 = (len > window) ? (len - window) : 0u;
+    const uint32_t n = len - t0;
+    const uint32_t s0 = t0 % rcap;
+    const uint32_t first = std::min(n, rcap - s0);
+    [blit copyFromBuffer:sb sourceOffset:size_t(s0) * kv_row_bf16
+                toBuffer:db destinationOffset:size_t(s0) * kv_row_bf16
+                    size:size_t(first) * kv_row_bf16];
+    if (n > first) {
+      [blit copyFromBuffer:sb sourceOffset:0 toBuffer:db destinationOffset:0
+                      size:size_t(n - first) * kv_row_bf16];
+    }
+  };
+  for (size_t i = 0; i < src_S.size(); i++) {
+    const auto& ss = src_S[i];
+    auto& ds = dst_S[i];
+    if (L[ss.phys_idx].is_local) {
+      blit_ring(ss.k_cache, ds.k_cache, E, ss.cap);
+      blit_ring(ss.v_cache, ds.v_cache, E, ss.cap);
+    } else if (n_gen > 0u) {
+      if (ss.kv8) {
+        [blit copyFromBuffer:ss.k_i8 sourceOffset:0 toBuffer:ds.k_i8 destinationOffset:size_t(P) * kv_row_i8 size:size_t(n_gen) * kv_row_i8];
+        [blit copyFromBuffer:ss.v_i8 sourceOffset:0 toBuffer:ds.v_i8 destinationOffset:size_t(P) * kv_row_i8 size:size_t(n_gen) * kv_row_i8];
+        [blit copyFromBuffer:ss.k_sc sourceOffset:0 toBuffer:ds.k_sc destinationOffset:size_t(P) * sc_row size:size_t(n_gen) * sc_row];
+        [blit copyFromBuffer:ss.v_sc sourceOffset:0 toBuffer:ds.v_sc destinationOffset:size_t(P) * sc_row size:size_t(n_gen) * sc_row];
+      } else {
+        [blit copyFromBuffer:ss.k_cache sourceOffset:0 toBuffer:ds.k_cache destinationOffset:size_t(P) * kv_row_bf16 size:size_t(n_gen) * kv_row_bf16];
+        [blit copyFromBuffer:ss.v_cache sourceOffset:0 toBuffer:ds.v_cache destinationOffset:size_t(P) * kv_row_bf16 size:size_t(n_gen) * kv_row_bf16];
+      }
+    }
+  }
+  if (has_mtp) {
+    const uint32_t mp = (src == active_lane) ? mtp_ctx_pos : lanes_[src].mtp_ctx_pos;
+    (dst == active_lane ? mtp_ctx_pos : lanes_[dst].mtp_ctx_pos) = mp;
+    id<MTLBuffer> sf = (src == active_lane) ? b_mtp_f_rnn : lanes_[src].mtp_f_rnn;
+    id<MTLBuffer> df = (dst == active_lane) ? b_mtp_f_rnn : lanes_[dst].mtp_f_rnn;
+    memcpy([df contents], [sf contents], size_t(H) * sizeof(float));
+    for (size_t l = 0; l < MtpL.size(); l++) {
+      id<MTLBuffer> sk = (src == active_lane) ? MtpL[l].k_cache : lanes_[src].mtp_k[l];
+      id<MTLBuffer> sv = (src == active_lane) ? MtpL[l].v_cache : lanes_[src].mtp_v[l];
+      id<MTLBuffer> dk = (dst == active_lane) ? MtpL[l].k_cache : lanes_[dst].mtp_k[l];
+      id<MTLBuffer> dv = (dst == active_lane) ? MtpL[l].v_cache : lanes_[dst].mtp_v[l];
+      if (MtpL[l].is_local) {
+        const uint32_t rcap = (src == active_lane) ? MtpL[l].cap : lanes_[src].mtp_cap[l];
+        blit_ring(sk, dk, mp, rcap);
+        blit_ring(sv, dv, mp, rcap);
+      } else if (mp > P) {
+        const uint32_t mg = mp - P;
+        [blit copyFromBuffer:sk sourceOffset:0 toBuffer:dk destinationOffset:size_t(P) * kv_row_bf16 size:size_t(mg) * kv_row_bf16];
+        [blit copyFromBuffer:sv sourceOffset:0 toBuffer:dv destinationOffset:size_t(P) * kv_row_bf16 size:size_t(mg) * kv_row_bf16];
+      }
+    }
+  }
+  [blit endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  if (cb.error) mtl::die("GPU promote_lane error", cb.error);
+}
+
 std::vector<uint32_t> Model::step_lanes(const std::vector<std::pair<int, std::vector<uint32_t>>>& batches,
                                         double* gpu_ms, std::vector<float>* all_logits,
                                         std::map<std::string, double>* prof) {
@@ -776,9 +951,13 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<std::pair<int, std::ve
   for (auto& [k, toks] : batches) {
     if (k < 0 || k >= int(lanes_.size())) mtl::die("step_lanes: invalid lane");
     if (toks.empty()) continue;
+    auto* kS = (k == active_lane ? &S : &lanes_[k].S);
     for (auto& r : refs)
-      if (r.S == (k == active_lane ? &S : &lanes_[k].S)) mtl::die("step_lanes: lane listed twice");
-    refs.push_back({k == active_lane ? &S : &lanes_[k].S, k == active_lane ? &pos : &lanes_[k].pos,
+      if (r.S == kS) mtl::die("step_lanes: lane listed twice");
+    const int fsrc = (k == active_lane ? fork_src : lanes_[k].fork_src);
+    const uint32_t fpos = (k == active_lane ? fork_pos : lanes_[k].fork_pos);
+    auto* pS = (fsrc >= 0) ? (fsrc == active_lane ? &S : &lanes_[fsrc].S) : nullptr;
+    refs.push_back({kS, pS, k == active_lane ? &pos : &lanes_[k].pos, fpos,
                     uint32_t(ids.size()), uint32_t(toks.size()), k == active_lane ? &samp : &lanes_[k].samp});
     ids.insert(ids.end(), toks.begin(), toks.end());
   }
@@ -808,6 +987,8 @@ void Model::rewind(uint32_t c, const std::vector<uint8_t>& conv) {
 
 void Model::reset() {
   pos = 0;
+  fork_pos = 0;
+  fork_src = -1;
   mtp_ctx_pos = 0;
   for (auto& st : S) {
     memset([st.k_conv contents], 0, [st.k_conv length]);
@@ -834,7 +1015,8 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
                                   std::vector<float>* last_logits,
                                   std::map<std::string, double>* prof) {
   tap_row0 = 0;
-  return step_core(ids, {{&S, &pos, 0u, uint32_t(ids.size()), &samp}}, gpu_ms, last_logits, nullptr, prof);
+  auto* pS = (fork_src >= 0) ? (fork_src == active_lane ? &S : &lanes_[fork_src].S) : nullptr;
+  return step_core(ids, {{&S, pS, &pos, fork_pos, 0u, uint32_t(ids.size()), &samp}}, gpu_ms, last_logits, nullptr, prof);
 }
 
 std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const std::vector<LaneRef>& lanes,
@@ -883,9 +1065,9 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   const uint32_t n_core = core_end - core_start;
 
   // Sampled rows (lanes with temp > 0) redraw over the softcapped logits; greedy rows keep the argmax.
+  // Always runs so every row gets its GPU Self-Certainty score in b_conf_out.
   auto enc_sample = [&](uint32_t n_rows, uint32_t pf_pos) {
     std::vector<SampRow> rows(n_rows);
-    bool any = false;
     for (const auto& lr : lanes) {
       const Samp& sp = *lr.sp;
       for (uint32_t i = 0; i < lr.m; i++) {
@@ -894,16 +1076,15 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
         rows[r] = SampRow{vocab_valid, vocab_pad, pf ? pf_pos : *lr.pos + i, uint32_t(sp.seed), uint32_t(sp.seed >> 32),
                           sp.temp > 0.0f ? 1.0f / sp.temp : -1.0f, sp.min_p > 0.0f ? logf(sp.min_p) : -INFINITY,
                           sp.top_p, sp.top_k};
-        any = any || sp.temp > 0.0f;
       }
     }
-    if (!any) return;
     memcpy([b_samp_rows contents], rows.data(), n_rows * sizeof(SampRow));
     barrier();
     [enc setComputePipelineState:p_sample_rows];
     [enc setBuffer:b_logits offset:0 atIndex:0];
     [enc setBuffer:b_tok_out offset:0 atIndex:1];
     [enc setBuffer:b_samp_rows offset:0 atIndex:2];
+    [enc setBuffer:b_conf_out offset:0 atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
     flush_prof("sample");
   };
@@ -1112,7 +1293,8 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
 
     for (const auto& lr : lanes) {
       auto& sl = (*lr.S)[log_idx];
-      KvConvArgs kca{lr.m, nkv, hd, ly.k_proj.N, *lr.pos, sl.cap, ly.is_local ? 0u : 1u, 1u, ks, sl.kv8 ? 1u : 0u, qk_clip, eps};
+      const uint32_t fpos = (!ly.is_local && lr.pref_S) ? lr.fork_pos : 0u;
+      KvConvArgs kca{lr.m, nkv, hd, ly.k_proj.N, *lr.pos, sl.cap, ly.is_local ? 0u : 1u, 1u, ks, sl.kv8 ? 1u : 0u, fpos, qk_clip, eps};
       [enc setComputePipelineState:p_kv_conv];
       [enc setBuffer:b_k_raw offset:size_t(lr.r0) * ly.k_proj.N * sizeof(float) atIndex:0];
       [enc setBuffer:ly.k_sconv.b offset:ly.k_sconv.off atIndex:1];
@@ -1126,7 +1308,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       [enc dispatchThreadgroups:MTLSizeMake(lr.m, nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
       std::swap(sl.k_conv, sl.k_conv_next);
 
-      KvConvArgs vca{lr.m, nkv, hd, ly.v_proj.N, *lr.pos, sl.cap, ly.is_local ? 0u : 1u, 0u, ks, sl.kv8 ? 1u : 0u, qk_clip, eps};
+      KvConvArgs vca{lr.m, nkv, hd, ly.v_proj.N, *lr.pos, sl.cap, ly.is_local ? 0u : 1u, 0u, ks, sl.kv8 ? 1u : 0u, fpos, qk_clip, eps};
       [enc setBuffer:b_v_raw offset:size_t(lr.r0) * ly.v_proj.N * sizeof(float) atIndex:0];
       [enc setBuffer:ly.v_sconv.b offset:ly.v_sconv.off atIndex:1];
       [enc setBuffer:sl.v_conv offset:0 atIndex:2];
@@ -1184,8 +1366,10 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
                                                       : (st.kv8 ? p_attn_dec_global_kv8 : p_attn_dec_global_bf16);
       for (const auto& lr : lanes) {
         auto& sl = (*lr.S)[log_idx];
+        const auto* pl = (!ly.is_local && lr.pref_S) ? &(*lr.pref_S)[log_idx] : nullptr;
+        const uint32_t fpos = pl ? lr.fork_pos : 0u;
         const size_t r0 = lr.r0;
-        AttnDecArgs da{lr.m, nh, nkv, hd, rel_extent, *lr.pos, sl.cap, window, nsp};
+        AttnDecArgs da{lr.m, nh, nkv, hd, rel_extent, *lr.pos, sl.cap, window, nsp, fpos};
         [enc setComputePipelineState:p_dec];
         [enc setBuffer:b_Q offset:r0 * nh * hd * sizeof(float) atIndex:0];
         [enc setBuffer:(sl.k_cache ? sl.k_cache : b_dummy) offset:0 atIndex:1];
@@ -1197,6 +1381,12 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
         [enc setBuffer:(sl.v_i8 ? sl.v_i8 : b_dummy) offset:0 atIndex:7];
         [enc setBuffer:(sl.v_sc ? sl.v_sc : b_dummy) offset:0 atIndex:8];
         [enc setBytes:&da length:sizeof(da) atIndex:9];
+        [enc setBuffer:(pl && pl->k_cache ? pl->k_cache : b_dummy) offset:0 atIndex:10];
+        [enc setBuffer:(pl && pl->v_cache ? pl->v_cache : b_dummy) offset:0 atIndex:11];
+        [enc setBuffer:(pl && pl->k_i8 ? pl->k_i8 : b_dummy) offset:0 atIndex:12];
+        [enc setBuffer:(pl && pl->k_sc ? pl->k_sc : b_dummy) offset:0 atIndex:13];
+        [enc setBuffer:(pl && pl->v_i8 ? pl->v_i8 : b_dummy) offset:0 atIndex:14];
+        [enc setBuffer:(pl && pl->v_sc ? pl->v_sc : b_dummy) offset:0 atIndex:15];
         [enc dispatchThreadgroups:MTLSizeMake(lr.m, nkv, nsp) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       }
       barrier();
@@ -1625,12 +1815,15 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   std::vector<uint32_t> out(M, 0u);
   if (pf) {
     out[M - 1u] = *(const uint32_t*)[b_tok_out contents];
+    last_conf.assign(1u, *(const float*)[b_conf_out contents]);
     if (last_logits) {
       last_logits->resize(vocab_valid);
       memcpy(last_logits->data(), [b_logits contents], vocab_valid * sizeof(float));
     }
   } else {
     memcpy(out.data(), [b_tok_out contents], M * sizeof(uint32_t));
+    last_conf.resize(M);
+    memcpy(last_conf.data(), [b_conf_out contents], M * sizeof(float));
     if (last_logits) {
       last_logits->resize(vocab_valid);
       const float* lp = (const float*)[b_logits contents] + size_t(M - 1u) * vocab_pad;
@@ -1673,7 +1866,8 @@ void Model::mtp_commit(uint32_t n_commit, double* gpu_ms) {
     }
     barrier();
 
-    MtpKvArgs ka{nkv, hd, mtp_ctx_pos, ml.cap, eps, mtp_rope_theta};
+    const uint32_t mfpos = (!ml.is_local && fork_src >= 0) ? fork_pos : 0u;
+    MtpKvArgs ka{nkv, hd, mtp_ctx_pos, ml.cap, mfpos, eps, mtp_rope_theta};
     [enc setComputePipelineState:p_mtp_kv_ctx];
     [enc setBuffer:b_mtp_kv_ctx offset:0 atIndex:0];
     [enc setBuffer:ml.k_norm_ctx.b offset:ml.k_norm_ctx.off atIndex:1];
@@ -1738,7 +1932,8 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
       }
       barrier();
 
-      MtpKvArgs ka{nkv, hd, mtp_ctx_pos, ml.cap, eps, mtp_rope_theta};
+      const uint32_t mfpos = (!ml.is_local && fork_src >= 0) ? fork_pos : 0u;
+    MtpKvArgs ka{nkv, hd, mtp_ctx_pos, ml.cap, mfpos, eps, mtp_rope_theta};
       [enc setComputePipelineState:p_mtp_kv_ctx];
       [enc setBuffer:b_mtp_kv_ctx offset:0 atIndex:0];
       [enc setBuffer:ml.k_norm_ctx.b offset:ml.k_norm_ctx.off atIndex:1];
@@ -1804,7 +1999,10 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     [enc dispatchThreadgroups:MTLSizeMake(B, nh + nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
     barrier();
 
-    MtpAttnArgs aa{B, nh, nkv, hd, mtp_ctx_pos, ml.cap, window, ml.is_local ? 1u : 0u};
+    const uint32_t mfpos = (!ml.is_local && fork_src >= 0) ? fork_pos : 0u;
+    id<MTLBuffer> pk = (mfpos > 0u) ? (fork_src == active_lane ? ml.k_cache : lanes_[fork_src].mtp_k[l]) : b_dummy;
+    id<MTLBuffer> pv = (mfpos > 0u) ? (fork_src == active_lane ? ml.v_cache : lanes_[fork_src].mtp_v[l]) : b_dummy;
+    MtpAttnArgs aa{B, nh, nkv, hd, mtp_ctx_pos, ml.cap, window, ml.is_local ? 1u : 0u, mfpos};
     [enc setComputePipelineState:p_mtp_attn];
     [enc setBuffer:b_mtp_Q offset:0 atIndex:0];
     [enc setBuffer:ml.k_cache offset:0 atIndex:1];
@@ -1813,6 +2011,8 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     [enc setBuffer:b_mtp_V_blk offset:0 atIndex:4];
     [enc setBuffer:b_mtp_o_frag offset:0 atIndex:5];
     [enc setBytes:&aa length:sizeof(aa) atIndex:6];
+    [enc setBuffer:pk offset:0 atIndex:7];
+    [enc setBuffer:pv offset:0 atIndex:8];
     [enc dispatchThreadgroups:MTLSizeMake(B, nkv, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     barrier();
 

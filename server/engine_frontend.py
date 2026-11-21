@@ -98,6 +98,9 @@ class EngineProc:
             self.load["waiting"] += 1
 
         def f(item):
+            if isinstance(item, tuple):
+                cb(item)
+                return
             with self.load_lock:
                 if isinstance(item, int):
                     if first[0]:
@@ -138,6 +141,9 @@ class EngineProc:
                 elif w == 0xFFFFFFFE:
                     (n,) = struct.unpack("<I", read_exact(out, 4))
                     item = {"error": read_exact(out, n).decode("utf-8", "replace")}
+                elif w == 0xFFFFFFFC:
+                    conf, cflags = struct.unpack("<fI", read_exact(out, 8))
+                    item = ("cand_sep", conf, cflags)
                 else:
                     item = w
                 with self.streams_lock:
