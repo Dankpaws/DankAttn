@@ -48,6 +48,7 @@ struct AttnResRmsArgs { uint32_t H, M, n_prev, b_stride, write_f32; float eps; }
 struct AttnResMgArgs { uint32_t H, M, n_prev, b_stride, q_shared, cat_stride_b4; float eps; };
 struct MsgGateArgs { uint32_t H, R; float eps; };
 struct MsgGate3Args { uint32_t H, R, M, q_shared, cat_stride_b4, low_stride_f; };
+struct MgMmaArgs { uint32_t H, R, M, q_shared, cat_stride_b, low_stride_f; };
 struct QRelArgs {
   uint32_t nh, hd, d_rel, rel_extent, qgrs_n, pos0, is_global;
   float qk_clip, rel_clip, log_n_floor, log_alpha;
@@ -73,7 +74,8 @@ void enc_mm2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
              const Lin& lin, id<MTLBuffer> X, size_t xoff, id<MTLBuffer> Y, size_t yoff,
              uint32_t M, id<MTLBuffer> E0, id<MTLBuffer> dummy,
              id<MTLBuffer> slots, id<MTLBuffer> nslots, id<MTLBuffer> rmask,
-             bool grouped, uint32_t R_epi = 0, uint32_t xstride_u4 = 0, uint32_t ystride_f = 0) {
+             bool grouped, uint32_t R_epi = 0, uint32_t xstride_u4 = 0, uint32_t ystride_f = 0,
+             bool prefer_nft1 = false) {
   MmArgs a{};
   a.N = lin.N;
   a.K = lin.K;
@@ -91,7 +93,8 @@ void enc_mm2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
     a.ystride = ystride_f;
     a.rm = 1;
   }
-  const uint32_t nsg = ((lin.N / 32u) % 2u == 0u && lin.sgs <= 4u) ? (lin.sgs * 2u) : lin.sgs;
+  const bool use_nft2 = !prefer_nft1 && ((lin.N / 32u) % 2u == 0u && lin.sgs <= 4u);
+  const uint32_t nsg = use_nft2 ? (lin.sgs * 2u) : lin.sgs;
   const uint32_t nft = nsg / lin.sgs;
   const uint32_t gx = (lin.N / 32u + nft - 1u) / nft;
   const uint32_t gz = grouped ? std::min<uint32_t>(M * 8u, lin.experts) : 1u;
@@ -192,7 +195,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   use_kv8 = kv8;
   {
     NSString* dname = [C.dev name];
-    const bool big_gpu = dname && ([dname containsString:@"Ultra"] || [dname containsString:@"Max"]);
+    big_gpu = dname && ([dname containsString:@"Ultra"] || [dname containsString:@"Max"]);
     nsp_local = big_gpu ? 12u : 8u;
     nsp_global = big_gpu ? 24u : 8u;
   }
@@ -537,6 +540,8 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_mg_apply = C.pipe(ink_src, "ink_mg_apply");
   p_mg_down3 = C.pipe(ink_src, "ink_mg_down3");
   p_mg_apply3 = C.pipe(ink_src, "ink_mg_apply3");
+  p_mg_down_mma = C.pipe(attn_src, "ink_mg_down_mma");
+  p_mg_apply_mma = C.pipe(attn_src, "ink_mg_apply_mma");
   p_rms_frag = C.pipe(ink_src, "ink_rms_frag");
   p_q_rel = C.pipe(ink_src, "ink_q_rel");
   p_kv_conv = C.pipe(ink_src, "ink_kv_conv_cache");
@@ -781,30 +786,57 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       barrier();
       flush_prof("attn_res");
 
-      MsgGate3Args mg3{H, gate_rank, M, q_shared, cat_stride_b4, low_stride_f};
-      [enc setComputePipelineState:p_mg_down3];
-      [enc setBuffer:b_mg_cat offset:0 atIndex:0];
-      [enc setBuffer:ly.ctrl_q.down.b offset:ly.ctrl_q.down.off atIndex:1];
-      [enc setBuffer:ly.ctrl_k.down.b offset:ly.ctrl_k.down.off atIndex:2];
-      [enc setBuffer:ly.ctrl_v.down.b offset:ly.ctrl_v.down.off atIndex:3];
-      [enc setBuffer:b_mg_low offset:0 atIndex:4];
-      [enc setBytes:&mg3 length:sizeof(mg3) atIndex:5];
-      [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 4u, 3) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-      barrier();
+      if (pf) {
+        MgMmaArgs mgm{H, gate_rank, M, q_shared, MP * 2u * H, low_stride_f};
+        [enc setComputePipelineState:p_mg_down_mma];
+        [enc setBuffer:b_mg_cat offset:0 atIndex:0];
+        [enc setBuffer:ly.ctrl_q.down.b offset:ly.ctrl_q.down.off atIndex:1];
+        [enc setBuffer:ly.ctrl_k.down.b offset:ly.ctrl_k.down.off atIndex:2];
+        [enc setBuffer:ly.ctrl_v.down.b offset:ly.ctrl_v.down.off atIndex:3];
+        [enc setBuffer:b_mg_low offset:0 atIndex:4];
+        [enc setBytes:&mgm length:sizeof(mgm) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((M + 15u) / 16u, gate_rank / 32u, 3) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
 
-      [enc setComputePipelineState:p_mg_apply3];
-      [enc setBuffer:b_qkv_in offset:0 atIndex:0];
-      [enc setBuffer:b_msgs offset:0 atIndex:1];
-      [enc setBuffer:b_mg_low offset:0 atIndex:2];
-      [enc setBuffer:ly.ctrl_q.forget.b offset:ly.ctrl_q.forget.off atIndex:3];
-      [enc setBuffer:ly.ctrl_q.gain.b offset:ly.ctrl_q.gain.off atIndex:4];
-      [enc setBuffer:ly.ctrl_k.forget.b offset:ly.ctrl_k.forget.off atIndex:5];
-      [enc setBuffer:ly.ctrl_k.gain.b offset:ly.ctrl_k.gain.off atIndex:6];
-      [enc setBuffer:ly.ctrl_v.forget.b offset:ly.ctrl_v.forget.off atIndex:7];
-      [enc setBuffer:ly.ctrl_v.gain.b offset:ly.ctrl_v.gain.off atIndex:8];
-      [enc setBuffer:b_qkv_out offset:0 atIndex:9];
-      [enc setBytes:&mg3 length:sizeof(mg3) atIndex:10];
-      [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 3) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc setComputePipelineState:p_mg_apply_mma];
+        [enc setBuffer:b_qkv_in offset:0 atIndex:0];
+        [enc setBuffer:b_msgs offset:0 atIndex:1];
+        [enc setBuffer:b_mg_low offset:0 atIndex:2];
+        [enc setBuffer:ly.ctrl_q.forget.b offset:ly.ctrl_q.forget.off atIndex:3];
+        [enc setBuffer:ly.ctrl_q.gain.b offset:ly.ctrl_q.gain.off atIndex:4];
+        [enc setBuffer:ly.ctrl_k.forget.b offset:ly.ctrl_k.forget.off atIndex:5];
+        [enc setBuffer:ly.ctrl_k.gain.b offset:ly.ctrl_k.gain.off atIndex:6];
+        [enc setBuffer:ly.ctrl_v.forget.b offset:ly.ctrl_v.forget.off atIndex:7];
+        [enc setBuffer:ly.ctrl_v.gain.b offset:ly.ctrl_v.gain.off atIndex:8];
+        [enc setBuffer:b_qkv_out offset:0 atIndex:9];
+        [enc setBytes:&mgm length:sizeof(mgm) atIndex:10];
+        [enc dispatchThreadgroups:MTLSizeMake((M + 63u) / 64u, (H + 31u) / 32u, 3) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      } else {
+        MsgGate3Args mg3{H, gate_rank, M, q_shared, cat_stride_b4, low_stride_f};
+        [enc setComputePipelineState:p_mg_down3];
+        [enc setBuffer:b_mg_cat offset:0 atIndex:0];
+        [enc setBuffer:ly.ctrl_q.down.b offset:ly.ctrl_q.down.off atIndex:1];
+        [enc setBuffer:ly.ctrl_k.down.b offset:ly.ctrl_k.down.off atIndex:2];
+        [enc setBuffer:ly.ctrl_v.down.b offset:ly.ctrl_v.down.off atIndex:3];
+        [enc setBuffer:b_mg_low offset:0 atIndex:4];
+        [enc setBytes:&mg3 length:sizeof(mg3) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 4u, 3) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
+
+        [enc setComputePipelineState:p_mg_apply3];
+        [enc setBuffer:b_qkv_in offset:0 atIndex:0];
+        [enc setBuffer:b_msgs offset:0 atIndex:1];
+        [enc setBuffer:b_mg_low offset:0 atIndex:2];
+        [enc setBuffer:ly.ctrl_q.forget.b offset:ly.ctrl_q.forget.off atIndex:3];
+        [enc setBuffer:ly.ctrl_q.gain.b offset:ly.ctrl_q.gain.off atIndex:4];
+        [enc setBuffer:ly.ctrl_k.forget.b offset:ly.ctrl_k.forget.off atIndex:5];
+        [enc setBuffer:ly.ctrl_k.gain.b offset:ly.ctrl_k.gain.off atIndex:6];
+        [enc setBuffer:ly.ctrl_v.forget.b offset:ly.ctrl_v.forget.off atIndex:7];
+        [enc setBuffer:ly.ctrl_v.gain.b offset:ly.ctrl_v.gain.off atIndex:8];
+        [enc setBuffer:b_qkv_out offset:0 atIndex:9];
+        [enc setBytes:&mg3 length:sizeof(mg3) atIndex:10];
+        [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 3) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      }
       barrier();
       flush_prof("msg_gate");
 
@@ -827,8 +859,8 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     } else {
       enc_mm2(enc, p_mm_w8, ly.qgrs, b_frag_q, 0, b_qgrs, 0, M, nil, b_dummy, nil, nil, nil, false);
       if (prof) flush_prof("attn_qgrs");
-      enc_mm2(enc, p_mm_w8, ly.k_proj, fk, 0, b_k_raw, 0, M, nil, b_dummy, nil, nil, nil, false);
-      enc_mm2(enc, p_mm_w8, ly.v_proj, fv, 0, b_v_raw, 0, M, nil, b_dummy, nil, nil, nil, false);
+      enc_mm2(enc, p_mm_w8, ly.k_proj, fk, 0, b_k_raw, 0, M, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      enc_mm2(enc, p_mm_w8, ly.v_proj, fv, 0, b_v_raw, 0, M, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
     }
     barrier();
     flush_prof("attn_kv");
@@ -933,7 +965,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     if (pf) {
       enc_mmp(enc, p_mmp_w8, ly.o_proj, b_frag_o, 0, b_o_out, 0, M, b_dummy);
     } else {
-      enc_mm2(enc, p_mm_w8, ly.o_proj, b_frag_o, 0, b_o_out, 0, M, nil, b_dummy, nil, nil, nil, false);
+      enc_mm2(enc, p_mm_w8, ly.o_proj, b_frag_o, 0, b_o_out, 0, M, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
     }
     barrier();
     flush_prof("attn_o");
@@ -989,24 +1021,51 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       barrier();
       flush_prof("attn_res");
 
-      MsgGateArgs mga{H, gate_rank, eps};
-      [enc setComputePipelineState:p_mg_down];
-      [enc setBuffer:b_mg_cat offset:0 atIndex:0];
-      [enc setBuffer:ly.ctrl_mlp.down.b offset:ly.ctrl_mlp.down.off atIndex:1];
-      [enc setBuffer:b_mg_low offset:0 atIndex:2];
-      [enc setBytes:&mga length:sizeof(mga) atIndex:3];
-      [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 4u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-      barrier();
+      if (pf) {
+        MgMmaArgs mgm{H, gate_rank, M, 0u, MP * 2u * H, MP * gate_rank};
+        [enc setComputePipelineState:p_mg_down_mma];
+        [enc setBuffer:b_mg_cat offset:0 atIndex:0];
+        [enc setBuffer:ly.ctrl_mlp.down.b offset:ly.ctrl_mlp.down.off atIndex:1];
+        [enc setBuffer:ly.ctrl_mlp.down.b offset:ly.ctrl_mlp.down.off atIndex:2];
+        [enc setBuffer:ly.ctrl_mlp.down.b offset:ly.ctrl_mlp.down.off atIndex:3];
+        [enc setBuffer:b_mg_low offset:0 atIndex:4];
+        [enc setBytes:&mgm length:sizeof(mgm) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((M + 15u) / 16u, gate_rank / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
 
-      [enc setComputePipelineState:p_mg_apply];
-      [enc setBuffer:b_mh offset:0 atIndex:0];
-      [enc setBuffer:b_msgs offset:m_off atIndex:1];
-      [enc setBuffer:b_mg_low offset:0 atIndex:2];
-      [enc setBuffer:ly.ctrl_mlp.forget.b offset:ly.ctrl_mlp.forget.off atIndex:3];
-      [enc setBuffer:ly.ctrl_mlp.gain.b offset:ly.ctrl_mlp.gain.off atIndex:4];
-      [enc setBuffer:b_mh offset:0 atIndex:5];
-      [enc setBytes:&mga length:sizeof(mga) atIndex:6];
-      [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc setComputePipelineState:p_mg_apply_mma];
+        [enc setBuffer:b_mh offset:0 atIndex:0];
+        [enc setBuffer:b_msgs offset:m_off atIndex:1];
+        [enc setBuffer:b_mg_low offset:0 atIndex:2];
+        [enc setBuffer:ly.ctrl_mlp.forget.b offset:ly.ctrl_mlp.forget.off atIndex:3];
+        [enc setBuffer:ly.ctrl_mlp.gain.b offset:ly.ctrl_mlp.gain.off atIndex:4];
+        [enc setBuffer:ly.ctrl_mlp.forget.b offset:ly.ctrl_mlp.forget.off atIndex:5];
+        [enc setBuffer:ly.ctrl_mlp.gain.b offset:ly.ctrl_mlp.gain.off atIndex:6];
+        [enc setBuffer:ly.ctrl_mlp.forget.b offset:ly.ctrl_mlp.forget.off atIndex:7];
+        [enc setBuffer:ly.ctrl_mlp.gain.b offset:ly.ctrl_mlp.gain.off atIndex:8];
+        [enc setBuffer:b_mh offset:0 atIndex:9];
+        [enc setBytes:&mgm length:sizeof(mgm) atIndex:10];
+        [enc dispatchThreadgroups:MTLSizeMake((M + 63u) / 64u, (H + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      } else {
+        MsgGateArgs mga{H, gate_rank, eps};
+        [enc setComputePipelineState:p_mg_down];
+        [enc setBuffer:b_mg_cat offset:0 atIndex:0];
+        [enc setBuffer:ly.ctrl_mlp.down.b offset:ly.ctrl_mlp.down.off atIndex:1];
+        [enc setBuffer:b_mg_low offset:0 atIndex:2];
+        [enc setBytes:&mga length:sizeof(mga) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 4u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
+
+        [enc setComputePipelineState:p_mg_apply];
+        [enc setBuffer:b_mh offset:0 atIndex:0];
+        [enc setBuffer:b_msgs offset:m_off atIndex:1];
+        [enc setBuffer:b_mg_low offset:0 atIndex:2];
+        [enc setBuffer:ly.ctrl_mlp.forget.b offset:ly.ctrl_mlp.forget.off atIndex:3];
+        [enc setBuffer:ly.ctrl_mlp.gain.b offset:ly.ctrl_mlp.gain.off atIndex:4];
+        [enc setBuffer:b_mh offset:0 atIndex:5];
+        [enc setBytes:&mga length:sizeof(mga) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      }
       barrier();
       flush_prof("msg_gate");
 
@@ -1022,7 +1081,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     [enc setBuffer:b_rscores offset:0 atIndex:2];
     [enc setBytes:&H length:4 atIndex:3];
     [enc setBytes:&E length:4 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(M, E / 2u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(M, E / 8u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     barrier();
 
     RouteArgs ra{M, H, E, topk, route_scale};

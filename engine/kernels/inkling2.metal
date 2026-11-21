@@ -541,35 +541,30 @@ kernel void ink_q_rel(device const float* qgrs [[buffer(0)]],
   device const float* s_in = qr + 2u * a.nh * a.hd + a.nh * a.d_rel;
 
   threadgroup float sm[4];
+  threadgroup float rv[16];
   const float qv = q_in[tid] * q_scale[h * a.hd + tid];
   float n2 = simd_sum(qv * qv);
   if ((tid & 31u) == 0u) sm[tid >> 5] = n2;
+  if (tid < a.d_rel) rv[tid] = r_in[tid] * rel_scale[h * a.d_rel + tid];
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0u) {
     const float norm = sqrt(sm[0] + sm[1] + sm[2] + sm[3]);
     sm[0] = min(a.qk_clip / (norm + 1e-6f), 1.0f) * tau;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  Q_out[(size_t(row) * a.nh + h) * a.hd + tid] = float(bfloat(qv * sm[0]));
-
-  gate_out[(size_t(row) * a.nh + h) * a.hd + tid] = isigm(g_in[tid]);
-  if (tid == 0u) sink_out[size_t(row) * a.nh + h] = s_in[h];
-
-  threadgroup float rv[16];
-  if (tid < a.d_rel) rv[tid] = r_in[tid] * rel_scale[h * a.d_rel + tid];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0u) {
     float rn2 = 0.0f;
     for (uint d = 0; d < a.d_rel; d++) rn2 += rv[d] * rv[d];
     const float mult = min(a.rel_clip / (sqrt(rn2) + 1e-6f), 1.0f) * tau;
     for (uint d = 0; d < a.d_rel; d++) rv[d] = float(bfloat(rv[d] * mult));
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  Q_out[(size_t(row) * a.nh + h) * a.hd + tid] = float(bfloat(qv * sm[0]));
+  gate_out[(size_t(row) * a.nh + h) * a.hd + tid] = isigm(g_in[tid]);
+  if (tid == 0u) sink_out[size_t(row) * a.nh + h] = s_in[h];
 
-  // Vectorized bfloat4: rel_extent=1024 -> 256 float4s -> 2 iterations per thread!
+  // Vectorized bfloat4: only compute needed relative distances up to min(pos + 1, rel_extent)
   const uint ext4 = a.rel_extent >> 2;
+  const uint ext4_need = (min(pos + 1u, a.rel_extent) + 3u) >> 2;
   device float4* rl = rel_logits + (size_t(row) * a.nh + h) * ext4;
-  for (uint e4 = tid; e4 < ext4; e4 += 128u) {
+  for (uint e4 = tid; e4 < ext4_need; e4 += 128u) {
     float4 acc = float4(0.0f);
     for (uint d = 0; d < a.d_rel; d++) acc = fma(rv[d], float4(rel_proj[d * ext4 + e4]), acc);
     rl[e4] = acc;
@@ -842,7 +837,7 @@ kernel void ink_post_sconv_add(device const float* y_in [[buffer(0)]],
 }
 
 // 9a. Parallel FP32 router logits (float4 vectorized): scores[m, e] = sigmoid(dot(mn[m], rw[e])).
-// Grid: (M, E / 2, 1), TG: 64 threads (2 simdgroups, 1 expert per simdgroup -> 64 TGs at M=1!).
+// Grid: (M, E / 8, 1), TG: 256 threads (8 simdgroups, 1 expert per simdgroup).
 kernel void ink_moe_scores(device const float4* mn [[buffer(0)]],
                            device const float4* rw [[buffer(1)]],
                            device float* scores [[buffer(2)]],
@@ -850,7 +845,7 @@ kernel void ink_moe_scores(device const float4* mn [[buffer(0)]],
                            uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   const uint row = tg.x;
   const uint sg = tid >> 5, lane = tid & 31u;
-  const uint e = tg.y * 2u + sg;
+  const uint e = tg.y * 8u + sg;
   if (e >= E) return;
   const uint H4 = H >> 2;
   device const float4* mr = mn + size_t(row) * H4;

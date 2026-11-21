@@ -79,6 +79,7 @@ struct Model {
   uint32_t core_start = 6, core_end = 18, num_passes = 3, gate_rank = 64;
   uint32_t eos = 200006, cap = 32768;
   uint32_t nsp_local = 8, nsp_global = 8;
+  bool big_gpu = false;
   bool use_kv8 = true;
   float eps = 1e-6f, qk_clip = 22.627417f, rel_clip = 8.0f;
   float log_n_floor = 8192.0f, log_alpha = 0.1f, route_scale = 8.0f;
@@ -112,6 +113,7 @@ struct Model {
   // Pipelines
   id<MTLComputePipelineState> p_embed, p_attn_res, p_attn_res_rms, p_attn_res_mg_prep;
   id<MTLComputePipelineState> p_mg_prep, p_mg_down, p_mg_apply, p_mg_down3, p_mg_apply3, p_rms_frag;
+  id<MTLComputePipelineState> p_mg_down_mma, p_mg_apply_mma;
   id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
   id<MTLComputePipelineState> p_attn_dec_local, p_attn_dec_global_bf16, p_attn_dec_global_kv8;
