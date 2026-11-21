@@ -333,6 +333,120 @@ kernel void ink_attn_res_mg_prep(device const float4* blocks [[buffer(0)]], devi
   if (has2) cdst[H4 + tid + 512u] = bfloat4(m2 * inv_m);
 }
 
+// 2d. Shared-query version of ink_attn_res_mg_prep for local has_msgs layers (q_shared=1):
+//     Computes attn_res ONCE per row (3x fewer block DRAM reads!) and emits all 3 msg slots in one TG.
+//     Grid: (M, 1, 1), TG: 256 threads.
+kernel void ink_attn_res_mg_prep_shared(device const float4* blocks [[buffer(0)]],
+                                        device const float4* partial [[buffer(1)]],
+                                        device const float4* queries [[buffer(2)]],
+                                        device const float4* msgs [[buffer(3)]],
+                                        device float4* h_out [[buffer(4)]],
+                                        device bfloat4* cat_out [[buffer(5)]],
+                                        constant AttnResMgArgs& a [[buffer(6)]],
+                                        uint row [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_index_in_threadgroup]]) {
+  const uint H4 = a.H >> 2, bs4 = a.b_stride >> 2;
+  const uint B = a.n_prev + 1u;
+  const float inv_sqrt_h = rsqrt(float(a.H));
+  threadgroup float sm_s[12][8];
+  threadgroup float sm_d[12][8];
+  threadgroup float wts[12];
+  threadgroup float sm_h[8];
+  threadgroup float sm_m[3][8];
+
+  const bool has2 = (tid + 512u) < H4;
+  const float4 q0 = queries[tid];
+  const float4 q1 = queries[tid + 256u];
+  const float4 q2 = has2 ? queries[tid + 512u] : float4(0.0f);
+
+  for (uint b = 0; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float4 v0 = st[tid], v1 = st[tid + 256u];
+    float s2 = dot(v0, v0) + dot(v1, v1);
+    float dt = dot(v0, q0) + dot(v1, q1);
+    if (has2) {
+      const float4 v2 = st[tid + 512u];
+      s2 += dot(v2, v2);
+      dt += dot(v2, q2);
+    }
+    s2 = simd_sum(s2);
+    dt = simd_sum(dt);
+    if ((tid & 31u) == 0u) { sm_s[b][tid >> 5] = s2; sm_d[b][tid >> 5] = dt; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float inv_rms[12];
+    float mx = -1e30f;
+    for (uint b = 0; b < B; b++) {
+      float t2 = 0.0f, td = 0.0f;
+      for (uint i = 0; i < 8u; i++) { t2 += sm_s[b][i]; td += sm_d[b][i]; }
+      const float ir = rsqrt(t2 / float(a.H) + a.eps);
+      inv_rms[b] = ir;
+      const float w = td * ir * inv_sqrt_h;
+      wts[b] = w;
+      mx = max(mx, w);
+    }
+    float den = 0.0f;
+    for (uint b = 0; b < B; b++) { wts[b] = exp(wts[b] - mx); den += wts[b]; }
+    const float inv_d = 1.0f / den;
+    for (uint b = 0; b < B; b++) wts[b] *= inv_d * inv_rms[b];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f);
+  for (uint b = 0; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float wb = wts[b];
+    acc0 = fma(st[tid], wb, acc0);
+    acc1 = fma(st[tid + 256u], wb, acc1);
+    if (has2) acc2 = fma(st[tid + 512u], wb, acc2);
+  }
+  device float4* dst = h_out + size_t(row) * H4;
+  dst[tid] = acc0;
+  dst[tid + 256u] = acc1;
+  if (has2) dst[tid + 512u] = acc2;
+
+  float sh = simd_sum(dot(acc0, acc0) + dot(acc1, acc1) + (has2 ? dot(acc2, acc2) : 0.0f));
+  if ((tid & 31u) == 0u) sm_h[tid >> 5] = sh;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float th = 0.0f;
+    for (uint i = 0; i < 8u; i++) th += sm_h[i];
+    sm_h[0] = rsqrt(th / float(a.H) + a.eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv_h = sm_h[0];
+  const bfloat4 h0_bf = bfloat4(acc0 * inv_h);
+  const bfloat4 h1_bf = bfloat4(acc1 * inv_h);
+  const bfloat4 h2_bf = has2 ? bfloat4(acc2 * inv_h) : bfloat4(bfloat(0.0f));
+
+  for (uint s = 0u; s < 3u; s++) {
+    device const float4* mr = msgs + (size_t(s) * a.M + row) * H4;
+    const float4 m0 = mr[tid], m1 = mr[tid + 256u];
+    const float4 m2 = has2 ? mr[tid + 512u] : float4(0.0f);
+    // One sm_m row per slot: reusing a row races the next slot's partial sums against this slot's inv_m reads.
+    float sv = simd_sum(dot(m0, m0) + dot(m1, m1) + (has2 ? dot(m2, m2) : 0.0f));
+    if ((tid & 31u) == 0u) sm_m[s][tid >> 5] = sv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+      float tm = 0.0f;
+      for (uint i = 0; i < 8u; i++) tm += sm_m[s][i];
+      sm_m[s][0] = rsqrt(tm / float(a.H) + a.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_m = sm_m[s][0];
+    device bfloat4* cdst = cat_out + size_t(s) * a.cat_stride_b4 + size_t(row) * (2u * H4);
+    cdst[tid] = h0_bf;
+    cdst[tid + 256u] = h1_bf;
+    if (has2) cdst[tid + 512u] = h2_bf;
+    cdst[H4 + tid] = bfloat4(m0 * inv_m);
+    cdst[H4 + tid + 256u] = bfloat4(m1 * inv_m);
+    if (has2) cdst[H4 + tid + 512u] = bfloat4(m2 * inv_m);
+  }
+}
+
 // 3a. Parallel Message Gate Stage 1: compute inv_rms(h), inv_rms(msg) -> inv_out[M, 2]
 //     and normalized bf16 cat buffer cat_out[M, 2*H].
 // Grid: (M, 1, 1), TG: 256 threads.
@@ -569,6 +683,51 @@ kernel void ink_q_rel(device const float* qgrs [[buffer(0)]],
     for (uint d = 0; d < a.d_rel; d++) acc = fma(rv[d], float4(rel_proj[d * ext4 + e4]), acc);
     rl[e4] = acc;
   }
+}
+
+// 5b. Prefill Q L2-clip + gate sigmoid + sinks + bf16 rel_vec[M*nh, d_rel] (feeds ink_q_rel_mma).
+// Grid: (M, nh, 1), TG: 128 threads.
+kernel void ink_q_rel_prep(device const float* qgrs [[buffer(0)]],
+                           device const float* q_scale [[buffer(1)]],
+                           device const float* rel_scale [[buffer(2)]],
+                           device float* Q_out [[buffer(3)]],
+                           device bfloat* rel_vec [[buffer(4)]],
+                           device float* gate_out [[buffer(5)]],
+                           device float* sink_out [[buffer(6)]],
+                           constant QRelArgs& a [[buffer(7)]],
+                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, h = tg.y;
+  const uint pos = a.pos0 + row;
+  const float tau = a.is_global
+      ? (1.0f + a.log_alpha * log(max(float(pos + 1u) / a.log_n_floor, 1.0f)))
+      : 1.0f;
+
+  device const float* qr = qgrs + size_t(row) * a.qgrs_n;
+  device const float* q_in = qr + h * a.hd;
+  device const float* g_in = qr + a.nh * a.hd + h * a.hd;
+  device const float* r_in = qr + 2u * a.nh * a.hd + h * a.d_rel;
+  device const float* s_in = qr + 2u * a.nh * a.hd + a.nh * a.d_rel;
+
+  threadgroup float sm[4];
+  threadgroup float rv[16];
+  const float qv = q_in[tid] * q_scale[h * a.hd + tid];
+  float n2 = simd_sum(qv * qv);
+  if ((tid & 31u) == 0u) sm[tid >> 5] = n2;
+  if (tid < a.d_rel) rv[tid] = r_in[tid] * rel_scale[h * a.d_rel + tid];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    const float norm = sqrt(sm[0] + sm[1] + sm[2] + sm[3]);
+    sm[0] = min(a.qk_clip / (norm + 1e-6f), 1.0f) * tau;
+    float rn2 = 0.0f;
+    for (uint d = 0; d < a.d_rel; d++) rn2 += rv[d] * rv[d];
+    const float mult = min(a.rel_clip / (sqrt(rn2) + 1e-6f), 1.0f) * tau;
+    for (uint d = 0; d < a.d_rel; d++) rv[d] = float(bfloat(rv[d] * mult));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  Q_out[(size_t(row) * a.nh + h) * a.hd + tid] = float(bfloat(qv * sm[0]));
+  gate_out[(size_t(row) * a.nh + h) * a.hd + tid] = isigm(g_in[tid]);
+  if (tid == 0u) sink_out[size_t(row) * a.nh + h] = s_in[h];
+  if (tid < a.d_rel) rel_vec[(size_t(row) * a.nh + h) * a.d_rel + tid] = bfloat(rv[tid]);
 }
 
 // 6. Parallel K/V short convolution (static on local, dynamic on global) + K L2-clip / V RMSNorm -> KV cache.
@@ -975,32 +1134,40 @@ kernel void ink_copy_f32(device const float4* src [[buffer(0)]], device float4* 
   if (gid < n4) dst[gid] = src[gid];
 }
 
-// 10. Accumulate routed expert outputs [nslots, M, H] -> moe_out [M, H] in FP32.
-// Grid: (M, ceil(H / 256), 1), TG: 256 threads.
-kernel void ink_moe_accum(device const float* exp_y [[buffer(0)]],
+// 10. Accumulate routed expert outputs [nslots, M, H] -> moe_out [M, H] in FP32 (float4 + TG slot cache).
+// Grid: (M, ceil(H/4 / 64), 1), TG: 64 threads.
+kernel void ink_moe_accum(device const float4* exp_y [[buffer(0)]],
                           device const uint* slots [[buffer(1)]],
                           device const uint* nslots [[buffer(2)]],
                           device const uint* top_idx [[buffer(3)]],
                           device const float* top_w [[buffer(4)]],
-                          device float* out [[buffer(5)]],
+                          device float4* out [[buffer(5)]],
                           constant uint& H [[buffer(6)]], constant uint& ystride [[buffer(7)]],
                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   const uint row = tg.x;
-  const uint c = tg.y * 256u + tid;
-  if (c >= H) return;
-  const uint ns = nslots[0];
-  float acc = 0.0f;
-  for (uint k = 0; k < 8u; k++) {
-    const uint e = top_idx[row * 8u + k];
-    const float w = top_w[row * 8u + k];
-    for (uint s = 0; s < ns; s++) {
-      if (slots[s] == e) {
-        acc = fma(exp_y[size_t(s) * ystride + size_t(row) * H + c], w, acc);
-        break;
-      }
+  const uint H4 = H >> 2;
+  const uint ys4 = ystride >> 2;
+  const uint c4 = tg.y * 64u + tid;
+  threadgroup uint s_idx[8];
+  threadgroup float s_w[8];
+  if (tid < 8u) {
+    const uint e = top_idx[row * 8u + tid];
+    const uint ns = nslots[0];
+    uint found = 0u;
+    float w = 0.0f;  // an expert missing from slots contributes 0, as before
+    for (uint s = 0u; s < ns; s++) {
+      if (slots[s] == e) { found = s; w = top_w[row * 8u + tid]; break; }
     }
+    s_idx[tid] = found;
+    s_w[tid] = w;
   }
-  out[size_t(row) * H + c] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (c4 >= H4) return;
+  float4 acc = float4(0.0f);
+  for (uint k = 0u; k < 8u; k++) {
+    acc = fma(exp_y[size_t(s_idx[k]) * ys4 + size_t(row) * H4 + c4], s_w[k], acc);
+  }
+  out[size_t(row) * H4 + c4] = acc;
 }
 
 // 11. Parallel 2-stage final logit softcap (30.0 * tanh(x / 30.0)) + greedy argmax.
@@ -1695,22 +1862,28 @@ kernel void ink_moe_plan_pf(device const uint* top_idx [[buffer(0)]],  // [M, 8]
   }
 }
 
-// P3. Prefill MoE gather-accumulate: moe_out[m, c] = sum_k exp_y[rpos[m, k], c] * top_w[m, k].
-// Grid: (M, ceil(H / 256), 1), TG: 256 threads.
-kernel void ink_moe_accum_pf(device const float* exp_y [[buffer(0)]],
+// P3. Prefill MoE gather-accumulate (float4 + TG rpos/w cache): moe_out[m, c] = sum_k exp_y[rpos[m, k], c] * top_w[m, k].
+// Grid: (M, ceil(H/4 / 256), 1), TG: 256 threads.
+kernel void ink_moe_accum_pf(device const float4* exp_y [[buffer(0)]],
                              device const uint* rpos [[buffer(1)]],
                              device const float* top_w [[buffer(2)]],
-                             device float* out [[buffer(3)]],
+                             device float4* out [[buffer(3)]],
                              constant uint& H [[buffer(4)]],
                              uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   const uint row = tg.x;
-  const uint c = tg.y * 256u + tid;
-  if (c >= H) return;
-  float acc = 0.0f;
-  for (uint k = 0; k < 8u; k++) {
-    const uint p = rpos[size_t(row) * 8u + k];
-    const float w = top_w[size_t(row) * 8u + k];
-    acc = fma(exp_y[size_t(p) * H + c], w, acc);
+  const uint H4 = H >> 2;
+  const uint c4 = tg.y * 256u + tid;
+  threadgroup uint rp[8];
+  threadgroup float tw[8];
+  if (tid < 8u) {
+    rp[tid] = rpos[size_t(row) * 8u + tid];
+    tw[tid] = top_w[size_t(row) * 8u + tid];
   }
-  out[size_t(row) * H + c] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (c4 >= H4) return;
+  float4 acc = float4(0.0f);
+  for (uint k = 0u; k < 8u; k++) {
+    acc = fma(exp_y[size_t(rp[k]) * H4 + c4], tw[k], acc);
+  }
+  out[size_t(row) * H4 + c4] = acc;
 }

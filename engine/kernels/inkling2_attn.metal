@@ -692,3 +692,74 @@ kernel void ink_moe_scores_mma(device const float* mn [[buffer(0)]],      // [M,
     }
   }
 }
+
+// Metal 4 matmul2d Prefill Relative Logits: rel_logits[R, E] = rel_vec[R, 16] @ rel_proj[16, E].
+// Grid: (ceil(R / 64), ceil(ext_active / 32), 1), TG: 128 threads (4 simdgroups x 16 rows = 64 rows/TG).
+kernel void ink_q_rel_mma(device const bfloat* rel_vec [[buffer(0)]],   // [R, 16] where R = M * nh
+                          device const bfloat* rel_proj [[buffer(1)]],  // [16, rel_extent]
+                          device float* rel_logits [[buffer(2)]],       // [R, rel_extent]
+                          constant uint& R [[buffer(3)]],
+                          constant uint& rel_extent [[buffer(4)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          ushort tid [[thread_index_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort l [[thread_index_in_simdgroup]]) {
+  const uint col0 = tg.y * 32u;
+  // Cooperatively transpose rel_proj[16, 32] into padded Bt[32][20] (1 bfloat4 load per thread!)
+  threadgroup bfloat Bt[32][20];
+  {
+    const uint k = tid >> 3;           // 0..15
+    const uint c4 = (tid & 7u) << 2;   // 0, 4, ..., 28
+    const uint col = col0 + c4;
+    bfloat4 v = (col + 3u < rel_extent)
+        ? *(device const bfloat4*)(rel_proj + size_t(k) * rel_extent + col)
+        : bfloat4(bfloat(0.0f));
+    Bt[c4 + 0u][k] = v.x;
+    Bt[c4 + 1u][k] = v.y;
+    Bt[c4 + 2u][k] = v.z;
+    Bt[c4 + 3u][k] = v.w;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint row0 = (tg.x * 4u + uint(sg)) * 16u;
+  if (row0 >= R) return;
+  const ushort m0 = ((l >> 1) & 3) + 4 * (l >> 4);
+  const ushort n0 = 4 * (l & 1) + 8 * ((l >> 3) & 1);
+
+  constexpr auto desc =
+      matmul2d_descriptor(16, 32, 16, false, true, false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroup> op;
+  auto xa = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto wb = op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto cs = op.template get_destination_cooperative_tensor<decltype(xa), decltype(wb), float>();
+
+  for (int r = 0; r < 2; r++) {
+    const uint qr = row0 + m0 + 8u * uint(r);
+    uint2 w = (qr < R) ? *(device const uint2*)(rel_vec + size_t(qr) * 16u + n0) : uint2(0u);
+    const bfloat4 b4 = as_type<bfloat4>(w);
+    for (int e = 0; e < 4; e++) xa[r * 4 + e] = b4[e];
+  }
+  for (int qq = 0; qq < 4; qq++) {
+    const uint cc = m0 + 8u * uint(qq);
+    for (int e = 0; e < 4; e++) wb[qq * 4 + e] = Bt[cc][n0 + e];
+  }
+  op.run(xa, wb, cs);
+
+  // Coalesced float4 stores: i=0..3 (row r0, col+n0), 4..7 (row r1, col+n0), 8..11 (row r0, col+n0+16), 12..15 (row r1, col+n0+16)
+  const uint qr0 = row0 + m0;
+  const uint qr1 = qr0 + 8u;
+  const uint c_lo = col0 + n0;
+  const uint c_hi = c_lo + 16u;
+  if (qr0 < R) {
+    if (c_lo + 3u < rel_extent)
+      *(device float4*)(rel_logits + size_t(qr0) * rel_extent + c_lo) = float4(cs[0], cs[1], cs[2], cs[3]);
+    if (c_hi + 3u < rel_extent)
+      *(device float4*)(rel_logits + size_t(qr0) * rel_extent + c_hi) = float4(cs[8], cs[9], cs[10], cs[11]);
+  }
+  if (qr1 < R) {
+    if (c_lo + 3u < rel_extent)
+      *(device float4*)(rel_logits + size_t(qr1) * rel_extent + c_lo) = float4(cs[4], cs[5], cs[6], cs[7]);
+    if (c_hi + 3u < rel_extent)
+      *(device float4*)(rel_logits + size_t(qr1) * rel_extent + c_hi) = float4(cs[12], cs[13], cs[14], cs[15]);
+  }
+}

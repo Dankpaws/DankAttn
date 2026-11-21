@@ -439,6 +439,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     b_qkv_in  = hbuf(o, sz_qkv_in);
     b_qkv_out = hbuf(o, sz_qkv_out);
   }
+  b_rel_vec = C.buf(size_t(MP) * nh * 16u * sizeof(uint16_t));
   // Phase 1b (Attention projections + FlashAttn + O-proj):
   {
     size_t o = 0;
@@ -593,6 +594,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_attn_res = C.pipe(ink_src, "ink_attn_res");
   p_attn_res_rms = C.pipe(ink_src, "ink_attn_res_rms");
   p_attn_res_mg_prep = C.pipe(ink_src, "ink_attn_res_mg_prep");
+  p_attn_res_mg_prep_shared = C.pipe(ink_src, "ink_attn_res_mg_prep_shared");
   p_mg_prep = C.pipe(ink_src, "ink_mg_prep");
   p_mg_down = C.pipe(ink_src, "ink_mg_down");
   p_mg_apply = C.pipe(ink_src, "ink_mg_apply");
@@ -602,6 +604,9 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_mg_apply_mma = C.pipe(attn_src, "ink_mg_apply_mma");
   p_rms_frag = C.pipe(ink_src, "ink_rms_frag");
   p_q_rel = C.pipe(ink_src, "ink_q_rel");
+  p_q_rel_prep = C.pipe(ink_src, "ink_q_rel_prep");
+  p_q_rel_mma = C.pipe(attn_src, "ink_q_rel_mma");
+  qrel_mma = !(getenv("INK_QREL_MMA") && atoi(getenv("INK_QREL_MMA")) == 0) && d_rel == 16u;
   p_kv_conv = C.pipe(ink_src, "ink_kv_conv_cache");
   p_attn_split = C.pipe(ink_src, "ink_attn_split");
   p_attn_reduce = C.pipe(ink_src, "ink_attn_reduce");
@@ -833,7 +838,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       const uint32_t q_shared = ly.is_local ? 1u : 0u;
 
       AttnResMgArgs arm{H, M, n_blocks, b_stride, q_shared, cat_stride_b4, eps};
-      [enc setComputePipelineState:p_attn_res_mg_prep];
+      [enc setComputePipelineState:(q_shared ? p_attn_res_mg_prep_shared : p_attn_res_mg_prep)];
       [enc setBuffer:b_blocks offset:0 atIndex:0];
       [enc setBuffer:b_h offset:0 atIndex:1];
       [enc setBuffer:ly.ar_attn_q.b offset:ly.ar_attn_q.off atIndex:2];
@@ -841,7 +846,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       [enc setBuffer:b_qkv_in offset:0 atIndex:4];
       [enc setBuffer:b_mg_cat offset:0 atIndex:5];
       [enc setBytes:&arm length:sizeof(arm) atIndex:6];
-      [enc dispatchThreadgroups:MTLSizeMake(M, 3, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [enc dispatchThreadgroups:MTLSizeMake(M, q_shared ? 1u : 3u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       barrier();
       flush_prof("attn_res");
 
@@ -927,16 +932,29 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     // E + F. Q+Rel || K sconv || V sconv concurrently
     QRelArgs qra{nh, hd, d_rel, rel_extent, ly.qgrs.N, pos, ly.is_local ? 0u : 1u,
                  qk_clip, rel_clip, log_n_floor, log_alpha};
-    [enc setComputePipelineState:p_q_rel];
-    [enc setBuffer:b_qgrs offset:0 atIndex:0];
-    [enc setBuffer:ly.q_scale.b offset:ly.q_scale.off atIndex:1];
-    [enc setBuffer:ly.rel_scale.b offset:ly.rel_scale.off atIndex:2];
-    [enc setBuffer:ly.rel_proj.b offset:ly.rel_proj.off atIndex:3];
-    [enc setBuffer:b_Q offset:0 atIndex:4];
-    [enc setBuffer:b_rel_logits offset:0 atIndex:5];
-    [enc setBuffer:b_gate offset:0 atIndex:6];
-    [enc setBuffer:b_sinks offset:0 atIndex:7];
-    [enc setBytes:&qra length:sizeof(qra) atIndex:8];
+    const bool qrel_pf = pf && qrel_mma;
+    if (qrel_pf) {
+      [enc setComputePipelineState:p_q_rel_prep];
+      [enc setBuffer:b_qgrs offset:0 atIndex:0];
+      [enc setBuffer:ly.q_scale.b offset:ly.q_scale.off atIndex:1];
+      [enc setBuffer:ly.rel_scale.b offset:ly.rel_scale.off atIndex:2];
+      [enc setBuffer:b_Q offset:0 atIndex:3];
+      [enc setBuffer:b_rel_vec offset:0 atIndex:4];
+      [enc setBuffer:b_gate offset:0 atIndex:5];
+      [enc setBuffer:b_sinks offset:0 atIndex:6];
+      [enc setBytes:&qra length:sizeof(qra) atIndex:7];
+    } else {
+      [enc setComputePipelineState:p_q_rel];
+      [enc setBuffer:b_qgrs offset:0 atIndex:0];
+      [enc setBuffer:ly.q_scale.b offset:ly.q_scale.off atIndex:1];
+      [enc setBuffer:ly.rel_scale.b offset:ly.rel_scale.off atIndex:2];
+      [enc setBuffer:ly.rel_proj.b offset:ly.rel_proj.off atIndex:3];
+      [enc setBuffer:b_Q offset:0 atIndex:4];
+      [enc setBuffer:b_rel_logits offset:0 atIndex:5];
+      [enc setBuffer:b_gate offset:0 atIndex:6];
+      [enc setBuffer:b_sinks offset:0 atIndex:7];
+      [enc setBytes:&qra length:sizeof(qra) atIndex:8];
+    }
     [enc dispatchThreadgroups:MTLSizeMake(M, nh, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
     if (prof) flush_prof("q_rel");
 
@@ -968,6 +986,21 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     std::swap(st.v_conv, st.v_conv_next);
     barrier();
     flush_prof("kv_conv");
+
+    if (qrel_pf) {
+      // rel_logits[M * nh, ext] = rel_vec[M * nh, 16] @ rel_proj[16, rel_extent], ext = distances this chunk can reach
+      const uint32_t R = M * nh;
+      const uint32_t ext = std::min(rel_extent, pos + M);
+      [enc setComputePipelineState:p_q_rel_mma];
+      [enc setBuffer:b_rel_vec offset:0 atIndex:0];
+      [enc setBuffer:ly.rel_proj.b offset:ly.rel_proj.off atIndex:1];
+      [enc setBuffer:b_rel_logits offset:0 atIndex:2];
+      [enc setBytes:&R length:4 atIndex:3];
+      [enc setBytes:&rel_extent length:4 atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake((R + 63u) / 64u, (ext + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      barrier();
+      flush_prof("q_rel");
+    }
 
     // G. Attention: Metal 4 matmul2d FlashAttention for prefill (pf), split-K GQA for decode/verify
     if (pf) {
@@ -1201,7 +1234,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       [enc setBuffer:b_top_w offset:0 atIndex:2];
       [enc setBuffer:b_moe_out offset:0 atIndex:3];
       [enc setBytes:&H length:4 atIndex:4];
-      [enc dispatchThreadgroups:MTLSizeMake(M, (H + 255u) / 256u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [enc dispatchThreadgroups:MTLSizeMake(M, ((H >> 2) + 255u) / 256u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       barrier();
       flush_prof("moe_accum");
     } else {
@@ -1257,7 +1290,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       [enc setBuffer:b_moe_out offset:0 atIndex:5];
       [enc setBytes:&H length:4 atIndex:6];
       [enc setBytes:&ystride_dn length:4 atIndex:7];
-      [enc dispatchThreadgroups:MTLSizeMake(M, (H + 255u) / 256u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [enc dispatchThreadgroups:MTLSizeMake(M, ((H >> 2) + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       barrier();
       flush_prof("moe_accum");
     }

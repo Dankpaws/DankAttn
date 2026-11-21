@@ -80,6 +80,7 @@ struct Model {
   uint32_t eos = 200006, cap = 32768;
   uint32_t nsp_local = 8, nsp_global = 8;
   bool big_gpu = false;
+  bool qrel_mma = true;  // INK_QREL_MMA: prefill rel_logits via matmul2d (ink_q_rel_prep + ink_q_rel_mma)
   bool use_kv8 = true;
   float eps = 1e-6f, qk_clip = 22.627417f, rel_clip = 8.0f;
   float log_n_floor = 8192.0f, log_alpha = 0.1f, route_scale = 8.0f;
@@ -111,10 +112,10 @@ struct Model {
   std::vector<MtpLayer> MtpL;
 
   // Pipelines
-  id<MTLComputePipelineState> p_embed, p_attn_res, p_attn_res_rms, p_attn_res_mg_prep;
+  id<MTLComputePipelineState> p_embed, p_attn_res, p_attn_res_rms, p_attn_res_mg_prep, p_attn_res_mg_prep_shared;
   id<MTLComputePipelineState> p_mg_prep, p_mg_down, p_mg_apply, p_mg_down3, p_mg_apply3, p_rms_frag;
   id<MTLComputePipelineState> p_mg_down_mma, p_mg_apply_mma;
-  id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
+  id<MTLComputePipelineState> p_q_rel, p_q_rel_prep, p_q_rel_mma, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
   id<MTLComputePipelineState> p_attn_dec_local, p_attn_dec_global_bf16, p_attn_dec_global_kv8;
   id<MTLComputePipelineState> p_scores, p_scores_mma, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
@@ -137,7 +138,7 @@ struct Model {
   id<MTLBuffer> b_qkv_in, b_qkv_out, b_msgs, b_mh, b_mn_f32, b_rscores;
   id<MTLBuffer> b_mg_cat, b_mg_low, b_attn_part;
   id<MTLBuffer> b_frag_q, b_frag_k, b_frag_v, b_frag_o, b_frag_m, b_frag_gu;
-  id<MTLBuffer> b_qgrs, b_k_raw, b_v_raw, b_Q, b_rel_logits, b_gate, b_sinks, b_o_out;
+  id<MTLBuffer> b_qgrs, b_k_raw, b_v_raw, b_Q, b_rel_logits, b_rel_vec, b_gate, b_sinks, b_o_out;
   id<MTLBuffer> b_top_idx, b_top_w, b_slots, b_nslots, b_rmask;
   id<MTLBuffer> b_roff, b_rcnt, b_rlist, b_rpos, b_wtile, b_ind_gu, b_ind_dn;
   id<MTLBuffer> b_moe_y, b_moe_out, b_logits, b_tok_out, b_argmax_v, b_argmax_i;
