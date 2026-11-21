@@ -192,30 +192,56 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
 #endif
 
     const bool maybe_rel = (pos_hi >= j0) && ((pos_lo < j0 + a.rel_extent) || (pos_hi - j0 < a.rel_extent));
-    float s[16];
-    for (int i = 0; i < 16; i++) {
-      const uint rr = m0 + 8 * ((i >> 2) & 1);
-      const uint qr = row0 + rr;
-      const uint qpos = a.pos0 + qr;
-      const uint kpos = j0 + n0 + (i & 3) + 16 * (i >> 3);
-      bool ok = (qr < a.M) && (kpos <= qpos);
 #if ATT_LOCAL
-      ok = ok && ((qpos - kpos) < a.window);
+    const bool full_tile = (j0 + 31u <= pos_lo) && (pos_hi - j0 < a.window) &&
+                           (pos_hi - j0 < a.rel_extent) && (row0 + 16u <= a.M);
+#else
+    const bool full_tile = (!maybe_rel) && (j0 + 31u <= pos_lo) && (row0 + 16u <= a.M);
 #endif
-      if (ok) {
+    float s[16];
+    if (full_tile) {
+#if ATT_LOCAL
+      const size_t rbase0 = (size_t(row0 + m0) * a.nh + h) * a.rel_extent;
+      const size_t rbase1 = (size_t(row0 + m0 + 8u) * a.nh + h) * a.rel_extent;
+      const uint d0 = a.pos0 + row0 + m0 - j0 - n0;
+      const uint d1 = d0 + 8u;
+#endif
+      for (int i = 0; i < 16; i++) {
         float sv = ((Sp[0][i][l] + Sp[1][i][l]) + (Sp[2][i][l] + Sp[3][i][l])) * scale;
 #if ATT_KV8
         sv *= ksc[(i >> 3) * 4 + (i & 3)];
 #endif
-        if (maybe_rel) {
-          const uint dist = qpos - kpos;
-          if (dist < a.rel_extent) {
-            sv += rel_logits[(size_t(qr) * a.nh + h) * a.rel_extent + dist];
-          }
-        }
+#if ATT_LOCAL
+        const uint sub = uint((i & 3) + 16 * (i >> 3));
+        sv += ((i >> 2) & 1) ? rel_logits[rbase1 + (d1 - sub)] : rel_logits[rbase0 + (d0 - sub)];
+#endif
         s[i] = sv;
-      } else {
-        s[i] = -INFINITY;
+      }
+    } else {
+      for (int i = 0; i < 16; i++) {
+        const uint rr = m0 + 8 * ((i >> 2) & 1);
+        const uint qr = row0 + rr;
+        const uint qpos = a.pos0 + qr;
+        const uint kpos = j0 + n0 + (i & 3) + 16 * (i >> 3);
+        bool ok = (qr < a.M) && (kpos <= qpos);
+#if ATT_LOCAL
+        ok = ok && ((qpos - kpos) < a.window);
+#endif
+        if (ok) {
+          float sv = ((Sp[0][i][l] + Sp[1][i][l]) + (Sp[2][i][l] + Sp[3][i][l])) * scale;
+#if ATT_KV8
+          sv *= ksc[(i >> 3) * 4 + (i & 3)];
+#endif
+          if (maybe_rel) {
+            const uint dist = qpos - kpos;
+            if (dist < a.rel_extent) {
+              sv += rel_logits[(size_t(qr) * a.nh + h) * a.rel_extent + dist];
+            }
+          }
+          s[i] = sv;
+        } else {
+          s[i] = -INFINITY;
+        }
       }
     }
 
@@ -231,7 +257,7 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
       float bs = 0.0f;
       for (int i = 0; i < 16; i++) {
         if (((i >> 2) & 1) == r) {
-          const float p = (s[i] > -1e29f) ? exp(s[i] - mn) : 0.0f;
+          const float p = (full_tile || s[i] > -1e29f) ? exp(s[i] - mn) : 0.0f;
           s[i] = p;
           bs += p;
         }
