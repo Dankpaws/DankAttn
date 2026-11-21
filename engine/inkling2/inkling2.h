@@ -96,9 +96,32 @@ struct Model {
   Lin lm_head;
   std::vector<PhysLayer> L;
 
-  // Per-logical-layer state
+  // Per-logical-layer state of the active lane (`S`, `pos`); other lanes are parked in `lanes_`.
   std::vector<LogicalState> S;
   uint32_t pos = 0;
+  struct Lane {
+    std::vector<LogicalState> S;  // empty while the lane is active (its state lives in Model::S)
+    uint32_t pos = 0;
+    // DSpark context state (KV of the 3 MTP layers, context position, mixed feature); live copy in MtpL / Model
+    std::vector<id<MTLBuffer>> mtp_k, mtp_v;
+    uint32_t mtp_ctx_pos = 0;
+    id<MTLBuffer> mtp_f_rnn = nil;
+  };
+  // First row of the active lane's rows in the last step: mtp_commit / draft(n_commit) read its b_taps rows.
+  uint32_t tap_row0 = 0;
+  std::vector<Lane> lanes_;
+  int active_lane = 0;
+  void alloc_state(std::vector<LogicalState>& SS);
+  // Add an independent sequence (own KV rings, sconv state, rollback history); returns its lane id.
+  int add_lane();
+  // Make lane k the target of step / reset / rollback / draft. DSpark state is not per-lane yet.
+  void use_lane(int k);
+  uint32_t lane_pos(int k) const { return k == active_lane ? pos : lanes_[k].pos; }
+  struct LaneRef {
+    std::vector<LogicalState>* S;
+    uint32_t* pos;
+    uint32_t r0, m;  // rows [r0, r0 + m) of the step belong to this lane
+  };
 
   // DSpark MTP drafter (optional overlay: mtp_manifest.json + pack-mtp-00.bin)
   bool has_mtp = false;
@@ -160,6 +183,16 @@ struct Model {
   std::vector<uint32_t> step(const std::vector<uint32_t>& ids, double* gpu_ms = nullptr,
                              std::vector<float>* last_logits = nullptr,
                              std::map<std::string, double>* prof = nullptr);
+  // Multi-lane batched decode / verify: each (lane, toks) appends toks at that lane's pos; total rows <= MAXM.
+  // Stateless ops (projections, MoE, norms, message gates) run once over all rows; q_rel, K/V sconv + cache
+  // writes, decode attention and the post-attention / post-MLP sconv dispatch per lane against its own state.
+  // Returns argmax per row; all_logits gets [M][vocab_valid] when given.
+  std::vector<uint32_t> step_lanes(const std::vector<std::pair<int, std::vector<uint32_t>>>& batches,
+                                   double* gpu_ms = nullptr, std::vector<float>* all_logits = nullptr,
+                                   std::map<std::string, double>* prof = nullptr);
+  std::vector<uint32_t> step_core(const std::vector<uint32_t>& ids, const std::vector<LaneRef>& lanes, double* gpu_ms,
+                                  std::vector<float>* last_logits, std::vector<float>* all_logits,
+                                  std::map<std::string, double>* prof);
   // Roll back sconv state & `pos` after verifying `M_step` rows and accepting `accepted` (1 <= accepted <= M_step).
   void rollback(uint32_t accepted, uint32_t M_step);
   // Commit `n_commit` accepted tokens' tapped target features (from the last step) into DSpark KV cache + f_rnn.
