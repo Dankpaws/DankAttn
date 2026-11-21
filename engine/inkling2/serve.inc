@@ -328,11 +328,11 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     if (n_finished >= Q || step_idx.empty()) break;
 
     const uint32_t budget = std::max(1u, ink2::MAXM / uint32_t(step_idx.size()));
-    std::vector<std::pair<int, std::vector<uint32_t>>> batches;
-    for (uint32_t k : step_idx) {
-      FprLane& fl = fls[k];
-      m.use_lane(fl.lane);
-      std::vector<uint32_t> drafts;
+    std::vector<std::vector<uint32_t>> lane_drafts(step_idx.size());
+    std::vector<ink2::Model::MtpDraftReq> dreqs;
+    std::vector<size_t> dreq_map;
+    for (size_t j = 0; j < step_idx.size(); j++) {
+      FprLane& fl = fls[step_idx[j]];
       auto& h = lane_hist()[fl.lane];
       if (spec && budget > 1u) {
         if (use_lookup && h.size() >= 4) {
@@ -345,24 +345,39 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
           const uint32_t mpos = fl.lk->find(h, tail, &mlen);
           if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
             const uint32_t cap_lk = std::min<uint32_t>(budget - 1u, uint32_t(h.size() - mpos));
-            for (uint32_t j = 0; j < cap_lk; j++) drafts.push_back(h[mpos + j]);
+            for (uint32_t l = 0; l < cap_lk; l++) lane_drafts[j].push_back(h[mpos + l]);
           }
         }
-        if (drafts.empty()) {
-          std::vector<float> dprobs;
-          drafts = m.draft(fl.b, std::min(draft_k, budget - 1u), &dprobs, nullptr, 0u);
-          uint32_t keep = 0;
-          while (keep < drafts.size() && (draft_cut <= 0.0f || dprobs[keep] >= draft_cut)) keep++;
-          drafts.resize(std::min<uint32_t>(keep, budget - 1u));
+        if (lane_drafts[j].empty()) {
+          dreqs.push_back({fl.lane, fl.b});
+          dreq_map.push_back(j);
         }
       }
+    }
+    if (!dreqs.empty()) {
+      std::vector<std::vector<uint32_t>> d_out;
+      std::vector<std::vector<float>> d_probs;
+      m.draft_lanes(dreqs, std::min(draft_k, budget - 1u), d_out, &d_probs);
+      for (size_t di = 0; di < dreqs.size(); di++) {
+        auto& dr = d_out[di];
+        const auto& dp = d_probs[di];
+        uint32_t keep = 0;
+        while (keep < dr.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
+        dr.resize(std::min<uint32_t>(keep, budget - 1u));
+        lane_drafts[dreq_map[di]] = std::move(dr);
+      }
+    }
+    std::vector<std::pair<int, std::vector<uint32_t>>> batches;
+    for (size_t j = 0; j < step_idx.size(); j++) {
+      FprLane& fl = fls[step_idx[j]];
       std::vector<uint32_t> v{fl.b};
-      v.insert(v.end(), drafts.begin(), drafts.end());
+      v.insert(v.end(), lane_drafts[j].begin(), lane_drafts[j].end());
       batches.push_back({fl.lane, std::move(v)});
     }
     const auto out = m.step_lanes(batches);
 
     uint32_t r0 = 0;
+    std::vector<ink2::Model::MtpCommitReq> creqs;
     for (size_t j = 0; j < step_idx.size(); j++) {
       FprLane& fl = fls[step_idx[j]];
       const auto& v = batches[j].second;
@@ -379,11 +394,7 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
       const uint32_t keep = 1u + emitted;
       m.use_lane(fl.lane);
       m.rollback(keep, mrows);
-      if (m.has_mtp) {
-        m.tap_row0 = r0;
-        m.mtp_commit(keep);
-        m.tap_row0 = 0;
-      }
+      if (m.has_mtp) creqs.push_back({fl.lane, r0, keep});
       auto& h = lane_hist()[fl.lane];
       h.insert(h.end(), v.begin(), v.begin() + keep);
       fl.b = out[r0 + keep - 1u];
@@ -395,6 +406,7 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
       if (stop) n_finished++;
       r0 += mrows;
     }
+    if (m.has_mtp && !creqs.empty()) m.mtp_commit_lanes(creqs, r0);
 
     // Online DeepConf confidence pruning (drop clearly spiraling lanes early when n_alive > remaining needed)
     if (prune_lvl > 0u) {
@@ -682,13 +694,13 @@ int main(ink2::Model& m) {
       fflush(stdout);
 
       if (!step_idx.empty()) {
-        // 4) Drafts per lane, one joint verify
+        // 4) Batched drafts across lanes, one joint verify
         const uint32_t budget = std::max(1u, ink2::MAXM / uint32_t(step_idx.size()));
-        std::vector<std::pair<int, std::vector<uint32_t>>> batches;
-        for (size_t i : step_idx) {
-          Active& a = active[i];
-          m.use_lane(a.lane);
-          std::vector<uint32_t> drafts;
+        std::vector<std::vector<uint32_t>> lane_drafts(step_idx.size());
+        std::vector<ink2::Model::MtpDraftReq> dreqs;
+        std::vector<size_t> dreq_map;
+        for (size_t j = 0; j < step_idx.size(); j++) {
+          Active& a = active[step_idx[j]];
           auto& h = lane_hist()[a.lane];
           if (a.spec && budget > 1u) {
             if (use_lookup && h.size() >= 4) {
@@ -701,25 +713,40 @@ int main(ink2::Model& m) {
               const uint32_t mpos = a.lk->find(h, tail, &mlen);
               if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
                 const uint32_t cap_lk = std::min<uint32_t>(budget - 1u, uint32_t(h.size() - mpos));
-                for (uint32_t k = 0; k < cap_lk; k++) drafts.push_back(h[mpos + k]);
+                for (uint32_t k = 0; k < cap_lk; k++) lane_drafts[j].push_back(h[mpos + k]);
               }
             }
-            if (drafts.empty()) {
-              std::vector<float> dprobs;
-              drafts = m.draft(a.b, std::min(draft_k, budget - 1u), &dprobs, nullptr, 0u);
-              uint32_t keep = 0;
-              while (keep < drafts.size() && (draft_cut <= 0.0f || dprobs[keep] >= draft_cut)) keep++;
-              drafts.resize(std::min<uint32_t>(keep, budget - 1u));
+            if (lane_drafts[j].empty()) {
+              dreqs.push_back({a.lane, a.b});
+              dreq_map.push_back(j);
             }
           }
+        }
+        if (!dreqs.empty()) {
+          std::vector<std::vector<uint32_t>> d_out;
+          std::vector<std::vector<float>> d_probs;
+          m.draft_lanes(dreqs, std::min(draft_k, budget - 1u), d_out, &d_probs);
+          for (size_t di = 0; di < dreqs.size(); di++) {
+            auto& dr = d_out[di];
+            const auto& dp = d_probs[di];
+            uint32_t keep = 0;
+            while (keep < dr.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
+            dr.resize(std::min<uint32_t>(keep, budget - 1u));
+            lane_drafts[dreq_map[di]] = std::move(dr);
+          }
+        }
+        std::vector<std::pair<int, std::vector<uint32_t>>> batches;
+        for (size_t j = 0; j < step_idx.size(); j++) {
+          Active& a = active[step_idx[j]];
           std::vector<uint32_t> v{a.b};
-          v.insert(v.end(), drafts.begin(), drafts.end());
+          v.insert(v.end(), lane_drafts[j].begin(), lane_drafts[j].end());
           batches.push_back({a.lane, std::move(v)});
         }
         const auto out = m.step_lanes(batches);
 
-        // 5) Per lane: accept, emit, roll back to what was emitted, commit DSpark context
+        // 5) Per lane: accept, emit, roll back, then ONE batched DSpark commit across all lanes
         uint32_t r0 = 0;
+        std::vector<ink2::Model::MtpCommitReq> creqs;
         for (size_t j = 0; j < step_idx.size(); j++) {
           Active& a = active[step_idx[j]];
           const auto& v = batches[j].second;
@@ -732,11 +759,7 @@ int main(ink2::Model& m) {
           const uint32_t keep = 1u + emitted;  // rows the lane keeps: anchor + emitted drafts
           m.use_lane(a.lane);
           m.rollback(keep, mrows);
-          if (m.has_mtp) {
-            m.tap_row0 = r0;
-            m.mtp_commit(keep);
-            m.tap_row0 = 0;
-          }
+          if (m.has_mtp) creqs.push_back({a.lane, r0, keep});
           auto& h = lane_hist()[a.lane];
           h.insert(h.end(), v.begin(), v.begin() + keep);
           a.b = out[r0 + keep - 1u];
@@ -745,6 +768,7 @@ int main(ink2::Model& m) {
           if (stop) done[step_idx[j]] = true;
           r0 += mrows;
         }
+        if (m.has_mtp && !creqs.empty()) m.mtp_commit_lanes(creqs, r0);
         fflush(stdout);
       }
       for (size_t i = active.size(); i-- > 0;) {

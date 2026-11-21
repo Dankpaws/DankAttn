@@ -396,13 +396,23 @@ int main(int argc, char** argv) {
         for (uint32_t k = 0; k < nl; k++) if (ls[k].out.size() < n_gen) act.push_back(k);
         if (act.empty()) break;
         const uint32_t budget = std::max(1u, ink2::MAXM / uint32_t(act.size()));  // rows per lane this round
-        std::vector<std::pair<int, std::vector<uint32_t>>> batches;
         auto td = std::chrono::steady_clock::now();
+        std::vector<ink2::Model::MtpCommitReq> creqs;
+        uint32_t tot_tap = 0;
         for (uint32_t k : act) {
-          auto& L = ls[k];
-          M.use_lane(int(k));
-          M.tap_row0 = L.pending_r0;
-          std::vector<uint32_t> drafts;
+          if (ls[k].pending > 0) {
+            creqs.push_back({int(k), ls[k].pending_r0, ls[k].pending});
+            tot_tap = std::max(tot_tap, ls[k].pending_r0 + ls[k].pending);
+            ls[k].pending = 0;
+          }
+        }
+        if (!creqs.empty()) M.mtp_commit_lanes(creqs, tot_tap);
+
+        std::vector<std::vector<uint32_t>> lane_drafts(act.size());
+        std::vector<ink2::Model::MtpDraftReq> dreqs;
+        std::vector<size_t> dmap;
+        for (size_t j = 0; j < act.size(); j++) {
+          auto& L = ls[act[j]];
           if (budget > 1u && use_lookup && L.hist.size() >= 4) {
             L.lk.sync(L.hist, false);
             std::vector<uint32_t> tail;
@@ -413,24 +423,34 @@ int main(int argc, char** argv) {
             uint32_t mpos = L.lk.find(L.hist, tail, &mlen);
             if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
               const uint32_t cap_lk = std::min<uint32_t>(budget - 1u, uint32_t(L.hist.size() - mpos));
-              for (uint32_t i = 0; i < cap_lk; i++) drafts.push_back(L.hist[mpos + i]);
+              for (uint32_t i = 0; i < cap_lk; i++) lane_drafts[j].push_back(L.hist[mpos + i]);
               lk_hits++;
             }
           }
-          if (drafts.empty() && budget > 1u) {
-            std::vector<float> dprobs;
-            drafts = M.draft(L.anchor, std::min(draft_k, budget - 1u), &dprobs, nullptr, L.pending);
-            L.pending = 0;
-            uint32_t keep = 0;
-            while (keep < drafts.size() && (draft_cut <= 0.0f || dprobs[keep] >= draft_cut)) keep++;
-            drafts.resize(std::min<uint32_t>(keep, budget - 1u));
-          } else if (L.pending > 0) {
-            M.mtp_commit(L.pending);
-            L.pending = 0;
+          if (lane_drafts[j].empty() && budget > 1u) {
+            dreqs.push_back({int(act[j]), L.anchor});
+            dmap.push_back(j);
           }
+        }
+        if (!dreqs.empty()) {
+          std::vector<std::vector<uint32_t>> d_out;
+          std::vector<std::vector<float>> d_probs;
+          M.draft_lanes(dreqs, std::min(draft_k, budget - 1u), d_out, &d_probs);
+          for (size_t di = 0; di < dreqs.size(); di++) {
+            auto& dr = d_out[di];
+            const auto& dp = d_probs[di];
+            uint32_t keep = 0;
+            while (keep < dr.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
+            dr.resize(std::min<uint32_t>(keep, budget - 1u));
+            lane_drafts[dmap[di]] = std::move(dr);
+          }
+        }
+        std::vector<std::pair<int, std::vector<uint32_t>>> batches;
+        for (size_t j = 0; j < act.size(); j++) {
+          auto& L = ls[act[j]];
           std::vector<uint32_t> v{L.anchor};
-          v.insert(v.end(), drafts.begin(), drafts.end());
-          batches.push_back({int(k), v});
+          v.insert(v.end(), lane_drafts[j].begin(), lane_drafts[j].end());
+          batches.push_back({int(act[j]), std::move(v)});
         }
         t_draft += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
         double vms = 0;

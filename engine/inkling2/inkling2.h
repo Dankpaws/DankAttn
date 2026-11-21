@@ -12,6 +12,8 @@
 namespace ink2 {
 
 constexpr uint32_t MAXM = 16;   // rows per decode / verify step (mm2)
+constexpr uint32_t MTP_MAXL = 8; // max lanes in one batched DSpark draft call
+constexpr uint32_t MTP_MAXB = MTP_MAXL * 8u; // 64 rows across 8 lanes x block_size 8
 constexpr uint32_t MP = 512;    // max rows per chunked prefill step (mmp / mmpg)
 constexpr uint32_t PF_COMPACT = 6144;  // max compact padded MoE rows for MP=512 (512*8 + 128*15 = 6016)
 constexpr uint32_t MAX_BLOCKS = 12;
@@ -174,7 +176,7 @@ struct Model {
   id<MTLComputePipelineState> p_scores, p_scores_mma, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
   id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
-  id<MTLComputePipelineState> p_mmp_w8;
+  id<MTLComputePipelineState> p_mmp_w8, p_mmp_w8_mtp, p_mmp_w6_gu, p_mmp_w6_dn;
   id<MTLComputePipelineState> p_moe_fp4_gu, p_moe_fp4_dn;
   id<MTLComputePipelineState> p_moe_fp8_gu, p_moe_fp8_dn;
   id<MTLComputePipelineState> p_mmpg_fp4_gu, p_mmpg_fp4_dn;
@@ -182,7 +184,7 @@ struct Model {
   // DSpark pipelines
   id<MTLComputePipelineState> p_mtp_mix, p_mtp_kv_ctx, p_mtp_embed, p_mtp_qkv_rope;
   id<MTLComputePipelineState> p_mtp_attn, p_add_rms_frag, p_mtp_rnn_static, p_mtp_rnn_dyn, p_mtp_rnn_gates;
-  id<MTLComputePipelineState> p_mtp_add_argmax_p1, p_mtp_add_argmax_p2, p_sample_rows;
+  id<MTLComputePipelineState> p_mtp_add_argmax_p1, p_mtp_add_argmax_p2, p_pack_frag_rows, p_sample_rows;
   id<MTLResidencySet> rs = nil;
   id<MTLHeap> scratch_heap = nil;
 
@@ -229,11 +231,19 @@ struct Model {
   void rollback(uint32_t accepted, uint32_t M_step);
   // Commit `n_commit` accepted tokens' tapped target features (from the last step) into DSpark KV cache + f_rnn.
   void mtp_commit(uint32_t n_commit, double* gpu_ms = nullptr);
+  struct MtpCommitReq { int lane; uint32_t tap_row0; uint32_t n_commit; };
+  // Batched DSpark commit across lanes in one command buffer (reads kv_ctx weights once over total_tap_rows <= MAXM).
+  void mtp_commit_lanes(const std::vector<MtpCommitReq>& reqs, uint32_t total_tap_rows, double* gpu_ms = nullptr);
   // Draft up to `max_drafts` (1..7, default 7) tokens starting from `anchor_tok` at current `pos`.
   // If `n_commit > 0`, fuses `mtp_commit(n_commit)` into the same command buffer (zero extra GPU sync!).
   std::vector<uint32_t> draft(uint32_t anchor_tok, uint32_t max_drafts = 7,
                               std::vector<float>* draft_probs = nullptr, double* gpu_ms = nullptr,
                               uint32_t n_commit = 0);
+  struct MtpDraftReq { int lane; uint32_t anchor_tok; };
+  // Batched DSpark drafting across L lanes (L <= MTP_MAXL) in one command buffer; bit-exact vs sequential draft().
+  void draft_lanes(const std::vector<MtpDraftReq>& reqs, uint32_t max_drafts,
+                   std::vector<std::vector<uint32_t>>& out_drafts,
+                   std::vector<std::vector<float>>* out_probs = nullptr, double* gpu_ms = nullptr);
 };
 
 }  // namespace ink2

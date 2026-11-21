@@ -1410,7 +1410,7 @@ kernel void ink_mtp_qkv_rope(device const float* qkv [[buffer(0)]],
 // M5. GQA G=3 Shared-KV MTP Non-Causal Block Attention over [cached ctx] U [B block K/V].
 // Grid: (B, nkv, 1), TG: 128 threads (4 simdgroups, 3x fewer KV cache reads!).
 struct MtpAttnArgs {
-  uint B, nh, nkv, hd, ctx_len, cap, window, is_local, fork_pos;
+  uint B, nh, nkv, hd, ctx_len, cap, window, is_local, fork_pos, out_row0;
 };
 kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
                          device const bfloat4* K_ctx [[buffer(1)]],
@@ -1556,10 +1556,11 @@ kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
     const bfloat4 res = bfloat4(fo / fl);
     const uint col0 = (h0 + g) * a.hd + lane * 4u;
     const uint K = a.nh * a.hd;
-    out_frag[frag_off(row, col0 + 0u, K)] = res.x;
-    out_frag[frag_off(row, col0 + 1u, K)] = res.y;
-    out_frag[frag_off(row, col0 + 2u, K)] = res.z;
-    out_frag[frag_off(row, col0 + 3u, K)] = res.w;
+    const uint orow = a.out_row0 + row;
+    out_frag[frag_off(orow, col0 + 0u, K)] = res.x;
+    out_frag[frag_off(orow, col0 + 1u, K)] = res.y;
+    out_frag[frag_off(orow, col0 + 2u, K)] = res.z;
+    out_frag[frag_off(orow, col0 + 3u, K)] = res.w;
   }
 }
 
@@ -1674,12 +1675,13 @@ kernel void ink_mtp_rnn_dyn(device const float* state [[buffer(0)]],
   if (lane == 0u) proj_out[out_r] = acc + static_in[size_t(a.step) * (3u * a.R) + out_r];
 }
 
-// M7b. RNN gates update: state' = sigm(g)*state + (1-sigm(g))*tanh(c), latent = tanh(o) -> bf16 frag (M=1, K=256).
+// M7b. RNN gates update: state' = sigm(g)*state + (1-sigm(g))*tanh(c), latent = tanh(o) -> bf16 frag (row_idx, K=256).
 // Grid: (1, 1, 1), TG: 256 threads.
 kernel void ink_mtp_rnn_gates(device const float* proj [[buffer(0)]],
                               device float* state [[buffer(1)]],
                               device bfloat* lat_frag [[buffer(2)]],
                               constant uint& R [[buffer(3)]],
+                              constant uint& row_idx [[buffer(4)]],
                               uint tid [[thread_index_in_threadgroup]]) {
   if (tid >= R) return;
   const float g = float(bfloat(isigm(proj[tid])));
@@ -1688,7 +1690,28 @@ kernel void ink_mtp_rnn_gates(device const float* proj [[buffer(0)]],
   const float kept = float(bfloat(g * state[tid]));
   const float blend = float(bfloat(float(bfloat(1.0f - g)) * c));
   state[tid] = kept + blend;
-  lat_frag[frag_off(0u, tid, R)] = bfloat(o);
+  lat_frag[frag_off(row_idx, tid, R)] = bfloat(o);
+}
+
+// Pack L*gamma rows (base_h[i * B + 1 + k]) -> bf16 frag[i * gamma + k, H] for single batched lm_head.
+// Grid: (L * gamma, 1, 1), TG: 256 threads.
+struct PackFragArgs { uint H, B, gamma; };
+kernel void ink_pack_frag_rows(device const float4* src [[buffer(0)]], device bfloat* dst_frag [[buffer(1)]],
+                               constant PackFragArgs& a [[buffer(2)]],
+                               uint out_row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint lane_i = out_row / a.gamma;
+  const uint k = out_row % a.gamma;
+  const uint src_row = lane_i * a.B + 1u + k;
+  const uint H4 = a.H >> 2;
+  device const float4* sr = src + size_t(src_row) * H4;
+  for (uint c4 = tid; c4 < H4; c4 += 256u) {
+    const bfloat4 bv = bfloat4(sr[c4]);
+    const uint c = c4 << 2;
+    dst_frag[frag_off(out_row, c + 0u, a.H)] = bv.x;
+    dst_frag[frag_off(out_row, c + 1u, a.H)] = bv.y;
+    dst_frag[frag_off(out_row, c + 2u, a.H)] = bv.z;
+    dst_frag[frag_off(out_row, c + 3u, a.H)] = bv.w;
+  }
 }
 
 // M8. Parallel 2-stage add base_logits[step] + bias + fold_b -> softcap(30) -> argmax + online p_max.
