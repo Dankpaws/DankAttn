@@ -339,6 +339,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     ly.moe_dn = get_lin(p + ".moe.dn");
   }
 
+  ring_extra = getenv("INK_RING_SLACK") ? uint32_t(atoi(getenv("INK_RING_SLACK"))) : 0u;
   // Allocate per-logical-layer KV + sconv + rollback history (lane 0)
   alloc_state(S);
   lanes_.assign(1, Lane{});
@@ -501,7 +502,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
         auto& ml = MtpL[l];
         std::string p = "mtp.L" + std::to_string(l);
         ml.is_local = mtp_local[l];
-        ml.cap = ml.is_local ? (window + MP) : cap;
+        ml.cap = ml.is_local ? (window + MP + ring_extra) : cap;
         ml.dflare_norm = mraw(p + ".dflare_norm");
         ml.attn_norm = mraw(p + ".attn_norm");
         ml.mlp_norm = mraw(p + ".mlp_norm");
@@ -674,7 +675,7 @@ void Model::alloc_state(std::vector<LogicalState>& SS) {
   auto init_logical = [&](uint32_t log_idx, uint32_t phys_idx) {
     auto& st = SS[log_idx];
     st.phys_idx = phys_idx;
-    st.cap = L[phys_idx].is_local ? (window + MP) : cap;
+    st.cap = L[phys_idx].is_local ? (window + MP + ring_extra) : cap;
     st.kv8 = (!L[phys_idx].is_local) && use_kv8;
     if (st.kv8) {
       st.k_i8 = C.buf(size_t(st.cap) * nkv * hd);
@@ -783,6 +784,26 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<std::pair<int, std::ve
   }
   if (ids.empty() || ids.size() > MAXM) mtl::die("step_lanes: total rows must be in 1..MAXM");
   return step_core(ids, refs, gpu_ms, nullptr, all_logits, prof);
+}
+
+void Model::save_conv(std::vector<uint8_t>& out) const {
+  out.clear();
+  for (const auto& st : S)
+    for (id<MTLBuffer> b : {st.k_conv, st.v_conv, st.attn_conv, st.mlp_conv})
+      out.insert(out.end(), (const uint8_t*)[b contents], (const uint8_t*)[b contents] + [b length]);
+}
+
+void Model::rewind(uint32_t c, const std::vector<uint8_t>& conv) {
+  if (c > pos || pos - c > rewind_slack()) mtl::die("rewind: beyond the KV ring slack");
+  size_t off = 0;
+  for (auto& st : S)
+    for (id<MTLBuffer> b : {st.k_conv, st.v_conv, st.attn_conv, st.mlp_conv}) {
+      if (off + [b length] > conv.size()) mtl::die("rewind: conv snapshot size mismatch");
+      memcpy([b contents], conv.data() + off, [b length]);
+      off += [b length];
+    }
+  pos = c;
+  if (has_mtp) mtp_ctx_pos = c;
 }
 
 void Model::reset() {

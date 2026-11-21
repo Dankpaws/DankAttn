@@ -80,6 +80,7 @@ struct Model {
   uint32_t eos = 200006, cap = 32768;
   uint32_t nsp_local = 8, nsp_global = 8;
   bool big_gpu = false;
+  uint32_t ring_extra = 0;  // INK_RING_SLACK: extra local-ring rows, so a lane can rewind MP + ring_extra tokens
   bool qrel_mma = true;  // INK_QREL_MMA: prefill rel_logits via matmul2d (ink_q_rel_prep + ink_q_rel_mma)
   bool use_kv8 = true;
   float eps = 1e-6f, qk_clip = 22.627417f, rel_clip = 8.0f;
@@ -127,6 +128,11 @@ struct Model {
   // Make lane k the target of step / reset / rollback / draft. DSpark state is not per-lane yet.
   void use_lane(int k);
   uint32_t lane_pos(int k) const { return k == active_lane ? pos : lanes_[k].pos; }
+  // Rewind support for the active lane: the sconv states at a position (saved right after a prefill) plus the
+  // KV rings still holding the window before it. rewind(c) needs pos - c <= rewind_slack().
+  void save_conv(std::vector<uint8_t>& out) const;
+  void rewind(uint32_t c, const std::vector<uint8_t>& conv);
+  uint32_t rewind_slack() const { return MP + ring_extra; }
   struct LaneRef {
     std::vector<LogicalState>* S;
     uint32_t* pos;

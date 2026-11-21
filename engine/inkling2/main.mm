@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "serve.inc"
+
 static std::vector<uint32_t> read_ids_bin(const std::string& p) {
   std::ifstream f(p, std::ios::binary | std::ios::ate);
   if (!f) mtl::die(("cannot read " + p).c_str());
@@ -54,6 +56,8 @@ int main(int argc, char** argv) {
 
     // Default 5-token prompt: "The capital of France is"
     std::vector<uint32_t> paris_ids = {371, 151451, 149879, 151194, 149884};
+
+    if (cmd == "serve") return iserve::main(M);
 
     if (cmd == "smoke") {
       double ms = 0;
