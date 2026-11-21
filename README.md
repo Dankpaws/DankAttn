@@ -4,8 +4,9 @@
 
 DankAttn is a from-scratch Metal 4 inference engine for Apple Silicon, written in Objective-C++ and Metal Shading Language with a thin Python OpenAI-compatible HTTP front end.
 
-It currently targets two architectures:
+It currently targets three architectures:
 
+- **Inkling-2-Mini (`engine/inkling2/`)**: `thinkingmachines/Inkling-2-Mini` (`Inkling2LoopForConditionalGeneration`): 26.4B total / 3.4B physical active / 5.4B effective active via a 3-pass looped core (24 physical -> 48 logical layers: 40 SWA-1024 + 8 `kv8` global, native lossless NVFP4/MXFP8 MoE, DankAttn W8 attention/unembed, DSpark MTP drafter + 3-gram lookup). Fits in **32 GB Apple Silicon** (`~21.1 GB` total at 32k context; `~22.9 GB` at 128k).
 - **Hy4 (`engine/hy4/`)**: `tencent/Hy4-flash` (`HYV4FlashForCausalLM`): 42 layers (30 sliding-window MLA in bf16, 12 sparse DSA with `kv8` latent caches, 512-expert MoE, 4 SSD-offloaded FP8 Engram layers, and a 5-layer DFly2 drafter).
 - **Flash-Next (`engine/`)**: `qwen4_exp` (GDN + sparse attention + MoE + PLE n-gram tables + MTP drafter).
 
@@ -15,7 +16,9 @@ Everything runs directly on Apple Silicon Metal without PyTorch, MLX, or llama.c
 
 - **Hardware**: Apple Silicon with Metal 4 / `MetalPerformancePrimitives` (`mpp::tensor_ops` cooperative `matmul2d`). Developed and benchmarked on an M5 Ultra. Other Apple Silicon chips with Metal 4 support should work but have not been benchmarked here.
 - **OS & toolchain**: macOS with Metal 4.0 support and Xcode Command Line Tools (`clang++` with C++20 and Objective-C++ ARC).
-- **Memory**: For Hy4 (`pack-g64-gptq-v3`), ~87.3 GB mapped weights plus ~6.5 GB wired GPU state for 4 concurrent lanes (512k main slot + 3x 32k side lanes), plus fast local NVMe for the 63 GB FP8 Engram table.
+- **Memory**:
+  - For **Inkling-2-Mini (`pack-inkling2-mini-w8`)**: ~19.91 GB mapped weights (including DSpark overlay) plus ~1.22 GB GPU state at `cap=32k` (~2.99 GB at `cap=128k`), fitting comfortably on a **32 GB MacBook Pro**.
+  - For **Hy4 (`pack-g64-gptq-v3`)**: ~87.3 GB mapped weights plus ~6.5 GB wired GPU state for 4 concurrent lanes (512k main slot + 3x 32k side lanes), plus fast local NVMe for the 63 GB FP8 Engram table.
 - **Wired memory limit**: macOS defaults can cap wired GPU memory below what a 90+ GB model needs. The engine checks `iogpu.wired_limit_mb` at startup and prints the exact `sysctl` command if your limit is too low:
   ```sh
   sudo sysctl iogpu.wired_limit_mb=<MB>
@@ -68,6 +71,27 @@ Quality of `pack-g64-gptq-v3` against the bf16 reference: `wikitext-2` (24x 512-
 
 See [hy4/ARCHITECTURE_AND_PERF.md](hy4/ARCHITECTURE_AND_PERF.md) for per-op profiles, optimization history, and experiments that were tested and rejected.
 
+## Benchmarks & Quickstart (Inkling-2-Mini, `pack-inkling2-mini-w8`)
+
+Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16), `kv8` on the 8 global layers, DSpark MTP (`K=7, cut=0.50`) + 3-gram lookup (`19.91 GB` mapped + `1.22 GB` GPU state at `cap=32k`):
+
+| Workload | M5 Ultra Mac Studio (96 GB) | Base M5 MacBook Pro (32 GB) |
+| :--- | :---: | :---: |
+| `vtest` (`M=5` vs `M=1`) | `0.000e+00` (BIT-EXACT) | `0.000e+00` (BIT-EXACT) |
+| Prefill 2,048 tok (`MP=256`) | **1,610.9 tok/s GPU** (1.28 s) | **314.2 tok/s GPU** (6.52 s) |
+| Prefill 8,192 tok (`MP=256`) | **1,272.5 tok/s GPU** (6.47 s) | **236.2 tok/s GPU** (34.71 s) |
+| Decode `M=1` (`ctx=512 / 2k / 8k`) | **75.9 / 73.2 / 69.0 tok/s GPU** | **24.2 / 23.4 / 22.4 tok/s GPU** |
+| Speculative (`code_prompt.bin`, 256 tok) | **167.8 tok/s wall** (256/256 exact) | **41.4 tok/s wall** (256/256 exact) |
+
+```sh
+sh inkling2/build_inkling2.sh
+./build/dankattn-inkling2 "$INK_PACK" vtest
+./build/dankattn-inkling2 "$INK_PACK" pfbench 2048
+./build/dankattn-inkling2 "$INK_PACK" spec 256 prompt_ids.bin
+```
+
+See [inkling2/ARCHITECTURE_AND_PERF.md](inkling2/ARCHITECTURE_AND_PERF.md) for architecture details, MoE fan-out analysis, packing instructions, CLI flags, and environment variables.
+
 ## Architecture Highlights
 
 - **Register-direct quantized matmuls (`engine/kernels/mm2.metal`)**: W4, W6, and W8 weights unpacked directly into `mpp::tensor_ops::matmul2d` cooperative tensors with two-level split-K (`mm2`), shared-weight prefill (`mmp`), and indirect-dispatch grouped MoE prefill (`mmpg`) with fused SwiGLU epilogues (`EPI=3`).
@@ -84,10 +108,14 @@ engine/
   mm_args.h             Shared MmArgs struct (host/kernel ABI)
   lookup.h              Zero-allocation 3-gram context-lookup table
   kernels/
-    mm2.metal           W4/W6/W8 decode, prefill, and grouped MoE matmuls
+    mm2.metal           NVFP4/MXFP8/W4/W6/W8 decode, prefill, and grouped MoE matmuls
+    inkling2.metal      Inkling-2-Mini looped core, message gates, split-K GQA, MoE, DSpark MTP
     hy4.metal           Hy4 attention, indexer, MoE routing, Engram, DFly2, sampling
     attn.metal          Flash-Next attention kernels
     ops.metal           Flash-Next GDN and MoE kernels
+  inkling2/
+    inkling2.h, inkling2.mm  Inkling-2-Mini loader, step (decode/prefill), rollback, DSpark draft
+    main.mm             CLI driver (smoke, vtest, pfbench, bench, vbench, dprof, spec, gen)
   hy4/
     config.h            All HY4_* environment variables and defaults
     hy4.h, hy4.mm       Hy4 model loader, step/step_lanes, draft/draft_lanes, prefix cache
@@ -98,6 +126,11 @@ server/
   engine_frontend.py    Shared subprocess supervisor, binary framing, prefix splicer, HTTP helpers
   hy4_server.py         OpenAI-compatible FastAPI server for Hy4
   dankattn_server.py    OpenAI-compatible FastAPI server for Flash-Next
+inkling2/
+  ARCHITECTURE_AND_PERF.md  Inkling-2-Mini architecture, benchmarks, and CLI reference
+  build_inkling2.sh     Build script for build/dankattn-inkling2
+  convert/              Native NVFP4/MXFP8/W8 packer (pack_inkling2.py) & DSpark packer (pack_mtp.py)
+  ref/                  Standalone PyTorch golden reference (inkling2_golden.py)
 hy4/
   build_hy4.sh          Build script for build/dankattn-hy4
   serve_hy4.sh          Start/stop/status/smoke wrapper for :8341
