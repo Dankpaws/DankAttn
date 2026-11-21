@@ -1,5 +1,5 @@
-// DankAttn (Inkling-2-Mini): Inkling2LoopForConditionalGeneration (text tower) on Metal 4.
-// Shares register-direct matmuls (kernels/mm2.metal, including native NVFP4 WBITS=40 & MXFP8 WBITS=80)
+// DankAttn (Inkling-2-Mini): Inkling2LoopForConditionalGeneration (text tower) + DSpark MTP on Metal 4.
+// Shares register-direct matmuls (kernels/mm2.metal: W8, W6, native NVFP4 WBITS=40, native MXFP8 WBITS=80)
 // and mtl.h with Hy4 and Flash-Next.
 #pragma once
 #include "../mtl.h"
@@ -47,12 +47,23 @@ struct PhysLayer {
 struct LogicalState {
   uint32_t phys_idx = 0;
   uint32_t cap = 0;
+  bool kv8 = false;
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
-  id<MTLBuffer> k_conv = nil;     // [3, nkv * hd] f32
-  id<MTLBuffer> v_conv = nil;     // [3, nkv * hd] f32
-  id<MTLBuffer> attn_conv = nil;  // [3, H] f32
-  id<MTLBuffer> mlp_conv = nil;   // [3, H] f32
+  id<MTLBuffer> k_i8 = nil, k_sc = nil;
+  id<MTLBuffer> v_i8 = nil, v_sc = nil;
+  id<MTLBuffer> k_conv = nil, k_hist = nil;       // [3, C] and [3 + MAXM, C] f32
+  id<MTLBuffer> v_conv = nil, v_hist = nil;
+  id<MTLBuffer> attn_conv = nil, attn_hist = nil;
+  id<MTLBuffer> mlp_conv = nil, mlp_hist = nil;
+};
+
+struct MtpLayer {
+  bool is_local = false;
+  uint32_t cap = 0;
+  Raw dflare_norm, attn_norm, mlp_norm, q_norm, k_norm, k_norm_ctx;
+  Lin qkv, kv_ctx, o, mlp_gu, mlp_dn;
+  id<MTLBuffer> k_cache = nil, v_cache = nil;
 };
 
 struct Model {
@@ -65,12 +76,14 @@ struct Model {
   uint32_t E = 128, topk = 8, I_moe = 1152, ks = 4, n_per_block = 6;
   uint32_t core_start = 6, core_end = 18, num_passes = 3, gate_rank = 64;
   uint32_t eos = 200006, cap = 32768;
+  bool use_kv8 = true;
   float eps = 1e-6f, qk_clip = 22.627417f, rel_clip = 8.0f;
   float log_n_floor = 8192.0f, log_alpha = 0.1f, route_scale = 8.0f;
   float gate_softcap = 4.0f, up_softcap = 25.0f, logit_softcap = 30.0f;
 
   // Mapped shard files
   std::vector<id<MTLBuffer>> files;
+  std::vector<id<MTLBuffer>> mtp_files;
   size_t mapped_bytes = 0;
 
   // Weights
@@ -78,17 +91,31 @@ struct Model {
   Lin lm_head;
   std::vector<PhysLayer> L;
 
-  // Per-logical-layer state (size = 24 + (num_passes - 1) * (core_end - core_start))
+  // Per-logical-layer state
   std::vector<LogicalState> S;
   uint32_t pos = 0;
+
+  // DSpark MTP drafter (optional overlay: mtp_manifest.json + pack-mtp-00.bin)
+  bool has_mtp = false;
+  uint32_t mtp_nL = 3, mtp_I = 9216, mtp_block = 8, mtp_rank = 256;
+  float mtp_rope_theta = 1000000.0f;
+  uint32_t mtp_taps[4] = {5, 23, 41, 48};
+  uint32_t mtp_ctx_pos = 0;
+  Raw mtp_fuse_alpha, mtp_mask_embed, mtp_norm;
+  Raw mtp_mh_dflare_norm, mtp_mh_markov_w1, mtp_mh_rnn_w, mtp_mh_rnn_b, mtp_mh_fold_b;
+  Lin mtp_mh_fold_w;
+  std::vector<MtpLayer> MtpL;
 
   // Pipelines
   id<MTLComputePipelineState> p_embed, p_attn_res, p_mg_prep, p_mg_down, p_mg_apply, p_rms_frag;
   id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_scores, p_route, p_moe_accum, p_softcap_argmax, p_copy;
-  id<MTLComputePipelineState> p_mm_w8, p_mm_w8_red2;
+  id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
   id<MTLComputePipelineState> p_moe_fp4_gu, p_moe_fp4_dn;
   id<MTLComputePipelineState> p_moe_fp8_gu, p_moe_fp8_dn;
+  // DSpark pipelines
+  id<MTLComputePipelineState> p_mtp_mix, p_mtp_kv_ctx, p_mtp_embed, p_mtp_qkv_rope;
+  id<MTLComputePipelineState> p_mtp_attn, p_add_f32, p_mtp_rnn_proj, p_mtp_rnn_gates, p_mtp_add_argmax;
   id<MTLResidencySet> rs = nil;
 
   // Scratch buffers (sized for MAXM = 16)
@@ -99,16 +126,28 @@ struct Model {
   id<MTLBuffer> b_qgrs, b_k_raw, b_v_raw, b_Q, b_rel_logits, b_gate, b_sinks, b_o_out;
   id<MTLBuffer> b_top_idx, b_top_w, b_slots, b_nslots, b_rmask;
   id<MTLBuffer> b_moe_y, b_moe_out, b_logits, b_tok_out;
-  id<MTLBuffer> b_partials, b_cnt;
   id<MTLBuffer> b_dummy;
 
-  void load(const std::string& pack_dir, uint32_t max_cap = 32768, uint32_t passes_override = 0);
+  // DSpark scratch buffers
+  id<MTLBuffer> b_taps;          // [4, MAXM, H] f32 captured target hidden states
+  id<MTLBuffer> b_mtp_f_rnn;     // [H] f32 mixed context feature for Markov RNN
+  id<MTLBuffer> b_mtp_h, b_mtp_frag, b_mtp_qkv, b_mtp_kv_ctx, b_mtp_Q, b_mtp_K_blk, b_mtp_V_blk;
+  id<MTLBuffer> b_mtp_o_frag, b_mtp_o_out, b_mtp_gu_frag, b_mtp_dn_out;
+  id<MTLBuffer> b_mtp_base_h, b_mtp_base_logits, b_mtp_bias;
+  id<MTLBuffer> b_mtp_rnn_state, b_mtp_rnn_proj, b_mtp_lat_frag, b_mtp_prev_tok, b_mtp_draft_out;
+
+  void load(const std::string& pack_dir, uint32_t max_cap = 32768, uint32_t passes_override = 0, bool kv8 = true);
   void reset();
   // Run M <= MAXM tokens starting at current `pos`, advancing `pos += M`.
-  // Returns greedy argmax token for each row; optionally writes last row's logits, timing, and per-op profile.
   std::vector<uint32_t> step(const std::vector<uint32_t>& ids, double* gpu_ms = nullptr,
                              std::vector<float>* last_logits = nullptr,
                              std::map<std::string, double>* prof = nullptr);
+  // Roll back sconv state & `pos` after verifying `M_step` rows and accepting `accepted` (1 <= accepted <= M_step).
+  void rollback(uint32_t accepted, uint32_t M_step);
+  // Commit `n_commit` accepted tokens' tapped target features (from the last step) into DSpark KV cache + f_rnn.
+  void mtp_commit(uint32_t n_commit, double* gpu_ms = nullptr);
+  // Draft `mtp_block - 1` (7) tokens starting from `anchor_tok` at current `pos`.
+  std::vector<uint32_t> draft(uint32_t anchor_tok, double* gpu_ms = nullptr);
 };
 
 }  // namespace ink2

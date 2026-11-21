@@ -36,9 +36,10 @@ int main(int argc, char** argv) {
     std::string cmd = argv[2];
     uint32_t cap = getenv("INK_CAP") ? uint32_t(atoi(getenv("INK_CAP"))) : 32768u;
     uint32_t passes = getenv("INK_PASSES") ? uint32_t(atoi(getenv("INK_PASSES"))) : 0u;
+    bool kv8 = getenv("INK_KV8") ? (atoi(getenv("INK_KV8")) != 0) : true;
 
     ink2::Model M;
-    M.load(pack, cap, passes);
+    M.load(pack, cap, passes, kv8);
 
     // Default 5-token prompt: "The capital of France is"
     std::vector<uint32_t> paris_ids = {371, 151451, 149879, 151194, 149884};
@@ -107,6 +108,86 @@ int main(int argc, char** argv) {
       printf("dprof (ctx=%u, unprofiled=%.2f ms = %.1f tok/s, profiled_sum=%.2f ms):\n",
              n_ctx, unprof_ms, 1000.0 / unprof_ms, tot);
       for (auto& [v, k] : rows) printf("  %-14s %6.2f ms (%4.1f%%)\n", k.c_str(), v, 100.0 * v / tot);
+      return 0;
+    }
+
+    if (cmd == "spec") {
+      if (!M.has_mtp) mtl::die("spec requires DSpark overlay (mtp_manifest.json)");
+      uint32_t n_gen = argc > 3 ? uint32_t(atoi(argv[3])) : 128u;
+      std::vector<uint32_t> prompt_ids = (argc > 4 && std::string(argv[4]) != "nocheck")
+          ? read_ids_bin(argv[4]) : paris_ids;
+      bool verify_exact = (argc <= 5 || std::string(argv[5]) != "nocheck");
+
+      // 1. Prefill prompt + commit MTP context KV (chunked by 16)
+      uint32_t anchor = 0;
+      for (size_t i = 0; i < prompt_ids.size(); i += 16) {
+        size_t n = std::min<size_t>(16, prompt_ids.size() - i);
+        std::vector<uint32_t> ch(prompt_ids.begin() + i, prompt_ids.begin() + i + n);
+        anchor = M.step(ch).back();
+        M.mtp_commit(uint32_t(n));
+      }
+
+      std::vector<uint32_t> spec_toks;
+      spec_toks.reserve(n_gen + 8);
+      spec_toks.push_back(anchor);
+
+      double t_draft = 0, t_verify = 0, t_commit = 0;
+      uint32_t rounds = 0, total_acc = 0;
+      auto t0 = std::chrono::steady_clock::now();
+
+      while (spec_toks.size() < n_gen) {
+        double dms = 0, vms = 0, cms = 0;
+        auto drafts = M.draft(anchor, &dms);
+        t_draft += dms;
+
+        // Verify [anchor, d0, d1, ..., d6] (M = 8 rows)
+        std::vector<uint32_t> v_in;
+        v_in.reserve(1 + drafts.size());
+        v_in.push_back(anchor);
+        for (uint32_t d : drafts) v_in.push_back(d);
+
+        auto v_out = M.step(v_in, &vms);
+        t_verify += vms;
+
+        // Count longest accepted prefix: v_out[i] predicts the token AFTER v_in[i]
+        uint32_t acc = 0;
+        while (acc < drafts.size() && v_out[acc] == drafts[acc]) acc++;
+        // We always accept anchor + acc draft tokens (= acc + 1 positions advanced),
+        // and the new anchor is v_out[acc] (either the corrected token or bonus token!)
+        const uint32_t n_adv = acc + 1u;
+        M.rollback(n_adv, uint32_t(v_in.size()));
+        M.mtp_commit(n_adv, &cms);
+        t_commit += cms;
+
+        for (uint32_t i = 0; i < acc && spec_toks.size() < n_gen; i++) spec_toks.push_back(drafts[i]);
+        anchor = v_out[acc];
+        if (spec_toks.size() < n_gen) spec_toks.push_back(anchor);
+        total_acc += n_adv;
+        rounds++;
+      }
+      double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      uint32_t gen_n = uint32_t(spec_toks.size()) - 1u;
+      printf("spec (%u tok, %u rounds, %.2f tok/round): %.1f tok/s wall (draft=%.2f ms, verify=%.2f ms, commit=%.2f ms per round)\n",
+             gen_n, rounds, double(total_acc) / rounds, 1000.0 * gen_n / wall_ms,
+             t_draft / rounds, t_verify / rounds, t_commit / rounds);
+
+      if (verify_exact) {
+        M.reset();
+        uint32_t tok = 0;
+        for (size_t i = 0; i < prompt_ids.size(); i += 16) {
+          size_t n = std::min<size_t>(16, prompt_ids.size() - i);
+          std::vector<uint32_t> ch(prompt_ids.begin() + i, prompt_ids.begin() + i + n);
+          tok = M.step(ch).back();
+        }
+        uint32_t match = 0;
+        for (uint32_t i = 0; i < spec_toks.size(); i++) {
+          if (tok == spec_toks[i]) match++;
+          if (i + 1 < spec_toks.size()) tok = M.step({tok})[0];
+        }
+        printf("spec exact check: %u/%zu greedy tokens match (%s)\n",
+               match, spec_toks.size(), (match == spec_toks.size()) ? "100% EXACT" : "MISMATCH");
+        return (match == spec_toks.size()) ? 0 : 1;
+      }
       return 0;
     }
 
