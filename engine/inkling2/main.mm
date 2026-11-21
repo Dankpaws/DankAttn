@@ -1,5 +1,6 @@
-// DankAttn (Inkling-2-Mini) CLI driver: test, vtest, gen, bench.
+// DankAttn (Inkling-2-Mini) CLI driver: smoke, vtest, dprof, pfbench, spec, bench, vbench, gen.
 #import "inkling2.h"
+#include "../lookup.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -87,10 +88,10 @@ int main(int argc, char** argv) {
 
     if (cmd == "dprof") {
       uint32_t n_ctx = argc > 3 ? uint32_t(atoi(argv[3])) : 128u;
-      std::vector<uint32_t> chunk(16);
-      for (uint32_t i = 0; i < n_ctx; i += 16) {
-        uint32_t n = std::min(16u, n_ctx - i);
-        chunk.assign(n, 371u);
+      std::vector<uint32_t> chunk;
+      for (uint32_t i = 0; i < n_ctx; i += ink2::MP) {
+        uint32_t n = std::min(ink2::MP, n_ctx - i);
+        chunk.resize(n);
         for (uint32_t j = 0; j < n; j++) chunk[j] = paris_ids[(i + j) % paris_ids.size()];
         M.step(chunk);
       }
@@ -111,6 +112,43 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (cmd == "pfbench") {
+      uint32_t n_tok = argc > 3 ? uint32_t(atoi(argv[3])) : 2048u;
+      // 1. Verify M=64 mmp/mmpg prefill against sequential M=1
+      std::vector<uint32_t> chk(64);
+      for (uint32_t i = 0; i < 64; i++) chk[i] = paris_ids[i % paris_ids.size()];
+      std::vector<float> l_pf, l_seq;
+      auto opf = M.step(chk, nullptr, &l_pf);
+      M.reset();
+      uint32_t last_seq = 0;
+      for (uint32_t i = 0; i < 64; i++) {
+        last_seq = M.step({chk[i]}, nullptr, (i + 1 == 64) ? &l_seq : nullptr)[0];
+      }
+      float max_diff = 0.0f;
+      for (size_t i = 0; i < l_pf.size(); i++) max_diff = std::max(max_diff, std::fabs(l_pf[i] - l_seq[i]));
+      printf("pfcheck (M=64 vs seq): pf_tok=%u seq_tok=%u max_logit_diff=%.3e (%s)\n",
+             opf.back(), last_seq, max_diff, (opf.back() == last_seq) ? "EXACT TOK" : "DIFF");
+
+      // 2. Benchmark chunked prefill (MP=256)
+      M.reset();
+      std::vector<uint32_t> chunk;
+      double tot_gpu_ms = 0;
+      auto t0 = std::chrono::steady_clock::now();
+      for (uint32_t i = 0; i < n_tok; i += ink2::MP) {
+        uint32_t n = std::min(ink2::MP, n_tok - i);
+        chunk.resize(n);
+        for (uint32_t j = 0; j < n; j++) chunk[j] = paris_ids[(i + j) % paris_ids.size()];
+        double ms = 0;
+        M.step(chunk, &ms);
+        tot_gpu_ms += ms;
+      }
+      double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      printf("pfbench (n_tok=%u, chunk=%u): %.1f ms GPU (%.1f tok/s GPU), %.1f ms wall (%.1f tok/s wall)\n",
+             n_tok, ink2::MP, tot_gpu_ms, 1000.0 * n_tok / tot_gpu_ms,
+             wall_ms, 1000.0 * n_tok / wall_ms);
+      return (opf.back() == last_seq) ? 0 : 1;
+    }
+
     if (cmd == "spec") {
       if (!M.has_mtp) mtl::die("spec requires DSpark overlay (mtp_manifest.json)");
       uint32_t n_gen = argc > 3 ? uint32_t(atoi(argv[3])) : 128u;
@@ -118,33 +156,70 @@ int main(int argc, char** argv) {
           ? read_ids_bin(argv[4]) : paris_ids;
       bool verify_exact = (argc <= 5 || std::string(argv[5]) != "nocheck");
 
-      // 1. Prefill prompt + commit MTP context KV (chunked by 16)
+      const uint32_t draft_k = getenv("INK_DRAFT_K") ? uint32_t(atoi(getenv("INK_DRAFT_K"))) : 7u;
+      const float draft_cut = getenv("INK_DRAFT_CUT") ? float(atof(getenv("INK_DRAFT_CUT"))) : 0.50f;
+      const bool use_lookup = getenv("INK_LOOKUP") ? (atoi(getenv("INK_LOOKUP")) != 0) : true;
+
+      // 1. Prefill prompt + commit MTP context KV (chunked by MP=256)
+      double pf_gpu_ms = 0;
       uint32_t anchor = 0;
-      for (size_t i = 0; i < prompt_ids.size(); i += 16) {
-        size_t n = std::min<size_t>(16, prompt_ids.size() - i);
+      for (size_t i = 0; i < prompt_ids.size(); i += ink2::MP) {
+        size_t n = std::min<size_t>(ink2::MP, prompt_ids.size() - i);
         std::vector<uint32_t> ch(prompt_ids.begin() + i, prompt_ids.begin() + i + n);
-        anchor = M.step(ch).back();
+        double ms = 0;
+        anchor = M.step(ch, &ms).back();
+        pf_gpu_ms += ms;
         M.mtp_commit(uint32_t(n));
       }
 
+      std::vector<uint32_t> hist = prompt_ids;
+      opus_lookup::Lookup lk;
+
       std::vector<uint32_t> spec_toks;
-      spec_toks.reserve(n_gen + 8);
+      spec_toks.reserve(n_gen + 16);
       spec_toks.push_back(anchor);
 
       double t_draft = 0, t_verify = 0, t_commit = 0;
-      uint32_t rounds = 0, total_acc = 0;
+      uint32_t rounds = 0, total_acc = 0, total_drafted = 0, lk_hits = 0;
       auto t0 = std::chrono::steady_clock::now();
 
       while (spec_toks.size() < n_gen) {
         double dms = 0, vms = 0, cms = 0;
-        auto drafts = M.draft(anchor, &dms);
-        t_draft += dms;
+        std::vector<uint32_t> drafts;
 
-        // Verify [anchor, d0, d1, ..., d6] (M = 8 rows)
+        // Optional 3-gram context lookup before DSpark
+        if (use_lookup && hist.size() >= 4) {
+          lk.sync(hist, false);
+          std::vector<uint32_t> tail;
+          const size_t tlen = std::min<size_t>(hist.size(), 63);
+          tail.insert(tail.end(), hist.end() - long(tlen), hist.end());
+          tail.push_back(anchor);
+          uint32_t mlen = 0;
+          uint32_t mpos = lk.find(hist, tail, &mlen);
+          if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
+            const uint32_t cap_lk = std::min<uint32_t>(ink2::MAXM - 1u, uint32_t(hist.size() - mpos));
+            for (uint32_t i = 0; i < cap_lk; i++) drafts.push_back(hist[mpos + i]);
+            lk_hits++;
+          }
+        }
+
+        if (drafts.empty()) {
+          std::vector<float> dprobs;
+          drafts = M.draft(anchor, draft_k, &dprobs, &dms);
+          t_draft += dms;
+          if (draft_cut > 0.0f) {
+            uint32_t keep = 0;
+            while (keep < drafts.size() && dprobs[keep] >= draft_cut) keep++;
+            drafts.resize(keep);
+          }
+        }
+
+        // Verify [anchor, d0, ..., d_{k-1}] (M = 1 + drafts.size() <= 16)
         std::vector<uint32_t> v_in;
         v_in.reserve(1 + drafts.size());
         v_in.push_back(anchor);
         for (uint32_t d : drafts) v_in.push_back(d);
+        total_drafted += uint32_t(drafts.size());
 
         auto v_out = M.step(v_in, &vms);
         t_verify += vms;
@@ -152,14 +227,16 @@ int main(int argc, char** argv) {
         // Count longest accepted prefix: v_out[i] predicts the token AFTER v_in[i]
         uint32_t acc = 0;
         while (acc < drafts.size() && v_out[acc] == drafts[acc]) acc++;
-        // We always accept anchor + acc draft tokens (= acc + 1 positions advanced),
-        // and the new anchor is v_out[acc] (either the corrected token or bonus token!)
         const uint32_t n_adv = acc + 1u;
         M.rollback(n_adv, uint32_t(v_in.size()));
         M.mtp_commit(n_adv, &cms);
         t_commit += cms;
 
-        for (uint32_t i = 0; i < acc && spec_toks.size() < n_gen; i++) spec_toks.push_back(drafts[i]);
+        hist.push_back(anchor);
+        for (uint32_t i = 0; i < acc; i++) {
+          hist.push_back(drafts[i]);
+          if (spec_toks.size() < n_gen) spec_toks.push_back(drafts[i]);
+        }
         anchor = v_out[acc];
         if (spec_toks.size() < n_gen) spec_toks.push_back(anchor);
         total_acc += n_adv;
@@ -167,15 +244,18 @@ int main(int argc, char** argv) {
       }
       double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       uint32_t gen_n = uint32_t(spec_toks.size()) - 1u;
-      printf("spec (%u tok, %u rounds, %.2f tok/round): %.1f tok/s wall (draft=%.2f ms, verify=%.2f ms, commit=%.2f ms per round)\n",
-             gen_n, rounds, double(total_acc) / rounds, 1000.0 * gen_n / wall_ms,
-             t_draft / rounds, t_verify / rounds, t_commit / rounds);
+      printf("spec (K=%u cut=%.2f lk=%d | %u tok, %u rounds, %.2f tok/rnd, avg_draft=%.2f, lk_hits=%u): "
+             "%.1f tok/s wall (draft=%.2f ms, verify=%.2f ms, commit=%.2f ms | pf=%zu tok in %.1f ms)\n",
+             draft_k, draft_cut, use_lookup ? 1 : 0, gen_n, rounds,
+             double(total_acc) / rounds, double(total_drafted) / rounds, lk_hits,
+             1000.0 * gen_n / wall_ms, t_draft / rounds, t_verify / rounds, t_commit / rounds,
+             prompt_ids.size(), pf_gpu_ms);
 
       if (verify_exact) {
         M.reset();
         uint32_t tok = 0;
-        for (size_t i = 0; i < prompt_ids.size(); i += 16) {
-          size_t n = std::min<size_t>(16, prompt_ids.size() - i);
+        for (size_t i = 0; i < prompt_ids.size(); i += ink2::MP) {
+          size_t n = std::min<size_t>(ink2::MP, prompt_ids.size() - i);
           std::vector<uint32_t> ch(prompt_ids.begin() + i, prompt_ids.begin() + i + n);
           tok = M.step(ch).back();
         }
@@ -222,10 +302,10 @@ int main(int argc, char** argv) {
     if (cmd == "bench") {
       uint32_t n_ctx = argc > 3 ? uint32_t(atoi(argv[3])) : 512u;
       uint32_t n_gen = argc > 4 ? uint32_t(atoi(argv[4])) : 64u;
-      std::vector<uint32_t> chunk(16);
-      for (uint32_t i = 0; i < n_ctx; i += 16) {
-        uint32_t n = std::min(16u, n_ctx - i);
-        chunk.assign(n, 371u);
+      std::vector<uint32_t> chunk;
+      for (uint32_t i = 0; i < n_ctx; i += ink2::MP) {
+        uint32_t n = std::min(ink2::MP, n_ctx - i);
+        chunk.resize(n);
         for (uint32_t j = 0; j < n; j++) chunk[j] = paris_ids[(i + j) % paris_ids.size()];
         M.step(chunk);
       }

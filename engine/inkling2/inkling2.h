@@ -12,6 +12,8 @@
 namespace ink2 {
 
 constexpr uint32_t MAXM = 16;   // rows per decode / verify step (mm2)
+constexpr uint32_t MP = 256;    // max rows per chunked prefill step (mmp / mmpg)
+constexpr uint32_t PF_COMPACT = 4096;  // max compact padded MoE rows for MP=256 (256*8 + 128*15 = 3968)
 constexpr uint32_t MAX_BLOCKS = 12;
 constexpr uint32_t ASPLITS = 8; // fixed attention key splits (bit-exact across M)
 
@@ -110,9 +112,13 @@ struct Model {
   id<MTLComputePipelineState> p_embed, p_attn_res, p_mg_prep, p_mg_down, p_mg_apply, p_rms_frag;
   id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_scores, p_route, p_moe_accum, p_softcap_argmax, p_copy;
+  id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
   id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
+  id<MTLComputePipelineState> p_mmp_w8;
   id<MTLComputePipelineState> p_moe_fp4_gu, p_moe_fp4_dn;
   id<MTLComputePipelineState> p_moe_fp8_gu, p_moe_fp8_dn;
+  id<MTLComputePipelineState> p_mmpg_fp4_gu, p_mmpg_fp4_dn;
+  id<MTLComputePipelineState> p_mmpg_fp8_gu, p_mmpg_fp8_dn;
   // DSpark pipelines
   id<MTLComputePipelineState> p_mtp_mix, p_mtp_kv_ctx, p_mtp_embed, p_mtp_qkv_rope;
   id<MTLComputePipelineState> p_mtp_attn, p_add_f32, p_mtp_rnn_proj, p_mtp_rnn_gates, p_mtp_add_argmax;
@@ -125,20 +131,22 @@ struct Model {
   id<MTLBuffer> b_frag_q, b_frag_k, b_frag_v, b_frag_o, b_frag_m, b_frag_gu;
   id<MTLBuffer> b_qgrs, b_k_raw, b_v_raw, b_Q, b_rel_logits, b_gate, b_sinks, b_o_out;
   id<MTLBuffer> b_top_idx, b_top_w, b_slots, b_nslots, b_rmask;
+  id<MTLBuffer> b_roff, b_rcnt, b_rlist, b_rpos, b_wtile, b_ind_gu, b_ind_dn;
   id<MTLBuffer> b_moe_y, b_moe_out, b_logits, b_tok_out;
   id<MTLBuffer> b_dummy;
 
   // DSpark scratch buffers
-  id<MTLBuffer> b_taps;          // [4, MAXM, H] f32 captured target hidden states
-  id<MTLBuffer> b_mtp_f_rnn;     // [H] f32 mixed context feature for Markov RNN
+  id<MTLBuffer> b_taps;          // [4, MP, H] f32 captured target hidden states
+  id<MTLBuffer> b_mtp_f_rnn;     // [MP, H] f32 mixed context feature for Markov RNN
   id<MTLBuffer> b_mtp_h, b_mtp_frag, b_mtp_qkv, b_mtp_kv_ctx, b_mtp_Q, b_mtp_K_blk, b_mtp_V_blk;
   id<MTLBuffer> b_mtp_o_frag, b_mtp_o_out, b_mtp_gu_frag, b_mtp_dn_out;
   id<MTLBuffer> b_mtp_base_h, b_mtp_base_logits, b_mtp_bias;
-  id<MTLBuffer> b_mtp_rnn_state, b_mtp_rnn_proj, b_mtp_lat_frag, b_mtp_prev_tok, b_mtp_draft_out;
+  id<MTLBuffer> b_mtp_rnn_state, b_mtp_rnn_proj, b_mtp_lat_frag, b_mtp_prev_tok, b_mtp_draft_out, b_mtp_draft_probs;
 
   void load(const std::string& pack_dir, uint32_t max_cap = 32768, uint32_t passes_override = 0, bool kv8 = true);
   void reset();
-  // Run M <= MAXM tokens starting at current `pos`, advancing `pos += M`.
+  // Run M <= MP tokens starting at current `pos`, advancing `pos += M`.
+  // M <= MAXM uses bit-exact mm2 decode/verify; M > MAXM uses mmp/mmpg chunked prefill (computes last row's logits).
   std::vector<uint32_t> step(const std::vector<uint32_t>& ids, double* gpu_ms = nullptr,
                              std::vector<float>* last_logits = nullptr,
                              std::map<std::string, double>* prof = nullptr);
@@ -146,8 +154,9 @@ struct Model {
   void rollback(uint32_t accepted, uint32_t M_step);
   // Commit `n_commit` accepted tokens' tapped target features (from the last step) into DSpark KV cache + f_rnn.
   void mtp_commit(uint32_t n_commit, double* gpu_ms = nullptr);
-  // Draft `mtp_block - 1` (7) tokens starting from `anchor_tok` at current `pos`.
-  std::vector<uint32_t> draft(uint32_t anchor_tok, double* gpu_ms = nullptr);
+  // Draft up to `max_drafts` (1..7, default 7) tokens starting from `anchor_tok` at current `pos`.
+  std::vector<uint32_t> draft(uint32_t anchor_tok, uint32_t max_drafts = 7,
+                              std::vector<float>* draft_probs = nullptr, double* gpu_ms = nullptr);
 };
 
 }  // namespace ink2

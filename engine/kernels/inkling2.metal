@@ -318,9 +318,12 @@ kernel void ink_kv_conv_cache(device const float* in_kv [[buffer(0)]],
   float h0 = conv_state[0u * C + ch];
   float h1 = conv_state[1u * C + ch];
   float h2 = conv_state[2u * C + ch];
-  conv_hist[0u * C + ch] = h0;
-  conv_hist[1u * C + ch] = h1;
-  conv_hist[2u * C + ch] = h2;
+  const bool save_hist = (a.M <= 16u);
+  if (save_hist) {
+    conv_hist[0u * C + ch] = h0;
+    conv_hist[1u * C + ch] = h1;
+    conv_hist[2u * C + ch] = h2;
+  }
   const float inv_denom = a.is_global ? rsqrt(float(2u * a.ks + 1u)) : rsqrt(float(a.ks + 1u));
 
   float sw0, sw1, sw2, sw3;
@@ -339,7 +342,7 @@ kernel void ink_kv_conv_cache(device const float* in_kv [[buffer(0)]],
   threadgroup float sm[4];
   for (uint m = 0; m < a.M; m++) {
     const float x = in_kv[size_t(m) * a.k_stride + ch];
-    conv_hist[(3u + m) * C + ch] = x;
+    if (save_hist) conv_hist[(3u + m) * C + ch] = x;
     float y;
     if (!a.is_global) {
       y = (sw0 * x + sw1 * h2 + sw2 * h1 + sw3 * h0 + x) * inv_denom;
@@ -517,9 +520,12 @@ kernel void ink_post_sconv_add(device const float* y_in [[buffer(0)]],
   float h0 = conv_state[0u * a.H + ch];
   float h1 = conv_state[1u * a.H + ch];
   float h2 = conv_state[2u * a.H + ch];
-  conv_hist[0u * a.H + ch] = h0;
-  conv_hist[1u * a.H + ch] = h1;
-  conv_hist[2u * a.H + ch] = h2;
+  const bool save_hist = (a.M <= 16u);
+  if (save_hist) {
+    conv_hist[0u * a.H + ch] = h0;
+    conv_hist[1u * a.H + ch] = h1;
+    conv_hist[2u * a.H + ch] = h2;
+  }
   const float sw3 = sconv_w[ch * 4u + 0u];
   const float sw2 = sconv_w[ch * 4u + 1u];
   const float sw1 = sconv_w[ch * 4u + 2u];
@@ -528,7 +534,7 @@ kernel void ink_post_sconv_add(device const float* y_in [[buffer(0)]],
 
   for (uint m = 0; m < a.M; m++) {
     const float x = y_in[size_t(m) * a.H + ch];
-    conv_hist[(3u + m) * a.H + ch] = x;
+    if (save_hist) conv_hist[(3u + m) * a.H + ch] = x;
     const float cv = (sw0 * x + sw1 * h2 + sw2 * h1 + sw3 * h0 + x) * inv_denom;
     h0 = h1; h1 = h2; h2 = x;
 
@@ -1026,7 +1032,7 @@ kernel void ink_mtp_rnn_gates(device const float* proj [[buffer(0)]],
   lat_frag[frag_off(0u, tid, R)] = bfloat(o);
 }
 
-// M8. Add base_logits[step] + bias + fold_b -> softcap(30) -> argmax -> prev_tok_buf & draft_out[step].
+// M8. Add base_logits[step] + bias + fold_b -> softcap(30) -> argmax + online p_max.
 // Grid: (1, 1, 1), TG: 256 threads.
 struct MtpPickArgs {
   uint V_valid, V_pad, step;
@@ -1037,30 +1043,173 @@ kernel void ink_mtp_add_argmax(device const float* base_logits [[buffer(0)]],
                                device const float* fold_b [[buffer(2)]],
                                device uint* prev_tok_buf [[buffer(3)]],
                                device uint* draft_out [[buffer(4)]],
-                               constant MtpPickArgs& a [[buffer(5)]],
+                               device float* draft_probs [[buffer(5)]],
+                               constant MtpPickArgs& a [[buffer(6)]],
                                uint tid [[thread_index_in_threadgroup]],
                                uint tpg [[threads_per_threadgroup]]) {
   threadgroup float sm_v[8];
   threadgroup uint sm_i[8];
+  threadgroup float sm_l[8];
   device const float* bl = base_logits + size_t(a.step) * a.V_pad;
   float bv = -1e30f;
   uint bi = 0u;
+  float lsum = 0.0f;
   const float inv_cap = 1.0f / a.cap;
   for (uint v = tid; v < a.V_valid; v += tpg) {
     const float val = tanh((bl[v] + bias[v] + fold_b[v]) * inv_cap) * a.cap;
-    if (val > bv) { bv = val; bi = v; }
+    if (val > bv) {
+      lsum = lsum * exp(bv - val) + 1.0f;
+      bv = val;
+      bi = v;
+    } else {
+      lsum += exp(val - bv);
+    }
   }
+  // Merge online (bv, bi, lsum) across simdgroup
   for (ushort d = 16; d > 0; d >>= 1) {
     const float ov = simd_shuffle_down(bv, d);
     const uint oi = simd_shuffle_down(bi, d);
+    const float ol = simd_shuffle_down(lsum, d);
+    const float mn = max(bv, ov);
+    lsum = lsum * exp(bv - mn) + ol * exp(ov - mn);
     if (ov > bv) { bv = ov; bi = oi; }
   }
-  if ((tid & 31u) == 0u) { sm_v[tid >> 5] = bv; sm_i[tid >> 5] = bi; }
+  if ((tid & 31u) == 0u) { sm_v[tid >> 5] = bv; sm_i[tid >> 5] = bi; sm_l[tid >> 5] = lsum; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0u) {
-    float fv = sm_v[0]; uint fi = sm_i[0];
-    for (uint i = 1; i < (tpg >> 5); i++) if (sm_v[i] > fv) { fv = sm_v[i]; fi = sm_i[i]; }
+    float fv = sm_v[0], fl = sm_l[0];
+    uint fi = sm_i[0];
+    for (uint i = 1; i < (tpg >> 5); i++) {
+      const float mn = max(fv, sm_v[i]);
+      fl = fl * exp(fv - mn) + sm_l[i] * exp(sm_v[i] - mn);
+      if (sm_v[i] > fv) { fv = sm_v[i]; fi = sm_i[i]; }
+    }
     prev_tok_buf[0] = fi;
     draft_out[a.step] = fi;
+    draft_probs[a.step] = 1.0f / max(fl, 1.0f);
   }
+}
+
+// ============================================================================
+// Prefill MoE Routing & Indirect-Dispatch Planning (M <= 256, mmpg CH=4 NF=2)
+// ============================================================================
+
+// P1. Parallel per-row top-8 selection for prefill: grid (M, 1, 1), TG 128 threads.
+kernel void ink_moe_topk_pf(device const float* scores [[buffer(0)]],
+                            device const float* rb [[buffer(1)]],
+                            device uint* top_idx [[buffer(2)]],
+                            device float* top_w [[buffer(3)]],
+                            constant RouteArgs& a [[buffer(4)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint e [[thread_index_in_threadgroup]]) {
+  const uint sg = e >> 5, lane = e & 31u;
+  threadgroup float sm_v[4];
+  threadgroup uint sm_i[4];
+  threadgroup uint picked_i[8];
+  threadgroup float picked_s[8];
+
+  const float s = scores[size_t(row) * a.E + e];
+  float k_val = s + rb[e];
+  for (uint k = 0; k < a.topk; k++) {
+    float bv = k_val;
+    uint bi = e;
+    for (ushort d = 16; d > 0; d >>= 1) {
+      const float ov = simd_shuffle_down(bv, d);
+      const uint oi = simd_shuffle_down(bi, d);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (lane == 0u) { sm_v[sg] = bv; sm_i[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e == 0u) {
+      float fv = sm_v[0]; uint fi = sm_i[0];
+      for (uint g = 1; g < 4u; g++) {
+        if (sm_v[g] > fv || (sm_v[g] == fv && sm_i[g] < fi)) { fv = sm_v[g]; fi = sm_i[g]; }
+      }
+      picked_i[k] = fi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e == picked_i[k]) { picked_s[k] = s; k_val = -1e30f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (e < a.topk) {
+    float wsum = 0.0f;
+    for (uint k = 0; k < a.topk; k++) wsum += picked_s[k];
+    const float inv = a.route_scale / (wsum + 1e-20f);
+    top_idx[size_t(row) * a.topk + e] = picked_i[e];
+    top_w[size_t(row) * a.topk + e] = picked_s[e] * inv;
+  }
+}
+
+// P2. Plan compact grouped MoE worklist for mmpg (CH=4 -> 64 rows/tile, NF=2 -> 64 cols/TG).
+// Grid: (1, 1, 1), TG: 128 threads.
+struct PlanArgs {
+  uint M, E, topk, gx_gu, gx_dn;
+};
+kernel void ink_moe_plan_pf(device const uint* top_idx [[buffer(0)]],  // [M, 8]
+                            device uint* slots [[buffer(1)]],          // [E]
+                            device uint* nslots [[buffer(2)]],         // [1]
+                            device uint* roff [[buffer(3)]],           // [E]
+                            device uint* rcnt [[buffer(4)]],           // [E]
+                            device uint* rlist [[buffer(5)]],          // [M * 8]
+                            device uint* rpos [[buffer(6)]],           // [M * 8] -> compact row index
+                            device uint* wtile [[buffer(7)]],          // [(M*8)/64 + E]
+                            device uint* ind_gu [[buffer(8)]],         // MTLDispatchThreadgroupsIndirectArguments (3 uint)
+                            device uint* ind_dn [[buffer(9)]],
+                            constant PlanArgs& a [[buffer(10)]],
+                            uint tid [[thread_index_in_threadgroup]]) {
+  if (tid != 0u) return;
+  uint cnt[128];
+  for (uint e = 0; e < a.E; e++) cnt[e] = 0u;
+  const uint tot = a.M * a.topk;
+  for (uint i = 0; i < tot; i++) cnt[top_idx[i]]++;
+
+  uint ns = 0, off = 0, nt = 0;
+  uint e2s[128];
+  uint cur[128];
+  for (uint e = 0; e < a.E; e++) {
+    if (cnt[e] > 0u) {
+      e2s[e] = ns;
+      slots[ns] = e;
+      roff[ns] = off;
+      rcnt[ns] = cnt[e];
+      cur[ns] = off;
+      const uint tiles = (cnt[e] + 63u) / 64u;
+      for (uint ty = 0; ty < tiles; ty++) wtile[nt++] = (ns << 16) | ty;
+      // Pad expert's compact row offset to multiple of 16 so frag_off(off + row) is block-aligned!
+      off += (cnt[e] + 15u) & ~15u;
+      ns++;
+    }
+  }
+  nslots[0] = ns;
+  ind_gu[0] = a.gx_gu; ind_gu[1] = nt; ind_gu[2] = 1u;
+  ind_dn[0] = a.gx_dn; ind_dn[1] = nt; ind_dn[2] = 1u;
+
+  for (uint m = 0; m < a.M; m++) {
+    for (uint k = 0; k < a.topk; k++) {
+      const uint s = e2s[top_idx[m * a.topk + k]];
+      const uint pos = cur[s]++;
+      rlist[pos] = m;
+      rpos[m * a.topk + k] = pos;
+    }
+  }
+}
+
+// P3. Prefill MoE gather-accumulate: moe_out[m, c] = sum_k exp_y[rpos[m, k], c] * top_w[m, k].
+// Grid: (M, ceil(H / 256), 1), TG: 256 threads.
+kernel void ink_moe_accum_pf(device const float* exp_y [[buffer(0)]],
+                             device const uint* rpos [[buffer(1)]],
+                             device const float* top_w [[buffer(2)]],
+                             device float* out [[buffer(3)]],
+                             constant uint& H [[buffer(4)]],
+                             uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x;
+  const uint c = tg.y * 256u + tid;
+  if (c >= H) return;
+  float acc = 0.0f;
+  for (uint k = 0; k < 8u; k++) {
+    const uint p = rpos[size_t(row) * 8u + k];
+    const float w = top_w[size_t(row) * 8u + k];
+    acc = fma(exp_y[size_t(p) * H + c], w, acc);
+  }
+  out[size_t(row) * H + c] = acc;
 }
