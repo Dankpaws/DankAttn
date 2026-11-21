@@ -185,6 +185,19 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     rs = [C.dev newResidencySetWithDescriptor:d error:&e];
     if (!rs) mtl::die("residency set", e);
   }
+  // Identify files referenced ONLY by vision tensors (V.* / V{i}.*) so they stay mmap'd in page cache
+  // without consuming permanent iogpu.wired_limit_mb residency during text decode/prefill.
+  std::set<uint32_t> text_files;
+  NSDictionary* ts_map = man[@"tensors"];
+  for (NSString* k in ts_map) {
+    const std::string ks = [k UTF8String];
+    const bool is_vis = ks.size() >= 2 && ks[0] == 'V' && (ks[1] == '.' || (ks[1] >= '0' && ks[1] <= '9'));
+    if (is_vis) continue;
+    NSDictionary* td = ts_map[k];
+    if (td[@"file"]) text_files.insert([td[@"file"] unsignedIntValue]);
+    if (td[@"sfile"]) text_files.insert([td[@"sfile"] unsignedIntValue]);
+  }
+  uint32_t fi = 0;
   for (NSString* f in man[@"files"]) {
     std::string p = dir + "/" + [f UTF8String];
     int fd = open(p.c_str(), O_RDONLY);
@@ -197,9 +210,12 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     if (m == MAP_FAILED) mtl::die(("mmap " + p).c_str());
     id<MTLBuffer> b = [C.dev newBufferWithBytesNoCopy:m length:len options:MTLResourceStorageModeShared deallocator:nil];
     if (!b) mtl::die(("nocopy buffer " + p).c_str());
-    [rs addAllocation:b];
+    if (text_files.empty() || text_files.count(fi)) {
+      [rs addAllocation:b];
+      total += len;
+    }
     files.push_back(b);
-    total += len;
+    fi++;
   }
   [rs commit];
   [rs requestResidency];
@@ -344,6 +360,43 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     df_enorm = raw("DF.enorm"); df_hnorm = raw("DF.hnorm"); df_gate = raw("DF.gate");
     df_hchn = raw("DF.hc.hnorm"); df_hcen = raw("DF.hc.enorm"); df_norm = raw("DF.norm");
   }
+  NSDictionary* vm = man[@"vision"];
+  if (vm) {
+    has_vision = true;
+    v_nL = [vm[@"layers"] unsignedIntValue];
+    v_H = [vm[@"hidden_size"] unsignedIntValue];
+    v_I = [vm[@"intermediate_size"] unsignedIntValue];
+    v_Ipad = [vm[@"intermediate_padded"] unsignedIntValue];
+    v_nh = [vm[@"num_heads"] unsignedIntValue];
+    v_hd = [vm[@"head_dim"] unsignedIntValue];
+    v_ps = [vm[@"patch_size"] unsignedIntValue];
+    v_merge = [vm[@"spatial_merge_size"] unsignedIntValue];
+    v_edge = [vm[@"position_edge"] unsignedIntValue];
+    v_eps = [vm[@"eps"] floatValue];
+    if (vm[@"image_start_token_id"]) img_start_id = [vm[@"image_start_token_id"] unsignedIntValue];
+    if (vm[@"image_end_token_id"]) img_end_id = [vm[@"image_end_token_id"] unsignedIntValue];
+    if (vm[@"image_token_id"]) img_tok_id = [vm[@"image_token_id"] unsignedIntValue];
+    if (vm[@"image_newline_token_id"]) img_nl_id = [vm[@"image_newline_token_id"] unsignedIntValue];
+    if (vm[@"video_start_token_id"]) vid_start_id = [vm[@"video_start_token_id"] unsignedIntValue];
+    if (vm[@"video_end_token_id"]) vid_end_id = [vm[@"video_end_token_id"] unsignedIntValue];
+    if (vm[@"video_token_id"]) vid_tok_id = [vm[@"video_token_id"] unsignedIntValue];
+    v_patch_w = lin("V.patch.w"); v_patch_b = raw("V.patch.b"); v_pos_embed = raw("V.pos_embed");
+    VL.resize(v_nL);
+    for (uint32_t i = 0; i < v_nL; i++) {
+      VLayer& v = VL[i];
+      const std::string n = "V" + std::to_string(i);
+      v.ln1_w = raw(n + ".ln1.w"); v.ln1_b = raw(n + ".ln1.b");
+      v.ln2_w = raw(n + ".ln2.w"); v.ln2_b = raw(n + ".ln2.b");
+      v.qkv = lin(n + ".attn.qkv"); v.qkv_b = raw(n + ".attn.qkv.b");
+      v.o = lin(n + ".attn.o"); v.o_b = raw(n + ".attn.o.b");
+      v.fc1 = lin(n + ".mlp.fc1"); v.fc1_b = raw(n + ".mlp.fc1.b");
+      v.fc2 = lin(n + ".mlp.fc2"); v.fc2_b = raw(n + ".mlp.fc2.b");
+    }
+    v_merge_norm = raw("V.merge.norm");
+    v_merge_fc1 = lin("V.merge.fc1"); v_merge_fc1_b = raw("V.merge.fc1.b");
+    v_merge_fc2 = lin("V.merge.fc2"); v_merge_fc2_b = raw("V.merge.fc2.b");
+    v_merge_nl = raw("V.merge.newline");
+  }
 
   // Engram table
   NSDictionary* et = man[@"engram_table"];
@@ -406,6 +459,14 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     reg(lm_head_w4, false, false, false);
     reg(lm_head_w4, true, false, false);  // GPU-gated draft head uses grouped mm2 with 1 slot
   }
+  if (has_vision) {
+    reg(v_patch_w, false, true, false);
+    for (const auto& v : VL) {
+      reg(v.qkv, false, true, false); reg(v.o, false, true, false);
+      reg(v.fc1, false, true, false); reg(v.fc2, false, true, false);
+    }
+    reg(v_merge_fc1, false, true, false); reg(v_merge_fc2, false, true, false);
+  }
   auto mk = [&](std::pair<uint32_t, uint32_t> bg) { return "w" + std::to_string(bg.first) + "g" + std::to_string(bg.second); };
   for (auto bg : need_dec)
     P[mk(bg)] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}});
@@ -427,12 +488,18 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   }
   for (auto bg : need_grpmmp_epi3)
     P[mk(bg) + "grpmmp_epi3"] = C.pipe(mm2, "mmpg", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}, {"SWIGLU_LIMIT", lim}, {"MMP_CH", gch}, {"MMP_FAST", "1"}, {"MMP_NF", gnf}});
-  for (const char* k : {"h4_embed", "h4_hc_1pass", "h4_hc_part", "h4_hc_fin", "h4_rms", "h4_attn_in", "h4_q_prep", "h4_idx_pool",
+  for (const char* k : {"h4_embed", "h4_embed_vis", "h4_hc_1pass", "h4_hc_part", "h4_hc_fin", "h4_rms", "h4_attn_in", "h4_q_prep", "h4_idx_pool",
                         "h4_idx_topk", "h4_attn_merge", "h4_gate", "h4_route", "h4_plan", "h4_combine",
                         "h4_eng_rows", "h4_eng_mix", "h4_argmax", "h4_plan_lists", "h4_combine_c",
                         "h4_add", "h4_dsel", "h4_add_frag", "h4_d_post_add_ln", "h4_draft_hc_in",
                         "h4_sample", "h4_pick_p", "h4_idx_score_mma", "h4_dgate"})
     P[k] = C.pipe(hk, k);
+  if (has_vision) {
+    const std::string vk = mtl::slurp(kdir + "hy4_vit.metal");
+    for (const char* k : {"vit_to_frag", "vit_patch_pos", "vit_layernorm_frag", "vit_attn_fwd",
+                          "vit_bias_res", "vit_bias_gelu_frag", "vit_merge_gather_frag", "vit_merge_out"})
+      P[k] = C.pipe(vk, k);
+  }
   P["h4_attn_mma_swa"] = C.pipe(hk, "h4_attn_mma", {{"ATT_SLIDING", "1"}, {"ATT_KV8", "0"}});
   P["h4_attn_mma_dsa"] = C.pipe(hk, "h4_attn_mma", {{"ATT_SLIDING", "0"}, {"ATT_KV8", kv8 ? "1" : "0"}});
 
@@ -570,6 +637,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   rope_swa = B(MRp * 64 * 4);
   rope_dsa = B(MRp * 64 * 4);
   rope_pool = B(MRp * 64 * 4);
+  if (has_vision) vis_idx_b = B(MRp * 4);
   nsel = B(MRp * 4);
   mmpart = B(size_t(64) << 20);
   counters = B(size_t(1) << 22);
@@ -758,6 +826,24 @@ static void rope_rows(const double* inv, const std::vector<uint32_t>& pos, float
   }
 }
 
+// Interleaved 3D MRoPE (mrope_section = [12, 10, 10]): pairs j < 30 interleave (T, H, W) at stride 3,
+// pairs 30..31 use T. When t == h == w (text), bit-identical to rope_rows().
+static void rope_rows_3d(const double* inv, const std::vector<Pos3D>& pos, float* out) {
+  for (size_t r = 0; r < pos.size(); r++) {
+    const Pos3D& p3 = pos[r];
+    for (uint32_t j = 0; j < 32; j++) {
+      uint32_t p = p3.t;
+      if (j < 30) {
+        if (j % 3 == 1) p = p3.h;
+        else if (j % 3 == 2) p = p3.w;
+      }
+      const double ang = double(p) * inv[j];
+      out[r * 64 + j] = float(std::cos(ang));
+      out[r * 64 + 32 + j] = float(std::sin(ang));
+    }
+  }
+}
+
 // Persistent blocking-I/O pool for the Engram row reads of decode / verify steps: every read of a step in
 // flight at once (cold rows come from SSD; GCD's pool runs about one thread per core, so ~100 reads took
 // several latency waves). The caller works too and returns when every index is done.
@@ -860,7 +946,10 @@ void Model::engram_read_rows(const std::vector<uint64_t>& rows, uint32_t M, uint
 // from the mapped table into the step's upload buffer [engram layer][row][16][96].
 void Model::engram_fetch(const std::vector<uint32_t>& ctx, size_t p0, uint32_t M, uint8_t* dst, uint32_t* live,
                          uint32_t s0, uint32_t s1, uint32_t dst_r0) {
-  if (live) for (uint32_t r = 0; r < M; r++) live[dst_r0 + r] = ctx[p0 + r] != pad_id;
+  if (live) for (uint32_t r = 0; r < M; r++) {
+    const uint32_t t = ctx[p0 + r];
+    live[dst_r0 + r] = (t != pad_id && t != img_tok_id && t != vid_tok_id);
+  }
   s1 = std::min(s1, n_eng);
   std::vector<uint64_t> rows;
   rows.reserve(size_t(s1 - s0) * M * 16);
@@ -981,6 +1070,12 @@ void Model::truncate(uint32_t n) {
   if (!can_truncate(n)) mtl::die("truncate: past the sliding rings (needs a checkpoint or a re-prefill)");
   pos = n;
   history.resize(n);
+  if (pos3d.size() > n) pos3d.resize(n);
+  if (pos3d.empty()) mrope_delta = 0;
+  else {
+    const Pos3D& b = pos3d.back();
+    mrope_delta = int32_t(std::max({b.t, b.h, b.w}) + 1u) - int32_t(n);
+  }
   while (!ckpts.empty() && ckpts.back().pos > n) ckpts.pop_back();
 }
 
@@ -1293,10 +1388,12 @@ void Model::use_slot(int i) {
   anchor_p0 = ~size_t(0);
   pf_toks.clear();
   Slot& o = slots_[cur_slot];
-  o.pos = pos; o.ring_floor = ring_floor; o.history.swap(history); o.ckpts.swap(ckpts);
+  o.pos = pos; o.ring_floor = ring_floor; o.mrope_delta = mrope_delta;
+  o.history.swap(history); o.pos3d.swap(pos3d); o.ckpts.swap(ckpts);
   Slot& n = slots_[i];
   for (size_t k = 0; k < L.size(); k++) { L[k].lat = n.lat[k]; L[k].tokring = n.tokring[k]; L[k].bk = n.bk[k]; }
-  cap = n.cap; pos = n.pos; ring_floor = n.ring_floor; history.swap(n.history); ckpts.swap(n.ckpts);
+  cap = n.cap; pos = n.pos; ring_floor = n.ring_floor; mrope_delta = n.mrope_delta;
+  history.swap(n.history); pos3d.swap(n.pos3d); ckpts.swap(n.ckpts);
   cur_slot = i;
 }
 
@@ -1412,7 +1509,10 @@ void Model::engram_fetch_lanes(const std::vector<const std::vector<uint32_t>*>& 
                                uint8_t* dst, uint32_t* live, uint32_t s0, uint32_t s1, const uint32_t* dst_rows) {
   const uint32_t M = uint32_t(rhist.size());
   if (M == 0) return;
-  if (live) for (uint32_t r = 0; r < M; r++) live[dst_rows ? dst_rows[r] : r] = (*rhist[r])[rpos[r]] != pad_id;
+  if (live) for (uint32_t r = 0; r < M; r++) {
+    const uint32_t t = (*rhist[r])[rpos[r]];
+    live[dst_rows ? dst_rows[r] : r] = (t != pad_id && t != img_tok_id && t != vid_tok_id);
+  }
   s1 = std::min(s1, n_eng);
   std::vector<uint64_t> rows;
   rows.reserve(size_t(s1 - s0) * M * 16);
@@ -1730,7 +1830,9 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
 }
 
 std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu_ms, std::vector<float>* logits_out,
-                                  std::map<std::string, double>* profile) {
+                                  std::map<std::string, double>* profile,
+                                  const float* vis_embeds, uint32_t n_vis, const int32_t* vis_idx,
+                                  const Pos3D* pos3d_in) {
   const uint32_t M = uint32_t(toks.size());
   if (M == 0 || M > MR) mtl::die("step: too many rows (HY4_MP)");
   if (logits_out && M > MAXM) mtl::die("step: all-row logits only for <= 16 rows");
@@ -1739,11 +1841,46 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   mtl::last_use() = mtl::now_s();
   memcpy(ids.contents, toks.data(), M * 4);
   history.insert(history.end(), toks.begin(), toks.end());
-  std::vector<uint32_t> pp(M), pg(M);
-  for (uint32_t r = 0; r < M; r++) { pp[r] = p0 + r; pg[r] = (p0 + r) / 4 * 4; }
-  rope_rows(inv_swa, pp, (float*)rope_swa.contents);
-  rope_rows(inv_dsa, pp, (float*)rope_dsa.contents);
-  rope_rows(inv_dsa, pg, (float*)rope_pool.contents);
+  // Maintain 3D MRoPE positions parallel to history (text-only fast path keeps t==h==w).
+  if (pos3d.size() < p0) {
+    const size_t old = pos3d.size();
+    pos3d.resize(p0);
+    for (size_t k = old; k < p0; k++) {
+      const uint32_t pk = uint32_t(int64_t(k) + mrope_delta);
+      pos3d[k] = Pos3D{pk, pk, pk};
+    }
+  }
+  pos3d.resize(p0 + M);
+  std::vector<Pos3D> pp3(M), pg3(M);
+  for (uint32_t r = 0; r < M; r++) {
+    Pos3D pr;
+    if (pos3d_in) {
+      pr = pos3d_in[r];
+    } else {
+      const uint32_t p1 = uint32_t(int64_t(p0 + r) + mrope_delta);
+      pr = Pos3D{p1, p1, p1};
+    }
+    pos3d[p0 + r] = pr;
+    pp3[r] = pr;
+  }
+  {
+    const Pos3D& b = pos3d[p0 + M - 1];
+    mrope_delta = int32_t(std::max({b.t, b.h, b.w}) + 1u) - int32_t(p0 + M);
+  }
+  for (uint32_t r = 0; r < M; r++) {
+    const uint32_t g0 = (p0 + r) / 4 * 4;
+    pg3[r] = pos3d[g0];
+  }
+  rope_rows_3d(inv_swa, pp3, (float*)rope_swa.contents);
+  rope_rows_3d(inv_dsa, pp3, (float*)rope_dsa.contents);
+  rope_rows_3d(inv_dsa, pg3, (float*)rope_pool.contents);
+
+  id<MTLBuffer> vis_buf = nil;
+  if (vis_embeds && n_vis > 0 && vis_idx) {
+    vis_buf = [C.dev newBufferWithBytes:vis_embeds length:size_t(n_vis) * H * 4 options:MTLResourceStorageModeShared];
+    if (!vis_idx_b) vis_idx_b = C.buf(MR * 4);
+    memcpy(vis_idx_b.contents, vis_idx, M * 4);
+  }
 
   Rec rc;
   rc.cb = [C.q commandBuffer];
@@ -1759,11 +1896,21 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   id<MTLComputeCommandEncoder> e = rc.op("embed");
   {
     struct { uint32_t M, H, HC; } a{M, H, HC};
-    [e setComputePipelineState:pipe("h4_embed")];
-    [e setBuffer:ids offset:0 atIndex:0];
-    setb(e, embed, 1);
-    [e setBuffer:h offset:0 atIndex:2];
-    [e setBytes:&a length:sizeof a atIndex:3];
+    if (vis_buf) {
+      [e setComputePipelineState:pipe("h4_embed_vis")];
+      [e setBuffer:ids offset:0 atIndex:0];
+      setb(e, embed, 1);
+      [e setBuffer:vis_buf offset:0 atIndex:2];
+      [e setBuffer:vis_idx_b offset:0 atIndex:3];
+      [e setBuffer:h offset:0 atIndex:4];
+      [e setBytes:&a length:sizeof a atIndex:5];
+    } else {
+      [e setComputePipelineState:pipe("h4_embed")];
+      [e setBuffer:ids offset:0 atIndex:0];
+      setb(e, embed, 1);
+      [e setBuffer:h offset:0 atIndex:2];
+      [e setBytes:&a length:sizeof a atIndex:3];
+    }
     [e dispatchThreads:MTLSizeMake(H, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
   for (uint32_t i = 0; i < nL; i++) {
@@ -1850,7 +1997,8 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<LaneBatch>& batches, d
   ensure_lane_pipes();
   if (lane_tab.empty()) rebuild_lane_tables();
   struct SampRow { uint32_t N, pos, s0, s1; float inv_t, lmin, top_p; uint32_t top_k; };
-  std::vector<uint32_t> toks, rlane, rpos, pg;
+  std::vector<uint32_t> toks, rlane, rpos;
+  std::vector<Pos3D> rpos3, pg3;
   std::vector<const std::vector<uint32_t>*> rhist;
   std::vector<size_t> rpos_sz;
   std::vector<SampRow> srows;
@@ -1860,17 +2008,31 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<LaneBatch>& batches, d
     if (b.toks.empty()) continue;
     uint32_t& sp = (b.slot == cur_slot) ? pos : slots_[b.slot].pos;
     std::vector<uint32_t>& sh = (b.slot == cur_slot) ? history : slots_[b.slot].history;
+    std::vector<Pos3D>& sp3 = (b.slot == cur_slot) ? pos3d : slots_[b.slot].pos3d;
+    const int32_t sdelta = (b.slot == cur_slot) ? mrope_delta : slots_[b.slot].mrope_delta;
     const uint32_t scap = (b.slot == cur_slot) ? cap : slots_[b.slot].cap;
     if (sp + b.toks.size() > scap) mtl::die("step_lanes: lane KV capacity exceeded");
     const uint32_t p0 = sp;
     sh.insert(sh.end(), b.toks.begin(), b.toks.end());
+    if (sp3.size() < p0) {
+      const size_t old = sp3.size();
+      sp3.resize(p0);
+      for (size_t k = old; k < p0; k++) {
+        const uint32_t pk = uint32_t(int64_t(k) + sdelta);
+        sp3[k] = Pos3D{pk, pk, pk};
+      }
+    }
     for (size_t j = 0; j < b.toks.size(); j++) {
       const uint32_t p = p0 + uint32_t(j);
+      const uint32_t rp = uint32_t(int64_t(p) + sdelta);
+      const Pos3D pr{rp, rp, rp};
+      sp3.push_back(pr);
       toks.push_back(b.toks[j]);
       rlane.push_back(uint32_t(b.slot));
       rpos.push_back(p);
+      rpos3.push_back(pr);
       rpos_sz.push_back(p);
-      pg.push_back(p / 4 * 4);
+      pg3.push_back(sp3[p / 4 * 4]);
       rhist.push_back(&sh);
       max_pos = std::max(max_pos, p);
       srows.push_back(SampRow{lm_head.N, p, uint32_t(b.seed), uint32_t(b.seed >> 32),
@@ -1885,9 +2047,9 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<LaneBatch>& batches, d
   memcpy(row_lane_b.contents, rlane.data(), M * 4);
   memcpy(row_pos_b.contents, rpos.data(), M * 4);
   memcpy(samp_rows_b.contents, srows.data(), M * sizeof(SampRow));
-  rope_rows(inv_swa, rpos, (float*)rope_swa.contents);
-  rope_rows(inv_dsa, rpos, (float*)rope_dsa.contents);
-  rope_rows(inv_dsa, pg, (float*)rope_pool.contents);
+  rope_rows_3d(inv_swa, rpos3, (float*)rope_swa.contents);
+  rope_rows_3d(inv_dsa, rpos3, (float*)rope_dsa.contents);
+  rope_rows_3d(inv_dsa, pg3, (float*)rope_pool.contents);
 
   Rec rc;
   rc.cb = [C.q commandBuffer];
@@ -2011,7 +2173,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
     di[0] = anchor;
     for (uint32_t i = 1; i < W; i++) di[i] = mask_id;
     std::vector<uint32_t> pp(W);
-    for (uint32_t i = 0; i < W; i++) pp[i] = p + i;
+    for (uint32_t i = 0; i < W; i++) pp[i] = uint32_t(int64_t(p + i) + mrope_delta);
     rope_rows(inv_dsa, pp, (float*)rope_draft.contents);
   }
   Rec rc;
@@ -2255,7 +2417,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
   struct SampRow { uint32_t N, pos, s0, s1; float inv_t, lmin, top_p; uint32_t top_k; };
   static_assert(sizeof(DraftEhRowHost) == 16 && sizeof(DselLaneRowHost) == 32 && sizeof(SampRow) == 32);
 
-  std::vector<uint32_t> dids_v, rlane, rpos, row0(n), maxd(n), anchors(n), lane_p(n);
+  std::vector<uint32_t> dids_v, rlane, rpos, rope_rpos, row0(n), maxd(n), anchors(n), lane_p(n);
   std::vector<DraftEhRowHost> eh_rows(n);
   uint32_t max_D = 0;
   for (uint32_t j = 0; j < n; j++) {
@@ -2271,10 +2433,12 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
     max_D = std::max(max_D, md);
     const bool use_saved = (rq.src_x == ~0u);
     eh_rows[j] = DraftEhRowHost{use_saved ? slots_[rq.slot].df_xf.gpuAddress : xf.gpuAddress, row0[j], use_saved ? 0u : rq.src_x};
+    const int32_t sdelta = (rq.slot == cur_slot) ? mrope_delta : slots_[rq.slot].mrope_delta;
     for (uint32_t q = 0; q < Wj; q++) {
       dids_v.push_back(q == 0 ? rq.anchor : mask_id);
       rlane.push_back(uint32_t(rq.slot));
       rpos.push_back(sp + q);
+      rope_rpos.push_back(uint32_t(int64_t(sp + q) + sdelta));
     }
   }
   const uint32_t M = uint32_t(dids_v.size());
@@ -2287,7 +2451,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
   memcpy(dl_row0_b.contents, row0.data(), n * 4);
   memcpy(dl_maxd_b.contents, maxd.data(), n * 4);
   memcpy(dl_anchor_b.contents, anchors.data(), n * 4);
-  rope_rows(inv_dsa, rpos, (float*)rope_draft.contents);
+  rope_rows(inv_dsa, rope_rpos, (float*)rope_draft.contents);
 
   // Per-DFly-layer dsel row descriptors
   for (size_t di = 0; di < D.size(); di++) {
@@ -2578,6 +2742,185 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
     }
   }
   return res;
+}
+
+std::vector<float> Model::encode_vision(const uint16_t* pixels_bf16, uint32_t T, uint32_t h, uint32_t w,
+                                        double* gpu_ms) {
+  if (!has_vision) mtl::die("encode_vision: pack has no vision tower");
+  if (T == 0 || h == 0 || w == 0 || (h % v_merge) != 0 || (w % v_merge) != 0)
+    mtl::die("encode_vision: invalid grid_thw (h and w must be positive multiples of spatial_merge_size)");
+  const uint32_t N = h * w;
+  const uint32_t M = T * N;
+  const uint32_t Mp = (M + 15u) / 16u * 16u;
+  const uint32_t hm = h / v_merge, wm = w / v_merge;
+  const uint32_t M_merge = T * hm * wm;
+  const uint32_t Mp_merge = (M_merge + 15u) / 16u * 16u;
+  const uint32_t M_out = T * hm * (wm + 1u);
+  const uint32_t K_patch = 3u * v_ps * v_ps;  // 768
+  const uint32_t K_merge = v_merge * v_merge * v_H;  // 4608
+
+  mtl::last_use() = mtl::now_s();
+  @autoreleasepool {
+    auto tmp = [&](size_t bytes) -> id<MTLBuffer> {
+      id<MTLBuffer> b = [C.dev newBufferWithLength:std::max<size_t>(bytes, 16) options:MTLResourceStorageModeShared];
+      if (!b) mtl::die("encode_vision: failed to allocate transient Metal buffer");
+      return b;
+    };
+    id<MTLBuffer> pix_b = [C.dev newBufferWithBytes:pixels_bf16 length:size_t(M) * K_patch * 2 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> x_b = tmp(size_t(Mp) * v_H * 4);
+    const size_t frag_elems = std::max<size_t>({size_t(Mp) * K_patch, size_t(Mp) * v_Ipad, size_t(Mp_merge) * K_merge});
+    const size_t y_elems = std::max<size_t>({size_t(Mp) * 3u * v_H, size_t(Mp) * v_Ipad, size_t(Mp_merge) * K_merge});
+    id<MTLBuffer> frag_b = tmp(frag_elems * 2);
+    id<MTLBuffer> y_b = tmp(y_elems * 4);
+    id<MTLBuffer> out_b = tmp(size_t(M_out) * H * 4);
+
+    Rec rc;
+    rc.cb = [C.q commandBuffer];
+    id<MTLComputeCommandEncoder> e;
+
+    // 1. Patch embedding: pixel_values [M, 768] -> frag -> mmp(V.patch.w) -> x_b + bias + interp pos_embed
+    {
+      struct { uint32_t M, Mp, K; } a{M, Mp, K_patch};
+      e = rc.op("vit.to_frag");
+      [e setComputePipelineState:pipe("vit_to_frag")];
+      [e setBuffer:pix_b offset:0 atIndex:0];
+      [e setBuffer:frag_b offset:0 atIndex:1];
+      [e setBytes:&a length:sizeof a atIndex:2];
+      [e dispatchThreads:MTLSizeMake(K_patch, Mp, 1) threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+    }
+    mm(rc, "vit.patch", v_patch_w, frag_b, x_b, M);
+    {
+      struct { uint32_t T, h, w, H, edge; } a{T, h, w, v_H, v_edge};
+      e = rc.op("vit.patch_pos");
+      [e setComputePipelineState:pipe("vit_patch_pos")];
+      [e setBuffer:x_b offset:0 atIndex:0];
+      setb(e, v_patch_b, 1);
+      setb(e, v_pos_embed, 2);
+      [e setBytes:&a length:sizeof a atIndex:3];
+      [e dispatchThreads:MTLSizeMake(v_H, M, 1) threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+    }
+
+    // 2. 27 ViT blocks
+    const uint32_t attn_gx = ((N + 15u) / 16u) * 4u;  // guarantees tail rows M..Mp-1 are zeroed on frame T-1
+    for (uint32_t i = 0; i < v_nL; i++) {
+      const VLayer& v = VL[i];
+      // LN1 -> frag
+      {
+        struct { uint32_t M, Mp, H; float eps; } a{M, Mp, v_H, v_eps};
+        e = rc.op("vit.ln1");
+        [e setComputePipelineState:pipe("vit_layernorm_frag")];
+        [e setBuffer:x_b offset:0 atIndex:0];
+        setb(e, v.ln1_w, 1); setb(e, v.ln1_b, 2);
+        [e setBuffer:frag_b offset:0 atIndex:3];
+        [e setBytes:&a length:sizeof a atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(Mp, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      // QKV projection -> y_b [M, 3*v_H]
+      mm(rc, "vit.qkv", v.qkv, frag_b, y_b, M);
+      // Bidirectional FlashAttention (D=72, nh=16) -> frag_b [Mp, v_H]
+      {
+        struct { uint32_t T, N, Mp, H, nh, hd; float scale; } a{T, N, Mp, v_H, v_nh, v_hd, 1.0f / std::sqrt(float(v_hd))};
+        e = rc.op("vit.attn");
+        [e setComputePipelineState:pipe("vit_attn_fwd")];
+        [e setBuffer:y_b offset:0 atIndex:0];
+        setb(e, v.qkv_b, 1);
+        [e setBuffer:frag_b offset:0 atIndex:2];
+        [e setBytes:&a length:sizeof a atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake(attn_gx, v_nh, T) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      // O projection -> y_b [M, v_H], then x_b += y_b + o_b
+      mm(rc, "vit.o", v.o, frag_b, y_b, M);
+      {
+        struct { uint32_t M, H; } a{M, v_H};
+        e = rc.op("vit.o_res");
+        [e setComputePipelineState:pipe("vit_bias_res")];
+        [e setBuffer:x_b offset:0 atIndex:0];
+        [e setBuffer:y_b offset:0 atIndex:1];
+        setb(e, v.o_b, 2);
+        [e setBytes:&a length:sizeof a atIndex:3];
+        [e dispatchThreads:MTLSizeMake(v_H, M, 1) threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+      }
+      // LN2 -> frag
+      {
+        struct { uint32_t M, Mp, H; float eps; } a{M, Mp, v_H, v_eps};
+        e = rc.op("vit.ln2");
+        [e setComputePipelineState:pipe("vit_layernorm_frag")];
+        [e setBuffer:x_b offset:0 atIndex:0];
+        setb(e, v.ln2_w, 1); setb(e, v.ln2_b, 2);
+        [e setBuffer:frag_b offset:0 atIndex:3];
+        [e setBytes:&a length:sizeof a atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(Mp, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      // MLP fc1 -> y_b [M, v_Ipad], bias + GELU -> frag_b [Mp, v_Ipad], fc2 -> y_b [M, v_H], x_b += y_b + fc2_b
+      mm(rc, "vit.fc1", v.fc1, frag_b, y_b, M);
+      {
+        struct { uint32_t M, Mp, Nreal, Npad; } a{M, Mp, v_I, v_Ipad};
+        e = rc.op("vit.gelu");
+        [e setComputePipelineState:pipe("vit_bias_gelu_frag")];
+        [e setBuffer:y_b offset:0 atIndex:0];
+        setb(e, v.fc1_b, 1);
+        [e setBuffer:frag_b offset:0 atIndex:2];
+        [e setBytes:&a length:sizeof a atIndex:3];
+        [e dispatchThreads:MTLSizeMake(v_Ipad, Mp, 1) threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+      }
+      mm(rc, "vit.fc2", v.fc2, frag_b, y_b, M);
+      {
+        struct { uint32_t M, H; } a{M, v_H};
+        e = rc.op("vit.fc2_res");
+        [e setComputePipelineState:pipe("vit_bias_res")];
+        [e setBuffer:x_b offset:0 atIndex:0];
+        [e setBuffer:y_b offset:0 atIndex:1];
+        setb(e, v.fc2_b, 2);
+        [e setBytes:&a length:sizeof a atIndex:3];
+        [e dispatchThreads:MTLSizeMake(v_H, M, 1) threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+      }
+    }
+
+    // 3. PatchMerger: RMSNorm + 2x2 gather -> frag_b [Mp_merge, 4608] -> fc1 -> GELU -> fc2 -> out_b + image_newline
+    {
+      struct { uint32_t T, h, w, H, Mp_merge; float eps; } a{T, h, w, v_H, Mp_merge, v_eps};
+      e = rc.op("vit.merge_gather");
+      [e setComputePipelineState:pipe("vit_merge_gather_frag")];
+      [e setBuffer:x_b offset:0 atIndex:0];
+      setb(e, v_merge_norm, 1);
+      [e setBuffer:frag_b offset:0 atIndex:2];
+      [e setBytes:&a length:sizeof a atIndex:3];
+      [e dispatchThreadgroups:MTLSizeMake(M + (Mp_merge - M_merge), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    mm(rc, "vit.merge_fc1", v_merge_fc1, frag_b, y_b, M_merge);
+    {
+      struct { uint32_t M, Mp, Nreal, Npad; } a{M_merge, Mp_merge, K_merge, K_merge};
+      e = rc.op("vit.merge_gelu");
+      [e setComputePipelineState:pipe("vit_bias_gelu_frag")];
+      [e setBuffer:y_b offset:0 atIndex:0];
+      setb(e, v_merge_fc1_b, 1);
+      [e setBuffer:frag_b offset:0 atIndex:2];
+      [e setBytes:&a length:sizeof a atIndex:3];
+      [e dispatchThreads:MTLSizeMake(K_merge, Mp_merge, 1) threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+    }
+    mm(rc, "vit.merge_fc2", v_merge_fc2, frag_b, y_b, M_merge);
+    {
+      struct { uint32_t T, hm, wm, out_H; } a{T, hm, wm, H};
+      e = rc.op("vit.merge_out");
+      [e setComputePipelineState:pipe("vit_merge_out")];
+      [e setBuffer:y_b offset:0 atIndex:0];
+      setb(e, v_merge_fc2_b, 1);
+      setb(e, v_merge_nl, 2);
+      [e setBuffer:out_b offset:0 atIndex:3];
+      [e setBytes:&a length:sizeof a atIndex:4];
+      [e dispatchThreads:MTLSizeMake(H, M_out, 1) threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+    }
+
+    if (rc.e) [rc.e endEncoding];
+    [rc.cb commit];
+    [rc.cb waitUntilCompleted];
+    if (rc.cb.error) mtl::die("encode_vision: command buffer failed", rc.cb.error);
+    if (gpu_ms) *gpu_ms = (rc.cb.GPUEndTime - rc.cb.GPUStartTime) * 1e3;
+
+    std::vector<float> res(size_t(M_out) * H);
+    memcpy(res.data(), out_b.contents, res.size() * 4);
+    return res;
+  }
 }
 
 }  // namespace hy4

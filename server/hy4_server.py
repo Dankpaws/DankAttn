@@ -22,6 +22,7 @@ from engine_frontend import (
     api_error, bad_request, error_response, json_body, make_jinja_env,
     normalize_messages, num, register_common_routes, unavailable,
 )
+from vision_preproc import extract_image_urls, preprocess_image
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--pack", required=True)
@@ -38,8 +39,10 @@ args = ap.parse_args()
 tok = Tokenizer.from_file(os.path.join(args.pack, "tokenizer.json"))
 template = make_jinja_env().from_string(open(os.path.join(args.pack, "chat_template.jinja")).read())
 HY_END = "<｜hy_end:opensource｜>"
+IMAGE_PAD = "<｜hy_image▁pad:opensource｜>"
 THINK_OPEN, THINK_CLOSE = "<think:opensource>", "</think:opensource>"
 STOPS = [tok.token_to_id(HY_END)]
+IMAGE_PAD_ID = tok.token_to_id(IMAGE_PAD)
 THINK_END = tok.token_to_id(THINK_CLOSE)
 THINK_FORCE = tok.encode("\n\n" + THINK_CLOSE, add_special_tokens=False).ids
 EFFORTS = ("max", "high", "no_think")
@@ -58,7 +61,7 @@ def render(body):
     kw = body.get("chat_template_kwargs") or {}
     if not isinstance(kw, dict):
         raise BadRequest("chat_template_kwargs must be an object")
-    msgs = normalize_messages(body)
+    msgs = normalize_messages(body, keep_vision=True)
     kw = dict(kw)
     eff = body.get("reasoning_effort")
     if eff in EFFORTS and "reasoning_effort" not in kw:
@@ -128,11 +131,33 @@ async def chat(request: Request):
         return bad_request(str(e))
     try:
         prompt = render(body)
-    except BadRequest as e:
+        img_urls = extract_image_urls(body["messages"])
+    except (BadRequest, ValueError) as e:
         return bad_request(str(e))
     except jinja2.exceptions.TemplateError as e:
         return bad_request(f"chat template: {e}")
-    ids = await asyncio.to_thread(splicer.splice, prompt)
+    vision_imgs = None
+    if img_urls:
+        try:
+            vision_imgs = await asyncio.to_thread(lambda: [preprocess_image(u) for u in img_urls])
+        except Exception as e:
+            return bad_request(f"image preprocessing failed: {e}")
+    raw_ids = await asyncio.to_thread(splicer.splice, prompt)
+    if vision_imgs:
+        ids = []
+        img_i = 0
+        for tid in raw_ids:
+            if tid == IMAGE_PAD_ID and img_i < len(vision_imgs):
+                im = vision_imgs[img_i]
+                im["tok_off"] = len(ids)
+                ids.extend([IMAGE_PAD_ID] * im["n_tokens"])
+                img_i += 1
+            else:
+                ids.append(tid)
+        if img_i != len(vision_imgs):
+            return bad_request(f"image placeholder mismatch: template emitted {img_i}, request had {len(vision_imgs)}")
+    else:
+        ids = raw_ids
     extra_stops = []
     for s in stop_strs:
         sids = tok.encode(s, add_special_tokens=False).ids
@@ -158,7 +183,7 @@ async def chat(request: Request):
     cb = eng.metered(track)
     try:
         eid = eng.submit(ids, max_new, spec, temp, top_p, top_k, seed, cb,
-                         think_budget=budget, min_p=min_p, extra_stops=extra_stops)
+                         think_budget=budget, min_p=min_p, extra_stops=extra_stops, vision_imgs=vision_imgs)
     except Unavailable as e:
         cb({"error": str(e)})
         return unavailable(str(e))

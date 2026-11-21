@@ -39,6 +39,39 @@ int main(int argc, char** argv) {
       hy4::Model m(argv[1], getenv("HY4_CAP") ? atoi(getenv("HY4_CAP")) : 262144);
       return serve::main(m);
     }
+    if (mode == "vittest") {  // opus-hy4 <pack> vittest <golden.bin>
+      hy4::Model m(argv[1], getenv("HY4_CAP") ? atoi(getenv("HY4_CAP")) : 4096);
+      if (!m.has_vision) { fprintf(stderr, "vittest: pack has no vision tower\n"); return 2; }
+      std::string raw = mtl::slurp(argv[3]);
+      if (raw.size() < 16) mtl::die("vittest: truncated golden file");
+      uint32_t hdr[4];
+      memcpy(hdr, raw.data(), 16);
+      const uint32_t T = hdr[0], h = hdr[1], w = hdr[2], n_out = hdr[3];
+      const size_t n_pix = size_t(T) * h * w * 3 * m.v_ps * m.v_ps;
+      const size_t n_emb = size_t(n_out) * m.H;
+      const uint16_t* pix = (const uint16_t*)(raw.data() + 16);
+      const float* ref_bf16 = (const float*)(raw.data() + 16 + n_pix * 2);
+      const float* ref_w8 = ref_bf16 + n_emb;
+      double gms = 0;
+      auto t0 = std::chrono::steady_clock::now();
+      auto got = m.encode_vision(pix, T, h, w, &gms);
+      const double wms = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1e3;
+      if (got.size() != n_emb) mtl::die("vittest: output size mismatch");
+      auto cmp = [&](const char* tag, const float* ref) {
+        double dot = 0, na = 0, nb = 0, err2 = 0, ma = 0;
+        for (size_t i = 0; i < n_emb; i++) {
+          double a = got[i], b = ref[i], d = std::abs(a - b);
+          dot += a * b; na += a * a; nb += b * b; err2 += d * d;
+          if (d > ma) ma = d;
+        }
+        fprintf(stderr, "vittest vs %s: cos=%.6f rel_L2=%.5f max_abs=%.5f\n",
+                tag, dot / std::sqrt(na * nb), std::sqrt(err2 / nb), ma);
+      };
+      fprintf(stderr, "vittest: grid=(%u,%u,%u) -> %u tokens, GPU %.2f ms, wall %.2f ms\n", T, h, w, n_out, gms, wms);
+      cmp("ref_bf16", ref_bf16);
+      cmp("ref_w8  ", ref_w8);
+      return 0;
+    }
     auto ids = read_ids(argv[3]);
     const uint32_t cap = getenv("HY4_CAP") ? atoi(getenv("HY4_CAP")) : 32768;
     hy4::Model m(argv[1], cap);

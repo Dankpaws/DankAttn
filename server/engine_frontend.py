@@ -31,16 +31,23 @@ def make_jinja_env():
     return env
 
 
-def normalize_messages(body):
+def normalize_messages(body, keep_vision=False):
     msgs = []
     for m in body["messages"]:
         if not isinstance(m, dict):
             raise BadRequest("each message must be an object")
         m = dict(m)
-        if isinstance(m.get("content"), list):  # text parts only
+        if isinstance(m.get("content"), list):
             if not all(isinstance(p, dict) for p in m["content"]):
                 raise BadRequest("content parts must be objects")
-            m["content"] = "".join(p.get("text", "") for p in m["content"] if p.get("type") == "text")
+            if keep_vision and any(
+                p.get("type") in ("image_url", "image", "video_url", "video")
+                or "image_url" in p or "image" in p or "video_url" in p or "video" in p
+                for p in m["content"]
+            ):
+                m["content"] = list(m["content"])
+            else:
+                m["content"] = "".join(p.get("text", "") for p in m["content"] if p.get("type") == "text")
         tcs = m.get("tool_calls") or []
         if not isinstance(tcs, list) or not all(isinstance(tc, dict) and isinstance(tc.get("function", {}), dict) for tc in tcs):
             raise BadRequest("tool_calls must be a list of {function: {...}} objects")
@@ -167,7 +174,7 @@ class EngineProc:
             time.sleep(2)
 
     def submit(self, ids, max_new, spec, temp, top_p, top_k, seed, cb,
-               group=None, think_budget=0, strict=False, min_p=None, extra_stops=()):
+               group=None, think_budget=0, strict=False, min_p=None, extra_stops=(), vision_imgs=None):
         if self.state["state"] != "up":
             raise Unavailable(self.state["state"])
         rid = next(self.rids)
@@ -182,6 +189,7 @@ class EngineProc:
             | (4 if think_budget else 0)
             | (8 if strict else 0)
             | (16 if min_p is not None else 0)
+            | (32 if vision_imgs else 0)
         )
         req += struct.pack("<III", max_new, flags, len(stops)) + struct.pack(f"<{len(stops)}I", *stops)
         req += struct.pack("<ffIQ", temp, top_p, top_k, seed)
@@ -192,6 +200,12 @@ class EngineProc:
             req += struct.pack(f"<{len(self.think_force)}I", *self.think_force)
         if min_p is not None:
             req += struct.pack("<f", min_p)
+        if vision_imgs:
+            parts = [req, struct.pack("<I", len(vision_imgs))]
+            for im in vision_imgs:
+                parts.append(struct.pack("<IIIIQ", im["T"], im["h"], im["w"], im["tok_off"], im["hash_u64"]))
+                parts.append(im["pixels_bf16"])
+            req = b"".join(parts)
         with self.streams_lock:
             self.streams[rid] = cb
         try:

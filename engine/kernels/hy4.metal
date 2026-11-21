@@ -51,6 +51,18 @@ kernel void h4_embed(device const uint* ids [[buffer(0)]], device const bfloat* 
   for (uint s = 0; s < a.HC; s++) h[(size_t(m) * a.HC + s) * a.H + c] = v;
 }
 
+// Multimodal embedding: scatter precomputed visual embeddings (vis_idx[m] >= 0) else token embed.
+kernel void h4_embed_vis(device const uint* ids [[buffer(0)]], device const bfloat* E [[buffer(1)]],
+                         device const float* vis [[buffer(2)]], device const int* vis_idx [[buffer(3)]],
+                         device float* h [[buffer(4)]], constant EmbArgs& a [[buffer(5)]],
+                         uint2 g [[thread_position_in_grid]]) {
+  const uint c = g.x, m = g.y;
+  if (c >= a.H || m >= a.M) return;
+  const int vi = vis_idx[m];
+  const float v = vi >= 0 ? vis[size_t(vi) * a.H + c] : float(E[size_t(ids[m]) * a.H + c]);
+  for (uint s = 0; s < a.HC; s++) h[(size_t(m) * a.HC + s) * a.H + c] = v;
+}
+
 // ------------------------------------------------------------------ hyper-connections
 // Two-pass hyper-connection read-in over NP channel slices (grid (NP, M), 256 threads): pass 1 injects and
 // writes per-slice partials [m][slice][18] = 8 mix dots, then the 10 Gram terms <h_s, h_t> (s <= t);

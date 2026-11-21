@@ -69,6 +69,16 @@ struct DLayer {  // one DFly2 draft layer (dense MLA, attends to its target laye
   Raw qa_norm, kva_norm, sinks, post_norm, in_norm, post_ln;
 };
 
+struct Pos3D {
+  uint32_t t = 0, h = 0, w = 0;
+};
+
+struct VLayer {  // one SigLIP2-adapted ViT block (H=1152, nh=16, hd=72, I=4304->4352)
+  Raw ln1_w, ln1_b, ln2_w, ln2_b;
+  Lin qkv, o, fc1, fc2;
+  Raw qkv_b, o_b, fc1_b, fc2_b;
+};
+
 struct Rec;
 
 struct Model {
@@ -147,6 +157,20 @@ struct Model {
   };
   std::vector<DraftRes> draft_lanes(const std::vector<DraftReq>& reqs, double* gpu_ms = nullptr, bool cut = true);
 
+  // Vision tower (optional pack overlay: man["vision"], ~500 MB W8g128, 0 persistent scratch)
+  bool has_vision = false;
+  uint32_t v_nL = 0, v_H = 0, v_I = 0, v_Ipad = 0, v_nh = 0, v_hd = 0, v_ps = 16, v_merge = 2, v_edge = 128;
+  float v_eps = 1e-5f;
+  uint32_t img_start_id = 120118, img_end_id = 120119, img_tok_id = 120120, img_nl_id = 120121;
+  uint32_t vid_start_id = 120122, vid_end_id = 120123, vid_tok_id = 120124;
+  Lin v_patch_w, v_merge_fc1, v_merge_fc2;
+  Raw v_patch_b, v_pos_embed, v_merge_norm, v_merge_fc1_b, v_merge_fc2_b, v_merge_nl;
+  std::vector<VLayer> VL;
+  id<MTLBuffer> vis_idx_b = nil;
+  // Encode one image/video (pixels_bf16: [T*h*w, 3*ps*ps]) -> float32 [T*(h/2)*(w/2+1), H].
+  std::vector<float> encode_vision(const uint16_t* pixels_bf16, uint32_t T, uint32_t h, uint32_t w,
+                                   double* gpu_ms = nullptr);
+
   // pipelines (mm2/mmp/mmpg compiled lazily for only the (bits, gs) pairs present in this pack)
   std::map<std::string, id<MTLComputePipelineState>> P;
   id<MTLComputePipelineState> pipe(const std::string& k) const;
@@ -178,12 +202,19 @@ struct Model {
   uint32_t top_k = 0;
   uint64_t seed = 0;
   std::vector<uint32_t> history;
+  std::vector<Pos3D> pos3d;
+  int32_t mrope_delta = 0;
 
   Model(const std::string& pack, uint32_t capacity);
   // Feed toks at positions pos..; returns argmax per row; logits_out gets [M][vocab] when given.
+  // Optional multimodal inputs: vis_embeds [n_vis][H], vis_idx [M] (-1 for text, else row in vis_embeds),
+  // pos3d_in [M] (3D interleaved MRoPE coords; nullptr uses 1D pos + mrope_delta).
   std::vector<uint32_t> step(const std::vector<uint32_t>& toks, double* gpu_ms = nullptr,
                              std::vector<float>* logits_out = nullptr,
-                             std::map<std::string, double>* profile = nullptr);
+                             std::map<std::string, double>* profile = nullptr,
+                             const float* vis_embeds = nullptr, uint32_t n_vis = 0,
+                             const int32_t* vis_idx = nullptr,
+                             const Pos3D* pos3d_in = nullptr);
   // Multi-lane batched decode / joint-verify step (total rows across batches <= MAXM).
   // Each batch appends toks to its slot's history/pos and returns one sampled/argmax token per row.
   struct LaneBatch {
@@ -200,7 +231,7 @@ struct Model {
     if (anchor_lanes_job.valid()) anchor_lanes_job.wait();
     anchor_p0 = ~size_t(0);
     anchor_lanes_meta.clear();
-    pos = 0; history.clear(); ckpts.clear(); ring_floor = 0;
+    pos = 0; history.clear(); pos3d.clear(); mrope_delta = 0; ckpts.clear(); ring_floor = 0;
     if (cur_slot >= 0 && cur_slot < int(slots_.size())) slots_[cur_slot].has_df_src = false;
   }
   // drop the newest tokens (keep the first n): valid while the sliding rings still hold n - window and the
@@ -226,7 +257,9 @@ struct Model {
   // position, history and checkpoints. Weights and step scratch are shared; switching swaps pointers.
   struct Slot {
     uint32_t cap = 0, pos = 0, ring_floor = 0;
+    int32_t mrope_delta = 0;
     std::vector<uint32_t> history;
+    std::vector<Pos3D> pos3d;
     std::vector<Ckpt> ckpts;
     std::vector<id<MTLBuffer>> lat, tokring, bk;
     // Saved DFly2 source state (~52 KB/slot): last accepted xf row + target layers' lsel/lnsel rows,

@@ -22,9 +22,16 @@ namespace serve {
 
 constexpr uint32_t END = 0xFFFFFFFFu, ERR = 0xFFFFFFFEu, READY = 0xFFFFFFFDu;
 
+struct VisImg {
+  uint32_t T = 0, h = 0, w = 0, tok_off = 0;
+  uint64_t hash = 0;
+  std::vector<uint16_t> pixels;  // bf16 [T * h * w * 768]
+};
+
 struct Req {
   uint32_t rid = 0, max_new = 0, flags = 0;
   std::vector<uint32_t> ids, stops, force;
+  std::vector<VisImg> imgs;
   uint32_t budget = 0, think_end = 0;
   float temp = 0, top_p = 1, min_p = -1.0f;
   uint32_t top_k = 0;
@@ -85,6 +92,23 @@ void reader() {
     }
     if (q->flags & 16) {
       if (!rd(&q->min_p, 4)) break;
+    }
+    if (q->flags & 32) {
+      uint32_t n_imgs = 0;
+      if (!rd(&n_imgs, 4)) break;
+      q->imgs.resize(n_imgs);
+      bool ok = true;
+      for (uint32_t k = 0; k < n_imgs; k++) {
+        uint32_t hdr4[4];
+        uint64_t ih = 0;
+        if (!rd(hdr4, 16) || !rd(&ih, 8)) { ok = false; break; }
+        auto& im = q->imgs[k];
+        im.T = hdr4[0]; im.h = hdr4[1]; im.w = hdr4[2]; im.tok_off = hdr4[3]; im.hash = ih;
+        const size_t npix = size_t(im.T) * im.h * im.w * 768;
+        im.pixels.resize(npix);
+        if (npix && !rd(im.pixels.data(), npix * 2)) { ok = false; break; }
+      }
+      if (!ok) break;
     }
     std::lock_guard<std::mutex> g(mu);
     live[q->rid] = q;
@@ -312,6 +336,10 @@ struct Active {
   int slot = -1;
   std::chrono::steady_clock::time_point t0;
   std::vector<uint32_t> rest;
+  std::vector<float> vis_embeds;
+  std::vector<int32_t> vis_idx;       // length == q->ids.size(), -1 for text
+  std::vector<hy4::Pos3D> req_pos3d;  // length == q->ids.size() when multimodal
+  bool vis_ready = false;
   size_t pref_off = 0;
   uint32_t reused = 0;
   double pms = 0.0;
@@ -324,6 +352,13 @@ struct Active {
     return t == m.eos || std::find(q->stops.begin(), q->stops.end(), t) != q->stops.end();
   }
 };
+
+// Per-slot image fingerprint list [(tok_off, hash)] so two different images of the same resolution
+// never falsely hit each other's KV prefix cache on identical <image_pad> token IDs.
+static std::vector<std::vector<std::pair<uint32_t, uint64_t>>>& slot_imgs() {
+  static std::vector<std::vector<std::pair<uint32_t, uint64_t>>> s;
+  return s;
+}
 
 static bool emit_tok(hy4::Model& m, Active& a, uint32_t t) {
   put(a.q->rid, t);
@@ -409,6 +444,12 @@ static void admit_requests(hy4::Model& m, std::vector<Active>& active, std::vect
           it = inbox.erase(it);
           continue;
         }
+        if ((cand->flags & 32) && !cand->imgs.empty() && !m.has_vision) {
+          error(cand->rid, "hy4: pack has no vision tower");
+          live.erase(cand->rid);
+          it = inbox.erase(it);
+          continue;
+        }
         if (cand->ids.empty()) {
           error(cand->rid, "empty prompt");
           live.erase(cand->rid);
@@ -471,11 +512,34 @@ static void admit_requests(hy4::Model& m, std::vector<Active>& active, std::vect
     }
     m.use_slot(sl);
     m.slots_[sl].has_df_src = false;
+    if (slot_imgs().size() < m.slots_.size()) slot_imgs().resize(m.slots_.size());
     Active a;
     a.q = q;
     a.slot = sl;
     a.t0 = std::chrono::steady_clock::now();
+    // Clamp prefix reuse at the first image span that differs from what is cached in this slot.
+    uint32_t img_reuse_cap = uint32_t(q->ids.size());
+    {
+      const auto& prev = slot_imgs()[sl];
+      const size_t n_cur = q->imgs.size(), n_prv = prev.size();
+      const size_t nm = std::min(n_cur, n_prv);
+      size_t k = 0;
+      while (k < nm && prev[k].first == q->imgs[k].tok_off && prev[k].second == q->imgs[k].hash) k++;
+      if (k < n_cur) img_reuse_cap = std::min(img_reuse_cap, q->imgs[k].tok_off);
+      if (k < n_prv) img_reuse_cap = std::min(img_reuse_cap, prev[k].first);
+    }
     a.reused = m.resume(q->ids);
+    if (a.reused > img_reuse_cap) {
+      if (m.can_truncate(img_reuse_cap)) {
+        m.truncate(img_reuse_cap);
+        a.reused = img_reuse_cap;
+      } else {
+        m.reset();
+        a.reused = 0;
+      }
+    }
+    slot_imgs()[sl].clear();
+    for (const auto& im : q->imgs) slot_imgs()[sl].push_back({im.tok_off, im.hash});
     a.rest.assign(q->ids.begin() + a.reused, q->ids.end());
     a.spec = (q->flags & 1) && m.has_dfly;
     a.thinking = (q->flags & 4) != 0;
@@ -541,17 +605,70 @@ int main(hy4::Model& m) {
         Active& a = active[i];
         m.use_slot(a.slot);
         apply_sampling(m, *a.q);
+        // Prepare 3D MRoPE positions & encode any uncached images once before the first prefill chunk.
+        if (!a.vis_ready && !a.q->imgs.empty()) {
+          const size_t L = a.q->ids.size();
+          a.req_pos3d.resize(L);
+          a.vis_idx.assign(L, -1);
+          uint32_t cur_pos = 0;
+          size_t tok_i = 0;
+          for (const auto& im : a.q->imgs) {
+            while (tok_i < im.tok_off && tok_i < L) {
+              a.req_pos3d[tok_i++] = hy4::Pos3D{cur_pos, cur_pos, cur_pos};
+              cur_pos++;
+            }
+            const uint32_t hm = im.h / m.v_merge, wm = im.w / m.v_merge, cols = wm + 1u;
+            const uint32_t step = std::max(hm, cols);
+            const uint32_t n_toks = im.T * hm * cols;
+            const bool need_enc = (im.tok_off + n_toks > a.reused);
+            int32_t base_vi = -1;
+            if (need_enc) {
+              double vms = 0;
+              auto emb = m.encode_vision(im.pixels.data(), im.T, im.h, im.w, &vms);
+              a.pms += vms;
+              base_vi = int32_t(a.vis_embeds.size() / m.H);
+              a.vis_embeds.insert(a.vis_embeds.end(), emb.begin(), emb.end());
+            }
+            for (uint32_t t = 0; t < im.T; t++) {
+              for (uint32_t r = 0; r < hm; r++) {
+                for (uint32_t c0 = 0; c0 < cols; c0++) {
+                  if (tok_i < L) {
+                    a.req_pos3d[tok_i] = hy4::Pos3D{cur_pos + t * step, cur_pos + t * step + r, cur_pos + t * step + c0};
+                    if (need_enc) a.vis_idx[tok_i] = base_vi + int32_t((t * hm + r) * cols + c0);
+                    tok_i++;
+                  }
+                }
+              }
+            }
+            cur_pos += im.T * step;
+          }
+          while (tok_i < L) {
+            a.req_pos3d[tok_i++] = hy4::Pos3D{cur_pos, cur_pos, cur_pos};
+            cur_pos++;
+          }
+          a.vis_ready = true;
+        }
         const size_t end = std::min(a.rest.size(), a.pref_off + pf_chunk);
         std::vector<uint32_t> c(a.rest.begin() + long(a.pref_off), a.rest.begin() + long(end));
         if (end < a.rest.size())
           m.next_hint.assign(a.rest.begin() + long(end), a.rest.begin() + long(std::min(a.rest.size(), end + pf_chunk)));
         double g = 0;
-        a.b = m.step(c, &g).back();
+        const size_t g_off = a.reused + a.pref_off;
+        if (!a.req_pos3d.empty()) {
+          const uint32_t n_vis = uint32_t(a.vis_embeds.size() / m.H);
+          a.b = m.step(c, &g, nullptr, nullptr, n_vis ? a.vis_embeds.data() : nullptr, n_vis,
+                       n_vis ? a.vis_idx.data() + g_off : nullptr, a.req_pos3d.data() + g_off).back();
+        } else {
+          a.b = m.step(c, &g).back();
+        }
         a.pms += g;
         a.pref_off = end;
         if (a.pref_off >= a.rest.size()) {
           a.prefilling = false;
           a.rest.clear();
+          a.vis_embeds.clear();
+          a.vis_idx.clear();
+          a.req_pos3d.clear();
           m.save_dfly_src(a.slot, c.size() > hy4::MAXM ? 0 : uint32_t(c.size()) - 1);
           m.save_ckpt();
         }
