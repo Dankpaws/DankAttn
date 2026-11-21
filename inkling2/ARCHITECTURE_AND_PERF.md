@@ -62,6 +62,19 @@ All runs use `pack-inkling2-mini-w8` (`19.91 GB` mapped + `1.33 GB` GPU state, `
 
 MBP prefill heat-soaks: the first run after idle reads 2–4% faster than steady state, so compare MBP variants interleaved, not back-to-back.
 
+### Lanes & Joint Speculation (`0d84d10`, 2026-11-21)
+
+Lanes are independent sequences with their own logical-layer KV rings, `sconv` state, rollback history, `pos`, and DSpark context; `use_lane(k)` swaps one into `Model::S`. `step_lanes` runs the stateless ops once over every lane's rows and dispatches only `q_rel`, K/V `sconv` + cache writes, decode attention split and the two post-`sconv`s per lane at row offsets (`ink_attn_reduce` runs once). The 3 loop passes can't share weight reads with each other: pass `p` builds its messages from pass `p-1`'s complete output (`b_prev_h` / `b_prev_blocks`), so lanes are the batching axis and "staggered passes" add nothing on top.
+
+| Total tok/s | 1 lane | 2 | 4 | 8 | 16 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Studio `lbench` (ctx 2,048, GPU) | 79 | 133 | 223 | 340 | 501 |
+| MBP `lbench` (ctx 2,048, GPU, `INK_CAP=8192`) | 25 | 37 | 49 | 65 | OOM |
+| Studio `jspec` (wall) | 158 | 244 | 324 | — | — |
+| MBP `jspec` (wall, `INK_CAP=8192`) | 45 | 57.5 | 65.8 | — | — |
+
+Every `ltest` / `jspec` run is bit-exact per lane vs. the same sequence alone. At 16 lanes (Studio) the step is 32.2 ms vs. 22.6 ms for 16 rows of one sequence; ~8 ms of the gap is MoE fan-out (16 unrelated contexts route to more experts), per-lane dispatch ≤ ~1.7 ms. Per-lane state is 0.83 GB at `cap=32768` and 0.42 GB at 8,192 (MBP fits ~8 lanes at 8k). `jspec` prompts are doc/source slices (they draft worse than `code_prompt.bin`); per-lane DSpark drafting is sequential (4.5 ms/round at 4 lanes on the Studio, 18 ms on the MBP) and is the next thing to batch.
+
 ### Speculation Sweep & the MoE Expert Fan-Out Tax (`spec 256 code_prompt.bin`)
 
 Measured at `7ba4268`, before Waves 1–13; the ordering of configs still holds but absolute numbers are now higher (see the table above).
@@ -112,6 +125,9 @@ sh inkling2/build_inkling2.sh
 ./build/dankattn-inkling2 "$PACK" spec 256 prompt_ids.bin    # DSpark + 3-gram lookup + exact greedy check
 ./build/dankattn-inkling2 "$PACK" dprof 512 8                # Per-op GPU timing breakdown (ctx, M)
 ./build/dankattn-inkling2 "$PACK" lgdump ids.bin 1600 out.bin # final-row logits: chunked prefill then M=1, for A/B diffs
+./build/dankattn-inkling2 "$PACK" ltest ids.bin 4 16           # 4 lanes joint decode + mixed-width round, bit-exact vs alone
+./build/dankattn-inkling2 "$PACK" lbench ids.bin 8 2048 32     # 8 lanes, ctx 2048 each, 32 joint decode steps (INK_LPROF=1: op profile)
+./build/dankattn-inkling2 "$PACK" jspec ids.bin 2 256          # joint speculation, 2 lanes, exact check (INK_JCHECK=0 skips)
 ```
 
 ### Environment Variables
@@ -145,6 +161,6 @@ sh inkling2/build_inkling2.sh
 - Base M5 on macOS 27.0 miscompiled (or otherwise mis-executed) a logically neutral edit in `ink_attn_pf_mma`. Re-check with `lgdump` Studio-vs-MBP bit equality after any attention-kernel change or OS update; `pfcheck`'s max diff alone is too noisy to catch it.
 
 ### Planned Next Steps (Not Yet Started)
-- **OpenAI-compatible `serve` + staggered-pass multi-lane batching** (Item 3, deferred until metrics review).
+- **OpenAI-compatible `serve`** on the shared `server/engine_frontend.py`, with continuous batching over lanes + joint speculation, GPU sampling, and batched per-lane DSpark drafting.
 - **MoE expert fan-out at `M=8` verify** (MBP: `moe_gu` + `moe_dn` = 63% of verify time) is the main lever for MBP speculation.
 - **Prefill attention** (29% at `M=512` on the Studio) and **MoE gate/up** (26%) are the remaining large prefill ops.
