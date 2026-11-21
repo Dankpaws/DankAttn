@@ -1,6 +1,9 @@
 ---
 base_model: tencent/Hy4-flash
 base_model_relation: quantized
+license: other
+license_name: tencent-hy-license
+license_link: LICENSE
 library_name: dankattn
 pipeline_tag: text-generation
 tags:
@@ -16,13 +19,14 @@ tags:
 
 Pre-packed weights for [`tencent/Hy4-flash`](https://huggingface.co/tencent/Hy4-flash) (revision `d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959`) formatted for the [DankAttn](https://github.com/Dankpaws/DankAttn) Metal 4 inference engine on Apple Silicon.
 
-Includes the main 42-layer model, the 5-layer DFly2 speculative drafter, the FP8 Engram n-gram table (`engram.bin`), `tokenizer.json`, and `chat_template.jinja`.
+Includes the main 42-layer model, the 5-layer DFly2 speculative drafter, the FP8 Engram n-gram table (`engram.bin`), the pack index (`manifest.json`), `tokenizer.json`, and `chat_template.jinja`. The weights are modified from the original: re-quantized and re-packed into DankAttn's own format (`pack-*.bin`), so they do not load in Transformers, MLX or llama.cpp.
 
 ## Quantization & Pack Layout
 
 - **Routed MoE experts (512 experts, top-16)**: W4, group size 64, GPTQ (`moe_gu` and `moe_dn`)
 - **Attention `gate` & `o` projections**: W8
 - **Dense layers, shared experts, attention `in`/`qb`/`kb`/`vb`, `lm_head`**: W8, group size 128
+- **DFly2 drafter layers (`pack-11.bin`)**: W6, group size 128
 - **DFly2 draft head (`lm_head_w4`)**: W4
 - **Embeddings**: bf16
 - **Norms, biases, hyper-connection weights, sinks**: f32
@@ -60,7 +64,7 @@ python3 -m venv .venv
 pip install -r requirements.txt
 
 # 3. Download this pack
-hf download <your-hf-namespace>/Hy4-flash-DankAttn-g64-gptq-v3 --local-dir ./pack-g64-gptq-v3
+hf download Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3 --local-dir ./pack-g64-gptq-v3
 
 # 4. Serve OpenAI-compatible API on :8341
 HY4_PACK=./pack-g64-gptq-v3 sh hy4/serve_hy4.sh start
@@ -80,4 +84,4 @@ sh hy4/serve_hy4.sh smoke
 
 ## Attribution & License
 
-Derived from [`tencent/Hy4-flash`](https://huggingface.co/tencent/Hy4-flash) (commit `d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959`). Use of these weights is subject to the upstream `tencent/Hy4-flash` license terms.
+Derived from [`tencent/Hy4-flash`](https://huggingface.co/tencent/Hy4-flash) (commit `d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959`). These are modified (quantized and re-packed) weights. Use is subject to the upstream `tencent/Hy4-flash` license, included here as [`LICENSE`](LICENSE). The DankAttn engine itself is MIT-licensed.
