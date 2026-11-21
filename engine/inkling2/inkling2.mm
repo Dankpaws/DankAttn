@@ -68,7 +68,8 @@ struct MtpKvArgs { uint32_t nkv, hd, pos0, cap; float eps, rope_theta; };
 struct MtpQkvArgs { uint32_t nh, nkv, hd, pos0; float eps, rope_theta; };
 struct MtpAttnArgs { uint32_t B, nh, nkv, hd, ctx_len, cap, window, is_local; };
 struct RnnArgs { uint32_t H, R, step; };
-struct MtpPickArgs { uint32_t V_valid, V_pad, step; float cap; };
+struct MtpPickArgs { uint32_t V_valid, V_pad, step; float cap; float inv_t; uint32_t s0, s1, pos0; };
+struct SampRow { uint32_t N, ld, pos, s0, s1; float inv_t, lmin, top_p; uint32_t top_k; };
 
 void enc_mm2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
              const Lin& lin, id<MTLBuffer> X, size_t xoff, id<MTLBuffer> Y, size_t yoff,
@@ -407,6 +408,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     b_qkv_out = hbuf(o, sz_qkv_out);
   }
   b_rel_vec = C.buf(size_t(MP) * nh * 16u * sizeof(uint16_t));
+  b_samp_rows = C.buf(MAXM * sizeof(SampRow));
   // Phase 1b (Attention projections + FlashAttn + O-proj):
   {
     size_t o = 0;
@@ -540,6 +542,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
       b_mtp_draft_out = C.buf(MAXM * sizeof(uint32_t));
       b_mtp_draft_probs = C.buf(MAXM * sizeof(float));
       b_mtp_part_l = C.buf(64u * sizeof(float));
+      b_mtp_part_x = C.buf(128u * sizeof(float));
     }
   }
 
@@ -627,6 +630,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     p_mtp_rnn_gates = C.pipe(ink_src, "ink_mtp_rnn_gates");
     p_mtp_add_argmax_p1 = C.pipe(ink_src, "ink_mtp_add_argmax_p1");
     p_mtp_add_argmax_p2 = C.pipe(ink_src, "ink_mtp_add_argmax_p2");
+  p_sample_rows = C.pipe(ink_src, "ink_sample_rows");
     const std::string mb = std::to_string(MtpL[0].mlp_gu.bits);
     p_mm_w6_gu = C.pipe(mm_src, "mm2", {{"WBITS", mb}, {"GS", "128"}, {"TILES", "1"}, {"EPI", "3"}});
     p_mm_w6_dn = C.pipe(mm_src, "mm2", {{"WBITS", mb}, {"GS", "128"}, {"TILES", "1"}});
@@ -746,6 +750,7 @@ void Model::use_lane(int k) {
   auto park = [&](Lane& ln) {  // swap the live state with a lane's parked copy
     std::swap(S, ln.S);
     std::swap(pos, ln.pos);
+    std::swap(samp, ln.samp);
     if (has_mtp) {
       if (ln.mtp_k.size() != MtpL.size()) { ln.mtp_k.assign(MtpL.size(), nil); ln.mtp_v.assign(MtpL.size(), nil); }
       for (size_t l = 0; l < MtpL.size(); l++) {
@@ -773,7 +778,7 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<std::pair<int, std::ve
     for (auto& r : refs)
       if (r.S == (k == active_lane ? &S : &lanes_[k].S)) mtl::die("step_lanes: lane listed twice");
     refs.push_back({k == active_lane ? &S : &lanes_[k].S, k == active_lane ? &pos : &lanes_[k].pos,
-                    uint32_t(ids.size()), uint32_t(toks.size())});
+                    uint32_t(ids.size()), uint32_t(toks.size()), k == active_lane ? &samp : &lanes_[k].samp});
     ids.insert(ids.end(), toks.begin(), toks.end());
   }
   if (ids.empty() || ids.size() > MAXM) mtl::die("step_lanes: total rows must be in 1..MAXM");
@@ -808,7 +813,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
                                   std::vector<float>* last_logits,
                                   std::map<std::string, double>* prof) {
   tap_row0 = 0;
-  return step_core(ids, {{&S, &pos, 0u, uint32_t(ids.size())}}, gpu_ms, last_logits, nullptr, prof);
+  return step_core(ids, {{&S, &pos, 0u, uint32_t(ids.size()), &samp}}, gpu_ms, last_logits, nullptr, prof);
 }
 
 std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const std::vector<LaneRef>& lanes,
@@ -855,6 +860,32 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
 
   const uint32_t b_stride = MP * H;
   const uint32_t n_core = core_end - core_start;
+
+  // Sampled rows (lanes with temp > 0) redraw over the softcapped logits; greedy rows keep the argmax.
+  auto enc_sample = [&](uint32_t n_rows, uint32_t pf_pos) {
+    std::vector<SampRow> rows(n_rows);
+    bool any = false;
+    for (const auto& lr : lanes) {
+      const Samp& sp = *lr.sp;
+      for (uint32_t i = 0; i < lr.m; i++) {
+        const uint32_t r = pf ? 0u : lr.r0 + i;
+        if (pf && i + 1u != lr.m) continue;
+        rows[r] = SampRow{vocab_valid, vocab_pad, pf ? pf_pos : *lr.pos + i, uint32_t(sp.seed), uint32_t(sp.seed >> 32),
+                          sp.temp > 0.0f ? 1.0f / sp.temp : -1.0f, sp.min_p > 0.0f ? logf(sp.min_p) : -INFINITY,
+                          sp.top_p, sp.top_k};
+        any = any || sp.temp > 0.0f;
+      }
+    }
+    if (!any) return;
+    memcpy([b_samp_rows contents], rows.data(), n_rows * sizeof(SampRow));
+    barrier();
+    [enc setComputePipelineState:p_sample_rows];
+    [enc setBuffer:b_logits offset:0 atIndex:0];
+    [enc setBuffer:b_tok_out offset:0 atIndex:1];
+    [enc setBuffer:b_samp_rows offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    flush_prof("sample");
+  };
 
   // 1. Embedding + embed_norm -> b_h
   [enc setComputePipelineState:p_embed];
@@ -1528,6 +1559,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     [enc setBuffer:b_tok_out offset:0 atIndex:2];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     flush_prof("argmax");
+    enc_sample(1u, pos + M - 1u);
   } else {
     [enc setComputePipelineState:p_rms_frag];
     [enc setBuffer:b_mh offset:0 atIndex:0];
@@ -1559,6 +1591,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     [enc setBuffer:b_tok_out offset:0 atIndex:2];
     [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     flush_prof("argmax");
+    enc_sample(M, 0u);
   }
 
   [enc endEncoding];
@@ -1842,7 +1875,8 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     enc_mm2(enc, p_mm_w8, mtp_mh_fold_w, b_mtp_lat_frag, 0, b_mtp_bias, 0, 1u, nil, b_dummy, nil, nil, nil, false);
     barrier();
 
-    MtpPickArgs pa{vocab_valid, vocab_pad, k, logit_softcap};
+    MtpPickArgs pa{vocab_valid, vocab_pad, k, logit_softcap, samp.temp > 0.0f ? 1.0f / samp.temp : -1.0f,
+                   uint32_t(samp.seed), uint32_t(samp.seed >> 32), pos};
     [enc setComputePipelineState:p_mtp_add_argmax_p1];
     [enc setBuffer:b_mtp_base_logits offset:(size_t(vocab_pad) * sizeof(float)) atIndex:0];  // row 1..7!
     [enc setBuffer:b_mtp_bias offset:0 atIndex:1];
@@ -1851,6 +1885,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     [enc setBuffer:b_argmax_i offset:0 atIndex:4];
     [enc setBuffer:b_mtp_part_l offset:0 atIndex:5];
     [enc setBytes:&pa length:sizeof(pa) atIndex:6];
+    [enc setBuffer:b_mtp_part_x offset:0 atIndex:7];
     [enc dispatchThreadgroups:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     barrier();
 
@@ -1862,6 +1897,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     [enc setBuffer:b_mtp_draft_out offset:0 atIndex:4];
     [enc setBuffer:b_mtp_draft_probs offset:0 atIndex:5];
     [enc setBytes:&pa length:sizeof(pa) atIndex:6];
+    [enc setBuffer:b_mtp_part_x offset:0 atIndex:7];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     barrier();
   }

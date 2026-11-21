@@ -42,6 +42,15 @@ int main(int argc, char** argv) {
 
     ink2::Model M;
     M.load(pack, cap, passes, kv8);
+    // Sampling for every lane (INK_TEMP <= 0: greedy). Lane k uses seed INK_SEED + k.
+    ink2::Model::Samp gsamp;
+    if (getenv("INK_TEMP")) gsamp.temp = float(atof(getenv("INK_TEMP")));
+    if (getenv("INK_TOP_P")) gsamp.top_p = float(atof(getenv("INK_TOP_P")));
+    if (getenv("INK_TOP_K")) gsamp.top_k = uint32_t(atoi(getenv("INK_TOP_K")));
+    if (getenv("INK_MIN_P")) gsamp.min_p = float(atof(getenv("INK_MIN_P")));
+    if (getenv("INK_SEED")) gsamp.seed = uint64_t(strtoull(getenv("INK_SEED"), nullptr, 10));
+    auto lane_samp = [&](uint32_t k) { ink2::Model::Samp s = gsamp; s.seed += k; return s; };
+    M.samp = gsamp;
 
     // Default 5-token prompt: "The capital of France is"
     std::vector<uint32_t> paris_ids = {371, 151451, 149879, 151194, 149884};
@@ -231,6 +240,7 @@ int main(int argc, char** argv) {
         for (uint32_t k = 0; k < nl; k++) {
           M.use_lane(0);
           M.reset();
+          M.samp = lane_samp(k);
           uint32_t t = prefill(prompt(k), false);
           for (uint32_t g = 0; g < n_gen; g++) { ref[k].push_back(t); t = M.step({t})[0]; }
         }
@@ -245,6 +255,7 @@ int main(int argc, char** argv) {
       for (uint32_t k = 0; k < nl; k++) {
         M.use_lane(int(k));
         M.reset();
+        M.samp = lane_samp(k);
         ls[k].hist = prompt(k);
         ls[k].anchor = prefill(ls[k].hist, true);
         ls[k].out.push_back(ls[k].anchor);
@@ -335,7 +346,7 @@ int main(int argc, char** argv) {
              "%.1f tok/s wall total (%.1f per lane) | draft %.2f ms/round wall, verify %.2f ms/round GPU\n",
              nl, draft_k, draft_cut, use_lookup ? 1 : 0, gen, rounds, double(acc) / lr, double(rows_tot) / rounds, lk_hits,
              1000.0 * gen / wall, 1000.0 * gen / wall / nl, t_draft / rounds, t_verify / rounds);
-      if (check) printf("jspec exact check: %u/%u tokens match greedy single-lane (%s)\n", match, nl * n_gen,
+      if (check) printf("jspec exact check: %u/%u tokens match plain single-lane decode (%s)\n", match, nl * n_gen,
                         match == nl * n_gen ? "100% EXACT" : "MISMATCH");
       return (!check || match == nl * n_gen) ? 0 : 1;
     }
@@ -572,7 +583,7 @@ int main(int argc, char** argv) {
           if (tok == spec_toks[i]) match++;
           if (i + 1 < spec_toks.size()) tok = M.step({tok})[0];
         }
-        printf("spec exact check: %u/%zu greedy tokens match (%s)\n",
+        printf("spec exact check: %u/%zu plain-decode tokens match (%s)\n",
                match, spec_toks.size(), (match == spec_toks.size()) ? "100% EXACT" : "MISMATCH");
         return (match == spec_toks.size()) ? 0 : 1;
       }

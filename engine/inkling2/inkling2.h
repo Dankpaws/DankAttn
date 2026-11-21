@@ -96,6 +96,15 @@ struct Model {
   Lin lm_head;
   std::vector<PhysLayer> L;
 
+  // Sampling: temp <= 0 is greedy argmax; else Gumbel-max keyed by (seed, input position) after min_p / top_k /
+  // top_p truncation, on GPU. DSpark drafts draw with the same keys, so speculation stays exact.
+  struct Samp {
+    float temp = 0.0f, min_p = 0.0f, top_p = 1.0f;
+    uint32_t top_k = 0;
+    uint64_t seed = 0;
+  };
+  Samp samp;  // active lane's
+
   // Per-logical-layer state of the active lane (`S`, `pos`); other lanes are parked in `lanes_`.
   std::vector<LogicalState> S;
   uint32_t pos = 0;
@@ -106,6 +115,7 @@ struct Model {
     std::vector<id<MTLBuffer>> mtp_k, mtp_v;
     uint32_t mtp_ctx_pos = 0;
     id<MTLBuffer> mtp_f_rnn = nil;
+    Samp samp;
   };
   // First row of the active lane's rows in the last step: mtp_commit / draft(n_commit) read its b_taps rows.
   uint32_t tap_row0 = 0;
@@ -121,6 +131,7 @@ struct Model {
     std::vector<LogicalState>* S;
     uint32_t* pos;
     uint32_t r0, m;  // rows [r0, r0 + m) of the step belong to this lane
+    const Samp* sp;
   };
 
   // DSpark MTP drafter (optional overlay: mtp_manifest.json + pack-mtp-00.bin)
@@ -152,7 +163,7 @@ struct Model {
   // DSpark pipelines
   id<MTLComputePipelineState> p_mtp_mix, p_mtp_kv_ctx, p_mtp_embed, p_mtp_qkv_rope;
   id<MTLComputePipelineState> p_mtp_attn, p_add_rms_frag, p_mtp_rnn_static, p_mtp_rnn_dyn, p_mtp_rnn_gates;
-  id<MTLComputePipelineState> p_mtp_add_argmax_p1, p_mtp_add_argmax_p2;
+  id<MTLComputePipelineState> p_mtp_add_argmax_p1, p_mtp_add_argmax_p2, p_sample_rows;
   id<MTLResidencySet> rs = nil;
   id<MTLHeap> scratch_heap = nil;
 
@@ -174,7 +185,7 @@ struct Model {
   id<MTLBuffer> b_mtp_o_frag, b_mtp_o_out, b_mtp_gu_frag, b_mtp_dn_out;
   id<MTLBuffer> b_mtp_base_h, b_mtp_base_logits, b_mtp_bias;
   id<MTLBuffer> b_mtp_rnn_state, b_mtp_rnn_static, b_mtp_rnn_proj, b_mtp_lat_frag;
-  id<MTLBuffer> b_mtp_prev_tok, b_mtp_draft_out, b_mtp_draft_probs, b_mtp_part_l;
+  id<MTLBuffer> b_mtp_prev_tok, b_mtp_draft_out, b_mtp_draft_probs, b_mtp_part_l, b_mtp_part_x, b_samp_rows;
 
   void load(const std::string& pack_dir, uint32_t max_cap = 32768, uint32_t passes_override = 0, bool kv8 = true);
   void reset();
