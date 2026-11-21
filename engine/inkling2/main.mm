@@ -189,6 +189,7 @@ int main(int argc, char** argv) {
 
       double t_draft = 0, t_verify = 0, t_commit = 0;
       uint32_t rounds = 0, total_acc = 0, total_drafted = 0, lk_hits = 0;
+      uint32_t pending_commit = 0;
       auto t0 = std::chrono::steady_clock::now();
 
       while (spec_toks.size() < n_gen) {
@@ -213,13 +214,18 @@ int main(int argc, char** argv) {
 
         if (drafts.empty()) {
           std::vector<float> dprobs;
-          drafts = M.draft(anchor, draft_k, &dprobs, &dms);
+          drafts = M.draft(anchor, draft_k, &dprobs, &dms, pending_commit);
+          pending_commit = 0;
           t_draft += dms;
           if (draft_cut > 0.0f) {
             uint32_t keep = 0;
             while (keep < drafts.size() && dprobs[keep] >= draft_cut) keep++;
             drafts.resize(keep);
           }
+        } else if (pending_commit > 0) {
+          M.mtp_commit(pending_commit, &cms);
+          pending_commit = 0;
+          t_commit += cms;
         }
 
         // Verify [anchor, d0, ..., d_{k-1}] (M = 1 + drafts.size() <= 16)
@@ -237,8 +243,7 @@ int main(int argc, char** argv) {
         while (acc < drafts.size() && v_out[acc] == drafts[acc]) acc++;
         const uint32_t n_adv = acc + 1u;
         M.rollback(n_adv, uint32_t(v_in.size()));
-        M.mtp_commit(n_adv, &cms);
-        t_commit += cms;
+        pending_commit = n_adv;
 
         hist.push_back(anchor);
         for (uint32_t i = 0; i < acc; i++) {

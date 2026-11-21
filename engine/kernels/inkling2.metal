@@ -1070,7 +1070,7 @@ kernel void ink_softcap_argmax_p2(device const float* part_v [[buffer(0)]],
 // M1. Mix 4 tapped target hidden states [4, M_stride, H] with alpha[4] + RMSNorm -> bf16 frag / f32 out.
 // Grid: (M, 1, 1), TG: 256 threads.
 struct MtpMixArgs {
-  uint H, M_stride, write_frag, write_f32;
+  uint H, M_stride, write_frag, write_f32, row_off;
   float eps;
 };
 kernel void ink_mtp_mix_norm(device const float4* taps [[buffer(0)]],   // [4][M_stride][H/4]
@@ -1083,12 +1083,13 @@ kernel void ink_mtp_mix_norm(device const float4* taps [[buffer(0)]],   // [4][M
                              uint tpg [[threads_per_threadgroup]]) {
   threadgroup float sm[8];
   const uint H4 = a.H >> 2;
+  const uint src_row = row + a.row_off;
   const size_t tap_stride = size_t(a.M_stride) * H4;
   const float a0 = alpha[0], a1 = alpha[1], a2 = alpha[2], a3 = alpha[3];
 
   float s2 = 0.0f;
   for (uint c = tid; c < H4; c += tpg) {
-    const size_t o = size_t(row) * H4 + c;
+    const size_t o = size_t(src_row) * H4 + c;
     const float4 v = taps[0u * tap_stride + o] * a0 + taps[1u * tap_stride + o] * a1 +
                      taps[2u * tap_stride + o] * a2 + taps[3u * tap_stride + o] * a3;
     s2 += dot(v, v);
@@ -1105,7 +1106,7 @@ kernel void ink_mtp_mix_norm(device const float4* taps [[buffer(0)]],   // [4][M
   const float inv = sm[0];
 
   for (uint c4 = tid; c4 < H4; c4 += tpg) {
-    const size_t o = size_t(row) * H4 + c4;
+    const size_t o = size_t(src_row) * H4 + c4;
     const float4 v = (taps[0u * tap_stride + o] * a0 + taps[1u * tap_stride + o] * a1 +
                       taps[2u * tap_stride + o] * a2 + taps[3u * tap_stride + o] * a3) * inv * norm_w[c4];
     const bfloat4 bv = bfloat4(v);

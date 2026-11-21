@@ -164,8 +164,10 @@ struct Model {
   // Commit `n_commit` accepted tokens' tapped target features (from the last step) into DSpark KV cache + f_rnn.
   void mtp_commit(uint32_t n_commit, double* gpu_ms = nullptr);
   // Draft up to `max_drafts` (1..7, default 7) tokens starting from `anchor_tok` at current `pos`.
+  // If `n_commit > 0`, fuses `mtp_commit(n_commit)` into the same command buffer (zero extra GPU sync!).
   std::vector<uint32_t> draft(uint32_t anchor_tok, uint32_t max_drafts = 7,
-                              std::vector<float>* draft_probs = nullptr, double* gpu_ms = nullptr);
+                              std::vector<float>* draft_probs = nullptr, double* gpu_ms = nullptr,
+                              uint32_t n_commit = 0);
 };
 
 }  // namespace ink2

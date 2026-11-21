@@ -63,7 +63,7 @@ struct AttnDecArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, n_s
 struct PostConvArgs { uint32_t M, H, ks, is_boundary, is_mlp, b_slot, b_stride; };
 struct RouteArgs { uint32_t M, H, E, topk; float route_scale; };
 struct PlanArgs { uint32_t M, E, topk, gx_gu, gx_dn; };
-struct MtpMixArgs { uint32_t H, M_stride, write_frag, write_f32; float eps; };
+struct MtpMixArgs { uint32_t H, M_stride, write_frag, write_f32, row_off; float eps; };
 struct MtpKvArgs { uint32_t nkv, hd, pos0, cap; float eps, rope_theta; };
 struct MtpQkvArgs { uint32_t nh, nkv, hd, pos0; float eps, rope_theta; };
 struct MtpAttnArgs { uint32_t B, nh, nkv, hd, ctx_len, cap, window, is_local; };
@@ -1446,7 +1446,7 @@ void Model::mtp_commit(uint32_t n_commit, double* gpu_ms) {
   // 1. Project & cache context KV for each of the 3 MTP layers
   for (uint32_t l = 0; l < mtp_nL; l++) {
     auto& ml = MtpL[l];
-    MtpMixArgs ma{H, MP, 1u, 0u, eps};
+    MtpMixArgs ma{H, MP, 1u, 0u, 0u, eps};
     [enc setComputePipelineState:p_mtp_mix];
     [enc setBuffer:b_taps offset:0 atIndex:0];
     [enc setBuffer:mtp_fuse_alpha.b offset:(mtp_fuse_alpha.off + size_t(l) * 4u * sizeof(float)) atIndex:1];
@@ -1460,7 +1460,7 @@ void Model::mtp_commit(uint32_t n_commit, double* gpu_ms) {
     if (n_commit > MAXM) {
       enc_mmp(enc, p_mmp_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, b_dummy);
     } else {
-      enc_mm2(enc, p_mm_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, nil, b_dummy, nil, nil, nil, false);
+      enc_mm2(enc, p_mm_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
     }
     barrier();
 
@@ -1475,8 +1475,8 @@ void Model::mtp_commit(uint32_t n_commit, double* gpu_ms) {
     barrier();
   }
 
-  // 2. Compute f_rnn for the last committed token (row = n_commit - 1)
-  MtpMixArgs rma{H, MP, 0u, 1u, eps};
+  // 2. Compute f_rnn ONLY for the last committed token (row_off = n_commit - 1 -> row 0, zero CPU memcpy!)
+  MtpMixArgs rma{H, MP, 0u, 1u, n_commit - 1u, eps};
   [enc setComputePipelineState:p_mtp_mix];
   [enc setBuffer:b_taps offset:0 atIndex:0];
   [enc setBuffer:mtp_fuse_alpha.b offset:(mtp_fuse_alpha.off + 3u * 4u * sizeof(float)) atIndex:1];
@@ -1484,25 +1484,19 @@ void Model::mtp_commit(uint32_t n_commit, double* gpu_ms) {
   [enc setBuffer:b_dummy offset:0 atIndex:3];
   [enc setBuffer:b_mtp_f_rnn offset:0 atIndex:4];
   [enc setBytes:&rma length:sizeof(rma) atIndex:5];
-  [enc dispatchThreadgroups:MTLSizeMake(n_commit, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
   [enc endEncoding];
   [cb commit];
   [cb waitUntilCompleted];
   if (cb.error) mtl::die("GPU mtp_commit error", cb.error);
   if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
-
-  // Move row (n_commit - 1) of b_mtp_f_rnn to row 0 so draft() always reads offset 0
-  if (n_commit > 1u) {
-    memcpy([b_mtp_f_rnn contents],
-           (const uint8_t*)[b_mtp_f_rnn contents] + size_t(n_commit - 1u) * H * sizeof(float),
-           size_t(H) * sizeof(float));
-  }
   mtp_ctx_pos += n_commit;
 }
 
 std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
-                                   std::vector<float>* draft_probs, double* gpu_ms) {
+                                   std::vector<float>* draft_probs, double* gpu_ms,
+                                   uint32_t n_commit) {
   if (!has_mtp) return {};
   const uint32_t B = mtp_block;  // 8
   const uint32_t gamma = std::max(1u, std::min(max_drafts, B - 1u));
@@ -1513,7 +1507,51 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
   auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
 
-  // 1. Build 8-token draft input block: [embed_norm(embed[anchor]), mask_embed x 7]
+  // Optional fused mtp_commit(n_commit) inside the same command buffer (eliminates 1 GPU sync round-trip!)
+  if (n_commit > 0u) {
+    for (uint32_t l = 0; l < mtp_nL; l++) {
+      auto& ml = MtpL[l];
+      MtpMixArgs ma{H, MP, 1u, 0u, 0u, eps};
+      [enc setComputePipelineState:p_mtp_mix];
+      [enc setBuffer:b_taps offset:0 atIndex:0];
+      [enc setBuffer:mtp_fuse_alpha.b offset:(mtp_fuse_alpha.off + size_t(l) * 4u * sizeof(float)) atIndex:1];
+      [enc setBuffer:ml.dflare_norm.b offset:ml.dflare_norm.off atIndex:2];
+      [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+      [enc setBuffer:b_dummy offset:0 atIndex:4];
+      [enc setBytes:&ma length:sizeof(ma) atIndex:5];
+      [enc dispatchThreadgroups:MTLSizeMake(n_commit, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      if (n_commit > MAXM) {
+        enc_mmp(enc, p_mmp_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, b_dummy);
+      } else {
+        enc_mm2(enc, p_mm_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      }
+      barrier();
+
+      MtpKvArgs ka{nkv, hd, mtp_ctx_pos, ml.cap, eps, mtp_rope_theta};
+      [enc setComputePipelineState:p_mtp_kv_ctx];
+      [enc setBuffer:b_mtp_kv_ctx offset:0 atIndex:0];
+      [enc setBuffer:ml.k_norm_ctx.b offset:ml.k_norm_ctx.off atIndex:1];
+      [enc setBuffer:ml.k_cache offset:0 atIndex:2];
+      [enc setBuffer:ml.v_cache offset:0 atIndex:3];
+      [enc setBytes:&ka length:sizeof(ka) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(n_commit, nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+      barrier();
+    }
+    MtpMixArgs rma{H, MP, 0u, 1u, n_commit - 1u, eps};
+    [enc setComputePipelineState:p_mtp_mix];
+    [enc setBuffer:b_taps offset:0 atIndex:0];
+    [enc setBuffer:mtp_fuse_alpha.b offset:(mtp_fuse_alpha.off + 3u * 4u * sizeof(float)) atIndex:1];
+    [enc setBuffer:mtp_mh_dflare_norm.b offset:mtp_mh_dflare_norm.off atIndex:2];
+    [enc setBuffer:b_dummy offset:0 atIndex:3];
+    [enc setBuffer:b_mtp_f_rnn offset:0 atIndex:4];
+    [enc setBytes:&rma length:sizeof(rma) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    mtp_ctx_pos += n_commit;
+  }
+
+  // 1. Build 8-token draft input block (runs concurrently with f_rnn above!)
   [enc setComputePipelineState:p_mtp_embed];
   [enc setBuffer:embed.b offset:embed.off atIndex:0];
   [enc setBuffer:embed_norm.b offset:embed_norm.off atIndex:1];
