@@ -1239,8 +1239,8 @@ kernel void ink_mtp_qkv_rope(device const float* qkv [[buffer(0)]],
   }
 }
 
-// M5. MTP Non-Causal Block GQA Attention over [cached ctx (t_start .. ctx_len-1)] U [B block K/V].
-// Grid: (B, nh, 1), TG: 128 threads (4 simdgroups, barrier-free).
+// M5. GQA G=3 Shared-KV MTP Non-Causal Block Attention over [cached ctx] U [B block K/V].
+// Grid: (B, nkv, 1), TG: 128 threads (4 simdgroups, 3x fewer KV cache reads!).
 struct MtpAttnArgs {
   uint B, nh, nkv, hd, ctx_len, cap, window, is_local;
 };
@@ -1252,62 +1252,108 @@ kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
                          device bfloat* out_frag [[buffer(5)]],
                          constant MtpAttnArgs& a [[buffer(6)]],
                          uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-  const uint row = tg.x, h = tg.y;
+  const uint row = tg.x, kvh = tg.y;
   const uint sg = tid >> 5, lane = tid & 31u;
-  const uint kvh = h / (a.nh / a.nkv);
+  const uint h0 = kvh * 3u;
   const uint t_start = (a.is_local && a.ctx_len > a.window) ? (a.ctx_len - a.window) : 0u;
   const float scale = rsqrt(float(a.hd));
-  const float4 q4 = Q[(size_t(row) * a.nh + h) * 32u + lane] * scale;
+  const size_t q_base = size_t(row) * a.nh + h0;
+  const float4 q0 = Q[(q_base + 0u) * 32u + lane] * scale;
+  const float4 q1 = Q[(q_base + 1u) * 32u + lane] * scale;
+  const float4 q2 = Q[(q_base + 2u) * 32u + lane] * scale;
 
-  float m_max = -1e30f, l_sum = 0.0f;
-  float4 o4 = float4(0.0f);
+  float m0 = -1e30f, l0 = 0.0f; float4 o0 = float4(0.0f);
+  float m1 = -1e30f, l1 = 0.0f; float4 o1 = float4(0.0f);
+  float m2 = -1e30f, l2 = 0.0f; float4 o2 = float4(0.0f);
 
-  // 1) Attend to cached context KV
-  for (uint t = t_start + sg; t < a.ctx_len; t += 4u) {
-    const uint slot = t % a.cap;
+  // 1) Attend to cached context KV (modulo-free ring index, 3x shared KV!)
+  uint t = t_start + sg;
+  uint slot = (t < a.ctx_len) ? (t % a.cap) : 0u;
+  for (; t < a.ctx_len; t += 4u) {
     const size_t kv_off = (size_t(slot) * a.nkv + kvh) * 32u + lane;
-    const float s = simd_sum(dot(q4, float4(K_ctx[kv_off])));
-    const float mn = max(m_max, s);
-    const float al = (l_sum > 0.0f) ? exp(m_max - mn) : 0.0f;
-    const float p = exp(s - mn);
-    o4 = fma(p, float4(V_ctx[kv_off]), o4 * al);
-    l_sum = l_sum * al + p;
-    m_max = mn;
+    const float4 k4 = float4(K_ctx[kv_off]);
+    const float4 v4 = float4(V_ctx[kv_off]);
+    {
+      const float s = simd_sum(dot(q0, k4));
+      const float mn = max(m0, s);
+      const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f;
+      const float p = exp(s - mn);
+      o0 = fma(p, v4, o0 * al); l0 = l0 * al + p; m0 = mn;
+    }
+    {
+      const float s = simd_sum(dot(q1, k4));
+      const float mn = max(m1, s);
+      const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f;
+      const float p = exp(s - mn);
+      o1 = fma(p, v4, o1 * al); l1 = l1 * al + p; m1 = mn;
+    }
+    {
+      const float s = simd_sum(dot(q2, k4));
+      const float mn = max(m2, s);
+      const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f;
+      const float p = exp(s - mn);
+      o2 = fma(p, v4, o2 * al); l2 = l2 * al + p; m2 = mn;
+    }
+    slot += 4u;
+    if (slot >= a.cap) slot -= a.cap;
   }
   // 2) Attend to all B block tokens (non-causal!)
   for (uint b = sg; b < a.B; b += 4u) {
     const size_t kv_off = (size_t(b) * a.nkv + kvh) * 32u + lane;
-    const float s = simd_sum(dot(q4, float4(K_blk[kv_off])));
-    const float mn = max(m_max, s);
-    const float al = (l_sum > 0.0f) ? exp(m_max - mn) : 0.0f;
-    const float p = exp(s - mn);
-    o4 = fma(p, float4(V_blk[kv_off]), o4 * al);
-    l_sum = l_sum * al + p;
-    m_max = mn;
+    const float4 k4 = float4(K_blk[kv_off]);
+    const float4 v4 = float4(V_blk[kv_off]);
+    {
+      const float s = simd_sum(dot(q0, k4));
+      const float mn = max(m0, s);
+      const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f;
+      const float p = exp(s - mn);
+      o0 = fma(p, v4, o0 * al); l0 = l0 * al + p; m0 = mn;
+    }
+    {
+      const float s = simd_sum(dot(q1, k4));
+      const float mn = max(m1, s);
+      const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f;
+      const float p = exp(s - mn);
+      o1 = fma(p, v4, o1 * al); l1 = l1 * al + p; m1 = mn;
+    }
+    {
+      const float s = simd_sum(dot(q2, k4));
+      const float mn = max(m2, s);
+      const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f;
+      const float p = exp(s - mn);
+      o2 = fma(p, v4, o2 * al); l2 = l2 * al + p; m2 = mn;
+    }
   }
 
-  threadgroup float sm_m[4], sm_l[4];
-  threadgroup float4 sm_o[4][32];
-  if (lane == 0u) { sm_m[sg] = m_max; sm_l[sg] = l_sum; }
-  sm_o[sg][lane] = o4;
+  threadgroup float sm_m[3][4], sm_l[3][4];
+  threadgroup float4 sm_o[3][4][32];
+  if (lane == 0u) {
+    sm_m[0][sg] = m0; sm_l[0][sg] = l0;
+    sm_m[1][sg] = m1; sm_l[1][sg] = l1;
+    sm_m[2][sg] = m2; sm_l[2][sg] = l2;
+  }
+  sm_o[0][sg][lane] = o0;
+  sm_o[1][sg][lane] = o1;
+  sm_o[2][sg][lane] = o2;
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (sg == 0u) {
+  if (sg < 3u) {
+    const uint g = sg;
     float fm = -1e30f, fl = 0.0f;
     float4 fo = float4(0.0f);
     for (uint s = 0; s < 4u; s++) {
-      const float sl = sm_l[s];
+      const float sl = sm_l[g][s];
       if (sl <= 0.0f) continue;
-      const float smv = sm_m[s];
+      const float smv = sm_m[g][s];
       const float mn = max(fm, smv);
       const float a0 = (fl > 0.0f) ? exp(fm - mn) : 0.0f;
       const float a1 = exp(smv - mn);
-      fo = fo * a0 + sm_o[s][lane] * a1;
+      fo = fo * a0 + sm_o[g][s][lane] * a1;
       fl = fl * a0 + sl * a1;
       fm = mn;
     }
     const bfloat4 res = bfloat4(fo / fl);
-    const uint col0 = h * a.hd + lane * 4u;
+    const uint col0 = (h0 + g) * a.hd + lane * 4u;
     const uint K = a.nh * a.hd;
     out_frag[frag_off(row, col0 + 0u, K)] = res.x;
     out_frag[frag_off(row, col0 + 1u, K)] = res.y;

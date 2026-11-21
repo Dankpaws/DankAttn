@@ -117,7 +117,7 @@ struct Model {
   id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
   id<MTLComputePipelineState> p_attn_dec_local, p_attn_dec_global_bf16, p_attn_dec_global_kv8;
-  id<MTLComputePipelineState> p_scores, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
+  id<MTLComputePipelineState> p_scores, p_scores_mma, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
   id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
   id<MTLComputePipelineState> p_mmp_w8;
@@ -130,6 +130,7 @@ struct Model {
   id<MTLComputePipelineState> p_mtp_attn, p_add_rms_frag, p_mtp_rnn_static, p_mtp_rnn_dyn, p_mtp_rnn_gates;
   id<MTLComputePipelineState> p_mtp_add_argmax_p1, p_mtp_add_argmax_p2;
   id<MTLResidencySet> rs = nil;
+  id<MTLHeap> scratch_heap = nil;
 
   // Scratch buffers (sized for MAXM = 16)
   id<MTLBuffer> b_ids, b_h, b_pre_h, b_prev_h, b_blocks, b_pre_blocks, b_prev_blocks;

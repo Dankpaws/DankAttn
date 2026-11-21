@@ -592,3 +592,73 @@ kernel void ink_mg_apply_mma(device const float* h_in [[buffer(0)]], device cons
     }
   }
 }
+
+// Metal 4 matmul2d Prefill MoE Router Scores (M > 16): scores[M, E] = sigmoid(mn[M, H] @ rw[E, H]^T).
+// Uses hi+lo bf16 split on rw for fp24 precision matching FP32 routing.
+// Grid: (ceil(M / 16), E / 32, 1), TG: 128 threads (4 simdgroups splitting K = H).
+kernel void ink_moe_scores_mma(device const float* mn [[buffer(0)]],      // [M, H] (already bf16-rounded)
+                               device const float* rw [[buffer(1)]],      // [E, H] f32
+                               device float* scores [[buffer(2)]],        // [M, E]
+                               constant uint& M [[buffer(3)]], constant uint& H [[buffer(4)]],
+                               constant uint& E [[buffer(5)]],
+                               uint2 tg [[threadgroup_position_in_grid]],
+                               ushort sg [[simdgroup_index_in_threadgroup]],
+                               ushort l [[thread_index_in_simdgroup]]) {
+  const uint row0 = tg.x * 16u, e0 = tg.y * 32u;
+  const uint ks_tot = H >> 5;  // 2304 / 32 = 72 -> 18 k-steps per simdgroup
+  const uint ks_per = ks_tot >> 2;
+  const uint ks_lo = uint(sg) * ks_per;
+  const uint ks_hi = (sg == 3u) ? ks_tot : (ks_lo + ks_per);
+
+  const ushort m0 = ((l >> 1) & 3) + 4 * (l >> 4);
+  const ushort n0 = 4 * (l & 1) + 8 * ((l >> 3) & 1);
+
+  constexpr auto desc =
+      matmul2d_descriptor(16, 32, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto xa = op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto wbh = op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto wbl = op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto acc = op.template get_destination_cooperative_tensor<decltype(xa), decltype(wbh), float>();
+  for (int i = 0; i < 16; i++) acc[i] = 0.0f;
+
+  for (uint ks = ks_lo; ks < ks_hi; ks++) {
+    const uint k0 = ks * 32u;
+    for (int hh = 0; hh < 2; hh++) {
+      const uint kc = k0 + n0 + 16u * uint(hh);
+      for (int r = 0; r < 2; r++) {
+        const uint qr = row0 + m0 + 8u * uint(r);
+        const float4 v = (qr < M) ? *(device const float4*)(mn + size_t(qr) * H + kc) : float4(0.0f);
+        const bfloat4 b4 = bfloat4(v);
+        for (int e = 0; e < 4; e++) xa[hh * 8 + r * 4 + e] = b4[e];
+      }
+      for (int qq = 0; qq < 4; qq++) {
+        const uint ec = e0 + m0 + 8u * uint(qq);
+        const float4 v = (ec < E) ? *(device const float4*)(rw + size_t(ec) * H + kc) : float4(0.0f);
+        const bfloat4 bh = bfloat4(v);
+        const bfloat4 bl = bfloat4(v - float4(bh));
+        for (int e = 0; e < 4; e++) {
+          wbh[hh * 16 + qq * 4 + e] = bh[e];
+          wbl[hh * 16 + qq * 4 + e] = bl[e];
+        }
+      }
+    }
+    op.run(xa, wbh, acc);
+    op.run(xa, wbl, acc);
+  }
+
+  threadgroup float Sp[4][16][32];
+  for (int i = 0; i < 16; i++) Sp[sg][i][l] = acc[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (sg == 0u) {
+    for (int i = 0; i < 16; i++) {
+      const uint qr = row0 + m0 + 8u * uint((i >> 2) & 1);
+      const uint ec = e0 + n0 + uint(i & 3) + 16u * uint(i >> 3);
+      if (qr < M && ec < E) {
+        const float v = (Sp[0][i][l] + Sp[1][i][l]) + (Sp[2][i][l] + Sp[3][i][l]);
+        scores[size_t(qr) * E + ec] = 1.0f / (1.0f + exp(-v));
+      }
+    }
+  }
+}

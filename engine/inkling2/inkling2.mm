@@ -376,7 +376,8 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     for (uint32_t l = core_start; l < core_end; l++) init_logical(li++, l);
   for (uint32_t l = core_end; l < nL; l++) init_logical(li++, l);
 
-  // Allocate main scratch buffers (sized for MP = 256 chunked prefill + MAXM = 16 decode)
+  // Allocate main scratch buffers (sized for MP = 512 chunked prefill + MAXM = 16 decode)
+  // Always-live step buffers:
   b_ids = C.buf(MP * sizeof(uint32_t));
   b_h = C.buf(MP * H * sizeof(float));
   b_pre_h = C.buf(MP * H * sizeof(float));
@@ -384,31 +385,90 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_blocks = C.buf(MAX_BLOCKS * MP * H * sizeof(float));
   b_pre_blocks = C.buf(MAX_BLOCKS * MP * H * sizeof(float));
   b_prev_blocks = C.buf(MAX_BLOCKS * MP * H * sizeof(float));
-  b_qkv_in = C.buf(3u * MP * H * sizeof(float));
-  b_qkv_out = C.buf(3u * MP * H * sizeof(float));
   b_msgs = C.buf(4u * MP * H * sizeof(float));
-  b_mh = C.buf(MP * H * sizeof(float));
-  b_mn_f32 = C.buf(MP * H * sizeof(float));
-  b_rscores = C.buf(MP * E * sizeof(float));
-  b_mg_cat = C.buf(3u * MP * 2u * H * sizeof(uint16_t));
-  b_mg_low = C.buf(3u * MP * gate_rank * sizeof(float));
-  b_attn_part = C.buf(size_t(MAXM) * nh * ASPLITS * 130u * sizeof(float));
-
   b_frag_q = C.buf(MP * H * sizeof(uint16_t));
   b_frag_k = C.buf(MP * H * sizeof(uint16_t));
   b_frag_v = C.buf(MP * H * sizeof(uint16_t));
-  b_frag_o = C.buf(MP * nh * hd * sizeof(uint16_t));
-  b_frag_m = C.buf(MP * H * sizeof(uint16_t));
-  b_frag_gu = C.buf(size_t(PF_COMPACT) * I_moe * sizeof(uint16_t));
 
-  b_qgrs = C.buf(MP * L[0].qgrs.N * sizeof(float));
-  b_k_raw = C.buf(MP * (nkv * hd + 32u) * sizeof(float));
-  b_v_raw = C.buf(MP * (nkv * hd + 32u) * sizeof(float));
-  b_Q = C.buf(MP * nh * hd * sizeof(float));
-  b_rel_logits = C.buf(MP * nh * rel_extent * sizeof(float));
-  b_gate = C.buf(MP * nh * hd * sizeof(float));
-  b_sinks = C.buf(MP * nh * sizeof(float));
-  b_o_out = C.buf(MP * H * sizeof(float));
+  // Phase-aliased MTLHeap (MTLHazardTrackingModeTracked) for non-overlapping Attention / MoE / Logits phases:
+  // Saves ~160 MB of wired GPU state (crucial for 32 GB MacBook Pro at 128k context).
+  auto align16k = [](size_t n) -> size_t { return (n + 16383u) & ~size_t(16383u); };
+  const size_t sz_mg_cat    = align16k(3u * MP * 2u * H * sizeof(uint16_t));
+  const size_t sz_mg_low    = align16k(3u * MP * gate_rank * sizeof(float));
+  const size_t sz_qkv_in    = align16k(3u * MP * H * sizeof(float));
+  const size_t sz_qkv_out   = align16k(3u * MP * H * sizeof(float));
+  const size_t off_mg_end   = sz_mg_cat + sz_mg_low;
+  const size_t sz_phase1a   = off_mg_end + sz_qkv_in + sz_qkv_out;
+
+  const size_t sz_qgrs      = align16k(size_t(MP) * L[0].qgrs.N * sizeof(float));
+  const size_t sz_k_raw     = align16k(size_t(MP) * (nkv * hd + 32u) * sizeof(float));
+  const size_t sz_v_raw     = align16k(size_t(MP) * (nkv * hd + 32u) * sizeof(float));
+  const size_t sz_Q         = align16k(size_t(MP) * nh * hd * sizeof(float));
+  const size_t sz_rel       = align16k(size_t(MP) * nh * rel_extent * sizeof(float));
+  const size_t sz_gate      = align16k(size_t(MP) * nh * hd * sizeof(float));
+  const size_t sz_sinks     = align16k(size_t(MP) * nh * sizeof(float));
+  const size_t sz_o_out     = align16k(size_t(MP) * H * sizeof(float));
+  const size_t sz_attn_part = align16k(size_t(MAXM) * nh * ASPLITS * 130u * sizeof(float));
+  const size_t sz_frag_o    = align16k(size_t(MP) * nh * hd * sizeof(uint16_t));
+  const size_t sz_phase1b   = sz_qgrs + sz_k_raw + sz_v_raw + sz_Q + sz_rel + sz_gate + sz_sinks + sz_o_out + sz_attn_part + sz_frag_o;
+
+  const size_t sz_mh        = align16k(size_t(MP) * H * sizeof(float));
+  const size_t sz_mn_f32    = align16k(size_t(MP) * H * sizeof(float));
+  const size_t sz_frag_m    = align16k(size_t(MP) * H * sizeof(uint16_t));
+  const size_t sz_rscores   = align16k(size_t(MP) * E * sizeof(float));
+  const size_t sz_frag_gu   = align16k(size_t(PF_COMPACT) * I_moe * sizeof(uint16_t));
+  const size_t sz_moe_y     = align16k(size_t(PF_COMPACT) * H * sizeof(float));
+  const size_t sz_moe_out   = align16k(size_t(MP) * H * sizeof(float));
+  const size_t sz_phase2    = off_mg_end + sz_mh + sz_mn_f32 + sz_frag_m + sz_rscores + sz_frag_gu + sz_moe_y + sz_moe_out;
+
+  const size_t sz_logits    = align16k(size_t(MAXM) * vocab_pad * sizeof(float));
+  const size_t heap_sz      = std::max({sz_phase1a, sz_phase1b, sz_phase2, sz_logits});
+  scratch_heap = C.heap(heap_sz);
+  auto hbuf = [&](size_t& off, size_t sz) -> id<MTLBuffer> {
+    id<MTLBuffer> b = [scratch_heap newBufferWithLength:sz options:MTLResourceStorageModeShared offset:off];
+    if (!b) mtl::die("heap buffer alloc");
+    off += sz;
+    return b;
+  };
+
+  // Phase 1a (Pre-Attn msg_gate):
+  {
+    size_t o = 0;
+    b_mg_cat  = hbuf(o, sz_mg_cat);
+    b_mg_low  = hbuf(o, sz_mg_low);
+    b_qkv_in  = hbuf(o, sz_qkv_in);
+    b_qkv_out = hbuf(o, sz_qkv_out);
+  }
+  // Phase 1b (Attention projections + FlashAttn + O-proj):
+  {
+    size_t o = 0;
+    b_qgrs       = hbuf(o, sz_qgrs);
+    b_k_raw      = hbuf(o, sz_k_raw);
+    b_v_raw      = hbuf(o, sz_v_raw);
+    b_Q          = hbuf(o, sz_Q);
+    b_rel_logits = hbuf(o, sz_rel);
+    b_gate       = hbuf(o, sz_gate);
+    b_sinks      = hbuf(o, sz_sinks);
+    b_o_out      = hbuf(o, sz_o_out);
+    b_attn_part  = hbuf(o, sz_attn_part);
+    b_frag_o     = hbuf(o, sz_frag_o);
+  }
+  // Phase 2 (MLP / MoE; starts after b_mg_cat + b_mg_low so MLP msg_gate never overlaps):
+  {
+    size_t o = off_mg_end;
+    b_mh      = hbuf(o, sz_mh);
+    b_mn_f32  = hbuf(o, sz_mn_f32);
+    b_frag_m  = hbuf(o, sz_frag_m);
+    b_rscores = hbuf(o, sz_rscores);
+    b_frag_gu = hbuf(o, sz_frag_gu);
+    b_moe_y   = hbuf(o, sz_moe_y);
+    b_moe_out = hbuf(o, sz_moe_out);
+  }
+  // Phase 3 (Final logits at offset 0 < off_mg_end, so never overlaps b_frag_m/b_mh):
+  {
+    size_t o = 0;
+    b_logits = hbuf(o, sz_logits);
+  }
 
   b_top_idx = C.buf(MP * topk * sizeof(uint32_t));
   b_top_w = C.buf(MP * topk * sizeof(float));
@@ -422,9 +482,6 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_wtile = C.buf((PF_COMPACT / 64u + E) * sizeof(uint32_t));
   b_ind_gu = C.buf(16);
   b_ind_dn = C.buf(16);
-  b_moe_y = C.buf(size_t(PF_COMPACT) * H * sizeof(float));
-  b_moe_out = C.buf(MP * H * sizeof(float));
-  b_logits = C.buf(MAXM * vocab_pad * sizeof(float));
   b_tok_out = C.buf(MAXM * sizeof(uint32_t));
   b_argmax_v = C.buf(MAXM * 64u * sizeof(float));
   b_argmax_i = C.buf(MAXM * 64u * sizeof(uint32_t));
@@ -549,6 +606,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_attn_reduce = C.pipe(ink_src, "ink_attn_reduce");
   p_post_conv = C.pipe(ink_src, "ink_post_sconv_add");
   p_scores = C.pipe(ink_src, "ink_moe_scores");
+  p_scores_mma = C.pipe(attn_src, "ink_moe_scores_mma");
   p_route = C.pipe(ink_src, "ink_moe_route");
   p_pack_dec = C.pipe(ink_src, "ink_moe_pack_dec");
   p_moe_accum = C.pipe(ink_src, "ink_moe_accum");
@@ -1075,13 +1133,24 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     }
 
     // J. MoE Router + Grouped NVFP4/MXFP8 Experts + Accum
-    [enc setComputePipelineState:p_scores];
-    [enc setBuffer:b_mn_f32 offset:0 atIndex:0];
-    [enc setBuffer:ly.router_w.b offset:ly.router_w.off atIndex:1];
-    [enc setBuffer:b_rscores offset:0 atIndex:2];
-    [enc setBytes:&H length:4 atIndex:3];
-    [enc setBytes:&E length:4 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(M, E / 8u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (pf) {
+      [enc setComputePipelineState:p_scores_mma];
+      [enc setBuffer:b_mn_f32 offset:0 atIndex:0];
+      [enc setBuffer:ly.router_w.b offset:ly.router_w.off atIndex:1];
+      [enc setBuffer:b_rscores offset:0 atIndex:2];
+      [enc setBytes:&M length:4 atIndex:3];
+      [enc setBytes:&H length:4 atIndex:4];
+      [enc setBytes:&E length:4 atIndex:5];
+      [enc dispatchThreadgroups:MTLSizeMake((M + 15u) / 16u, E / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else {
+      [enc setComputePipelineState:p_scores];
+      [enc setBuffer:b_mn_f32 offset:0 atIndex:0];
+      [enc setBuffer:ly.router_w.b offset:ly.router_w.off atIndex:1];
+      [enc setBuffer:b_rscores offset:0 atIndex:2];
+      [enc setBytes:&H length:4 atIndex:3];
+      [enc setBytes:&E length:4 atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(M, E / 8u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
     barrier();
 
     RouteArgs ra{M, H, E, topk, route_scale};
@@ -1497,7 +1566,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     [enc setBuffer:b_mtp_V_blk offset:0 atIndex:4];
     [enc setBuffer:b_mtp_o_frag offset:0 atIndex:5];
     [enc setBytes:&aa length:sizeof(aa) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake(B, nh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(B, nkv, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     barrier();
 
     enc_mm2(enc, p_mm_w8, ml.o, b_mtp_o_frag, 0, b_mtp_o_out, 0, B, nil, b_dummy, nil, nil, nil, false);
