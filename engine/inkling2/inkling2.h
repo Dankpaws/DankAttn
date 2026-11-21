@@ -110,11 +110,12 @@ struct Model {
   std::vector<MtpLayer> MtpL;
 
   // Pipelines
-  id<MTLComputePipelineState> p_embed, p_attn_res, p_mg_prep, p_mg_down, p_mg_apply, p_rms_frag;
+  id<MTLComputePipelineState> p_embed, p_attn_res, p_attn_res_rms, p_attn_res_mg_prep;
+  id<MTLComputePipelineState> p_mg_prep, p_mg_down, p_mg_apply, p_mg_down3, p_mg_apply3, p_rms_frag;
   id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
   id<MTLComputePipelineState> p_attn_dec_local, p_attn_dec_global_bf16, p_attn_dec_global_kv8;
-  id<MTLComputePipelineState> p_scores, p_route, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
+  id<MTLComputePipelineState> p_scores, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
   id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
   id<MTLComputePipelineState> p_mmp_w8;
@@ -129,7 +130,7 @@ struct Model {
 
   // Scratch buffers (sized for MAXM = 16)
   id<MTLBuffer> b_ids, b_h, b_pre_h, b_prev_h, b_blocks, b_pre_blocks, b_prev_blocks;
-  id<MTLBuffer> b_qkv_in, b_msgs, b_mh, b_mn_f32, b_rscores;
+  id<MTLBuffer> b_qkv_in, b_qkv_out, b_msgs, b_mh, b_mn_f32, b_rscores;
   id<MTLBuffer> b_mg_cat, b_mg_low, b_attn_part;
   id<MTLBuffer> b_frag_q, b_frag_k, b_frag_v, b_frag_o, b_frag_m, b_frag_gu;
   id<MTLBuffer> b_qgrs, b_k_raw, b_v_raw, b_Q, b_rel_logits, b_gate, b_sinks, b_o_out;

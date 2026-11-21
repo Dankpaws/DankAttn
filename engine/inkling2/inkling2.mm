@@ -44,7 +44,10 @@ id<MTLBuffer> mmap_file(id<MTLDevice> dev, const std::string& path, size_t& out_
 
 // Kernel argument structs matching engine/kernels/inkling2.metal
 struct AttnResArgs { uint32_t H, M, n_prev, b_stride; float eps; };
+struct AttnResRmsArgs { uint32_t H, M, n_prev, b_stride, write_f32; float eps; };
+struct AttnResMgArgs { uint32_t H, M, n_prev, b_stride, q_shared, cat_stride_b4; float eps; };
 struct MsgGateArgs { uint32_t H, R; float eps; };
+struct MsgGate3Args { uint32_t H, R, M, q_shared, cat_stride_b4, low_stride_f; };
 struct QRelArgs {
   uint32_t nh, hd, d_rel, rel_extent, qgrs_n, pos0, is_global;
   float qk_clip, rel_clip, log_n_floor, log_alpha;
@@ -379,6 +382,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_pre_blocks = C.buf(MAX_BLOCKS * MP * H * sizeof(float));
   b_prev_blocks = C.buf(MAX_BLOCKS * MP * H * sizeof(float));
   b_qkv_in = C.buf(3u * MP * H * sizeof(float));
+  b_qkv_out = C.buf(3u * MP * H * sizeof(float));
   b_msgs = C.buf(4u * MP * H * sizeof(float));
   b_mh = C.buf(MP * H * sizeof(float));
   b_mn_f32 = C.buf(MP * H * sizeof(float));
@@ -524,9 +528,13 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
 
   p_embed = C.pipe(ink_src, "ink_embed");
   p_attn_res = C.pipe(ink_src, "ink_attn_res");
+  p_attn_res_rms = C.pipe(ink_src, "ink_attn_res_rms");
+  p_attn_res_mg_prep = C.pipe(ink_src, "ink_attn_res_mg_prep");
   p_mg_prep = C.pipe(ink_src, "ink_mg_prep");
   p_mg_down = C.pipe(ink_src, "ink_mg_down");
   p_mg_apply = C.pipe(ink_src, "ink_mg_apply");
+  p_mg_down3 = C.pipe(ink_src, "ink_mg_down3");
+  p_mg_apply3 = C.pipe(ink_src, "ink_mg_apply3");
   p_rms_frag = C.pipe(ink_src, "ink_rms_frag");
   p_q_rel = C.pipe(ink_src, "ink_q_rel");
   p_kv_conv = C.pipe(ink_src, "ink_kv_conv_cache");
@@ -535,6 +543,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_post_conv = C.pipe(ink_src, "ink_post_sconv_add");
   p_scores = C.pipe(ink_src, "ink_moe_scores");
   p_route = C.pipe(ink_src, "ink_moe_route");
+  p_pack_dec = C.pipe(ink_src, "ink_moe_pack_dec");
   p_moe_accum = C.pipe(ink_src, "ink_moe_accum");
   p_softcap_argmax_p1 = C.pipe(ink_src, "ink_softcap_argmax_p1");
   p_softcap_argmax_p2 = C.pipe(ink_src, "ink_softcap_argmax_p2");
@@ -706,87 +715,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     const auto& ly = L[phys_idx];
     auto& st = S[log_idx];
 
-    // A. Pre-attention Block Attention Residual -> b_qkv_in
-    id<MTLBuffer> q_in_buf = b_qkv_in, k_in_buf = b_qkv_in, v_in_buf = b_qkv_in;
-    size_t q_in_off = 0, k_in_off = 0, v_in_off = 0;
-
-    if (phys_idx == 0) {
-      q_in_buf = k_in_buf = v_in_buf = b_h;
-    } else {
-      const uint32_t nq = ly.is_local ? 1u : 3u;
-      AttnResArgs ara{H, M, n_blocks, b_stride, eps};
-      [enc setComputePipelineState:p_attn_res];
-      [enc setBuffer:b_blocks offset:0 atIndex:0];
-      [enc setBuffer:b_h offset:0 atIndex:1];
-      [enc setBuffer:ly.ar_attn_q.b offset:ly.ar_attn_q.off atIndex:2];
-      [enc setBuffer:b_qkv_in offset:0 atIndex:3];
-      [enc setBytes:&ara length:sizeof(ara) atIndex:4];
-      [enc dispatchThreadgroups:MTLSizeMake(M, nq, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-      if (!ly.is_local) {
-        k_in_off = size_t(M) * H * sizeof(float);
-        v_in_off = 2u * size_t(M) * H * sizeof(float);
-      }
-      barrier();
-      flush_prof("attn_res");
-    }
-
-    // B. Cross-pass message gates (passes >= 1 of core)
-    if (has_msgs) {
-      MsgGateArgs mga{H, gate_rank, eps};
-      const size_t stride_m = size_t(M) * H * sizeof(float);
-      const size_t cat_stride = size_t(MP) * 2u * H * sizeof(uint16_t);
-      const size_t low_stride = size_t(MP) * gate_rank * sizeof(float);
-
-      auto mg_prep = [&](uint32_t slot, id<MTLBuffer> hin, size_t hoff, size_t moff) {
-        [enc setComputePipelineState:p_mg_prep];
-        [enc setBuffer:hin offset:hoff atIndex:0];
-        [enc setBuffer:b_msgs offset:moff atIndex:1];
-        [enc setBuffer:b_mg_cat offset:(slot * cat_stride) atIndex:2];
-        [enc setBytes:&mga length:sizeof(mga) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-      };
-      auto mg_down = [&](uint32_t slot, const Ctrl& c) {
-        [enc setComputePipelineState:p_mg_down];
-        [enc setBuffer:b_mg_cat offset:(slot * cat_stride) atIndex:0];
-        [enc setBuffer:c.down.b offset:c.down.off atIndex:1];
-        [enc setBuffer:b_mg_low offset:(slot * low_stride) atIndex:2];
-        [enc setBytes:&mga length:sizeof(mga) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 4u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-      };
-      auto mg_apply = [&](uint32_t slot, id<MTLBuffer> hin, size_t hoff, size_t moff, const Ctrl& c, size_t out_off) {
-        [enc setComputePipelineState:p_mg_apply];
-        [enc setBuffer:hin offset:hoff atIndex:0];
-        [enc setBuffer:b_msgs offset:moff atIndex:1];
-        [enc setBuffer:b_mg_low offset:(slot * low_stride) atIndex:2];
-        [enc setBuffer:c.forget.b offset:c.forget.off atIndex:3];
-        [enc setBuffer:c.gain.b offset:c.gain.off atIndex:4];
-        [enc setBuffer:b_qkv_in offset:out_off atIndex:5];
-        [enc setBytes:&mga length:sizeof(mga) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-      };
-
-      mg_prep(0, q_in_buf, q_in_off, 0u * stride_m);
-      mg_prep(1, k_in_buf, k_in_off, 1u * stride_m);
-      mg_prep(2, v_in_buf, v_in_off, 2u * stride_m);
-      barrier();
-      mg_down(0, ly.ctrl_q);
-      mg_down(1, ly.ctrl_k);
-      mg_down(2, ly.ctrl_v);
-      barrier();
-      mg_apply(1, k_in_buf, k_in_off, 1u * stride_m, ly.ctrl_k, 1u * stride_m);
-      mg_apply(2, v_in_buf, v_in_off, 2u * stride_m, ly.ctrl_v, 2u * stride_m);
-      if (ly.is_local) barrier();
-      mg_apply(0, q_in_buf, q_in_off, 0u * stride_m, ly.ctrl_q, 0u * stride_m);
-      barrier();
-
-      q_in_buf = k_in_buf = v_in_buf = b_qkv_in;
-      q_in_off = 0;
-      k_in_off = 1u * stride_m;
-      v_in_off = 2u * stride_m;
-      flush_prof("msg_gate");
-    }
-
-    // C. Input RMSNorm -> bf16 fragments
+    // A + B + C. Pre-attention Block Attention Residual + optional Message Gate + Input RMSNorm -> bf16 fragments
     const uint32_t zero_u = 0;
     auto enc_rms = [&](id<MTLBuffer> x, size_t xoff, const Raw& w, id<MTLBuffer> frag,
                        id<MTLBuffer> f32o, uint32_t wf32) {
@@ -802,17 +731,88 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     };
 
     id<MTLBuffer> fk = b_frag_q, fv = b_frag_q;
-    if (ly.is_local && !has_msgs) {
-      enc_rms(q_in_buf, q_in_off, ly.attn_norm, b_frag_q, nil, zero_u);
+    if (phys_idx == 0) {
+      enc_rms(b_h, 0, ly.attn_norm, b_frag_q, nil, zero_u);
+      barrier();
+      flush_prof("rms");
+    } else if (!has_msgs) {
+      // Fused attn_res + rms_frag (zero DRAM round-trip, zero intermediate barrier!)
+      const uint32_t nq = ly.is_local ? 1u : 3u;
+      AttnResRmsArgs arra{H, M, n_blocks, b_stride, 0u, eps};
+      [enc setComputePipelineState:p_attn_res_rms];
+      [enc setBuffer:b_blocks offset:0 atIndex:0];
+      [enc setBuffer:b_h offset:0 atIndex:1];
+      [enc setBuffer:ly.ar_attn_q.b offset:ly.ar_attn_q.off atIndex:2];
+      const Raw& w0 = ly.is_local ? ly.attn_norm : ly.q_norm;
+      const Raw& w1 = ly.is_local ? ly.attn_norm : ly.k_norm;
+      const Raw& w2 = ly.is_local ? ly.attn_norm : ly.v_norm;
+      [enc setBuffer:w0.b offset:w0.off atIndex:3];
+      [enc setBuffer:w1.b offset:w1.off atIndex:4];
+      [enc setBuffer:w2.b offset:w2.off atIndex:5];
+      [enc setBuffer:b_frag_q offset:0 atIndex:6];
+      [enc setBuffer:b_frag_k offset:0 atIndex:7];
+      [enc setBuffer:b_frag_v offset:0 atIndex:8];
+      [enc setBuffer:b_dummy offset:0 atIndex:9];
+      [enc setBytes:&arra length:sizeof(arra) atIndex:10];
+      [enc dispatchThreadgroups:MTLSizeMake(M, nq, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      if (!ly.is_local) { fk = b_frag_k; fv = b_frag_v; }
+      barrier();
+      flush_prof("attn_res");
     } else {
-      enc_rms(q_in_buf, q_in_off, ly.is_local ? ly.attn_norm : ly.q_norm, b_frag_q, nil, zero_u);
-      enc_rms(k_in_buf, k_in_off, ly.is_local ? ly.attn_norm : ly.k_norm, b_frag_k, nil, zero_u);
-      enc_rms(v_in_buf, v_in_off, ly.is_local ? ly.attn_norm : ly.v_norm, b_frag_v, nil, zero_u);
+      // Fused attn_res + mg_prep -> batched mg_down3 -> batched mg_apply3 (zero local barrier!) -> rms
+      const uint32_t cat_stride_b4 = (MP * 2u * H) / 4u;
+      const uint32_t low_stride_f = MP * gate_rank;
+      const uint32_t q_shared = ly.is_local ? 1u : 0u;
+
+      AttnResMgArgs arm{H, M, n_blocks, b_stride, q_shared, cat_stride_b4, eps};
+      [enc setComputePipelineState:p_attn_res_mg_prep];
+      [enc setBuffer:b_blocks offset:0 atIndex:0];
+      [enc setBuffer:b_h offset:0 atIndex:1];
+      [enc setBuffer:ly.ar_attn_q.b offset:ly.ar_attn_q.off atIndex:2];
+      [enc setBuffer:b_msgs offset:0 atIndex:3];
+      [enc setBuffer:b_qkv_in offset:0 atIndex:4];
+      [enc setBuffer:b_mg_cat offset:0 atIndex:5];
+      [enc setBytes:&arm length:sizeof(arm) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(M, 3, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+      flush_prof("attn_res");
+
+      MsgGate3Args mg3{H, gate_rank, M, q_shared, cat_stride_b4, low_stride_f};
+      [enc setComputePipelineState:p_mg_down3];
+      [enc setBuffer:b_mg_cat offset:0 atIndex:0];
+      [enc setBuffer:ly.ctrl_q.down.b offset:ly.ctrl_q.down.off atIndex:1];
+      [enc setBuffer:ly.ctrl_k.down.b offset:ly.ctrl_k.down.off atIndex:2];
+      [enc setBuffer:ly.ctrl_v.down.b offset:ly.ctrl_v.down.off atIndex:3];
+      [enc setBuffer:b_mg_low offset:0 atIndex:4];
+      [enc setBytes:&mg3 length:sizeof(mg3) atIndex:5];
+      [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 4u, 3) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      barrier();
+
+      [enc setComputePipelineState:p_mg_apply3];
+      [enc setBuffer:b_qkv_in offset:0 atIndex:0];
+      [enc setBuffer:b_msgs offset:0 atIndex:1];
+      [enc setBuffer:b_mg_low offset:0 atIndex:2];
+      [enc setBuffer:ly.ctrl_q.forget.b offset:ly.ctrl_q.forget.off atIndex:3];
+      [enc setBuffer:ly.ctrl_q.gain.b offset:ly.ctrl_q.gain.off atIndex:4];
+      [enc setBuffer:ly.ctrl_k.forget.b offset:ly.ctrl_k.forget.off atIndex:5];
+      [enc setBuffer:ly.ctrl_k.gain.b offset:ly.ctrl_k.gain.off atIndex:6];
+      [enc setBuffer:ly.ctrl_v.forget.b offset:ly.ctrl_v.forget.off atIndex:7];
+      [enc setBuffer:ly.ctrl_v.gain.b offset:ly.ctrl_v.gain.off atIndex:8];
+      [enc setBuffer:b_qkv_out offset:0 atIndex:9];
+      [enc setBytes:&mg3 length:sizeof(mg3) atIndex:10];
+      [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 3) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      barrier();
+      flush_prof("msg_gate");
+
+      const size_t stride_m = size_t(M) * H * sizeof(float);
+      enc_rms(b_qkv_out, 0u, ly.is_local ? ly.attn_norm : ly.q_norm, b_frag_q, nil, zero_u);
+      enc_rms(b_qkv_out, 1u * stride_m, ly.is_local ? ly.attn_norm : ly.k_norm, b_frag_k, nil, zero_u);
+      enc_rms(b_qkv_out, 2u * stride_m, ly.is_local ? ly.attn_norm : ly.v_norm, b_frag_v, nil, zero_u);
       fk = b_frag_k;
       fv = b_frag_v;
+      barrier();
+      flush_prof("rms");
     }
-    barrier();
-    flush_prof("rms");
 
     // D. Attention projections (W8): qgrs || k || v concurrently
     if (pf) {
@@ -951,29 +951,41 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     barrier();
     flush_prof("post_conv");
 
-    // I. Pre-MLP Block Attention Residual + optional 3-stage parallel message gate + mlp_norm
-    AttnResArgs mara{H, M, n_blocks, b_stride, eps};
-    [enc setComputePipelineState:p_attn_res];
-    [enc setBuffer:b_blocks offset:0 atIndex:0];
-    [enc setBuffer:b_h offset:0 atIndex:1];
-    [enc setBuffer:ly.ar_mlp_q.b offset:ly.ar_mlp_q.off atIndex:2];
-    [enc setBuffer:b_mh offset:0 atIndex:3];
-    [enc setBytes:&mara length:sizeof(mara) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    barrier();
-    flush_prof("attn_res");
-
-    if (has_msgs) {
-      MsgGateArgs mga{H, gate_rank, eps};
-      const size_t m_off = 3u * size_t(M) * H * sizeof(float);
-      [enc setComputePipelineState:p_mg_prep];
-      [enc setBuffer:b_mh offset:0 atIndex:0];
-      [enc setBuffer:b_msgs offset:m_off atIndex:1];
-      [enc setBuffer:b_mg_cat offset:0 atIndex:2];
-      [enc setBytes:&mga length:sizeof(mga) atIndex:3];
+    // I. Pre-MLP Block Attention Residual + optional Message Gate + mlp_norm
+    if (!has_msgs) {
+      AttnResRmsArgs mar{H, M, n_blocks, b_stride, 1u, eps};
+      [enc setComputePipelineState:p_attn_res_rms];
+      [enc setBuffer:b_blocks offset:0 atIndex:0];
+      [enc setBuffer:b_h offset:0 atIndex:1];
+      [enc setBuffer:ly.ar_mlp_q.b offset:ly.ar_mlp_q.off atIndex:2];
+      [enc setBuffer:ly.mlp_norm.b offset:ly.mlp_norm.off atIndex:3];
+      [enc setBuffer:ly.mlp_norm.b offset:ly.mlp_norm.off atIndex:4];
+      [enc setBuffer:ly.mlp_norm.b offset:ly.mlp_norm.off atIndex:5];
+      [enc setBuffer:b_frag_m offset:0 atIndex:6];
+      [enc setBuffer:b_frag_m offset:0 atIndex:7];
+      [enc setBuffer:b_frag_m offset:0 atIndex:8];
+      [enc setBuffer:b_mn_f32 offset:0 atIndex:9];
+      [enc setBytes:&mar length:sizeof(mar) atIndex:10];
       [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       barrier();
+      flush_prof("attn_res");
+    } else {
+      const uint32_t cat_stride_b4 = (MP * 2u * H) / 4u;
+      const size_t m_off = 3u * size_t(M) * H * sizeof(float);
+      AttnResMgArgs arm{H, M, n_blocks, b_stride, 0u, cat_stride_b4, eps};
+      [enc setComputePipelineState:p_attn_res_mg_prep];
+      [enc setBuffer:b_blocks offset:0 atIndex:0];
+      [enc setBuffer:b_h offset:0 atIndex:1];
+      [enc setBuffer:ly.ar_mlp_q.b offset:ly.ar_mlp_q.off atIndex:2];
+      [enc setBuffer:b_msgs offset:m_off atIndex:3];
+      [enc setBuffer:b_mh offset:0 atIndex:4];
+      [enc setBuffer:b_mg_cat offset:0 atIndex:5];
+      [enc setBytes:&arm length:sizeof(arm) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+      flush_prof("attn_res");
 
+      MsgGateArgs mga{H, gate_rank, eps};
       [enc setComputePipelineState:p_mg_down];
       [enc setBuffer:b_mg_cat offset:0 atIndex:0];
       [enc setBuffer:ly.ctrl_mlp.down.b offset:ly.ctrl_mlp.down.off atIndex:1];
@@ -993,11 +1005,11 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       barrier();
       flush_prof("msg_gate");
-    }
 
-    enc_rms(b_mh, 0, ly.mlp_norm, b_frag_m, b_mn_f32, 1u);
-    barrier();
-    flush_prof("rms");
+      enc_rms(b_mh, 0, ly.mlp_norm, b_frag_m, b_mn_f32, 1u);
+      barrier();
+      flush_prof("rms");
+    }
 
     // J. MoE Router + Grouped NVFP4/MXFP8 Experts + Accum
     [enc setComputePipelineState:p_scores];
@@ -1006,7 +1018,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     [enc setBuffer:b_rscores offset:0 atIndex:2];
     [enc setBytes:&H length:4 atIndex:3];
     [enc setBytes:&E length:4 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(M, E / 8u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(M, E / 2u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     barrier();
 
     RouteArgs ra{M, H, E, topk, route_scale};
@@ -1060,16 +1072,35 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
       barrier();
       flush_prof("moe_accum");
     } else {
-      [enc setComputePipelineState:p_route];
-      [enc setBuffer:b_rscores offset:0 atIndex:0];
-      [enc setBuffer:ly.router_b.b offset:ly.router_b.off atIndex:1];
-      [enc setBuffer:b_top_idx offset:0 atIndex:2];
-      [enc setBuffer:b_top_w offset:0 atIndex:3];
-      [enc setBuffer:b_slots offset:0 atIndex:4];
-      [enc setBuffer:b_nslots offset:0 atIndex:5];
-      [enc setBuffer:b_rmask offset:0 atIndex:6];
-      [enc setBytes:&ra length:sizeof(ra) atIndex:7];
-      [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(E, 1, 1)];
+      if (M == 1u) {
+        [enc setComputePipelineState:p_route];
+        [enc setBuffer:b_rscores offset:0 atIndex:0];
+        [enc setBuffer:ly.router_b.b offset:ly.router_b.off atIndex:1];
+        [enc setBuffer:b_top_idx offset:0 atIndex:2];
+        [enc setBuffer:b_top_w offset:0 atIndex:3];
+        [enc setBuffer:b_slots offset:0 atIndex:4];
+        [enc setBuffer:b_nslots offset:0 atIndex:5];
+        [enc setBuffer:b_rmask offset:0 atIndex:6];
+        [enc setBytes:&ra length:sizeof(ra) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(E, 1, 1)];
+      } else {
+        [enc setComputePipelineState:p_topk_pf];
+        [enc setBuffer:b_rscores offset:0 atIndex:0];
+        [enc setBuffer:ly.router_b.b offset:ly.router_b.off atIndex:1];
+        [enc setBuffer:b_top_idx offset:0 atIndex:2];
+        [enc setBuffer:b_top_w offset:0 atIndex:3];
+        [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(E, 1, 1)];
+        barrier();
+
+        [enc setComputePipelineState:p_pack_dec];
+        [enc setBuffer:b_top_idx offset:0 atIndex:0];
+        [enc setBuffer:b_slots offset:0 atIndex:1];
+        [enc setBuffer:b_nslots offset:0 atIndex:2];
+        [enc setBuffer:b_rmask offset:0 atIndex:3];
+        [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(E, 1, 1)];
+      }
       barrier();
       flush_prof("moe_route");
 
