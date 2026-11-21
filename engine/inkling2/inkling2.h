@@ -111,6 +111,7 @@ struct Model {
   // Pipelines
   id<MTLComputePipelineState> p_embed, p_attn_res, p_mg_prep, p_mg_down, p_mg_apply, p_rms_frag;
   id<MTLComputePipelineState> p_q_rel, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
+  id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
   id<MTLComputePipelineState> p_scores, p_route, p_moe_accum, p_softcap_argmax, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
   id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;

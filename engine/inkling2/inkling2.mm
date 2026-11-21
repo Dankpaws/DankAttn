@@ -54,6 +54,7 @@ struct KvConvArgs {
   float qk_clip, eps;
 };
 struct AttnArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, is_local, n_splits, kv8; };
+struct AttnPfArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window; };
 struct PostConvArgs { uint32_t M, H, ks, is_boundary, is_mlp, b_slot, b_stride; };
 struct RouteArgs { uint32_t M, H, E, topk; float route_scale; };
 struct PlanArgs { uint32_t M, E, topk, gx_gu, gx_dn; };
@@ -377,7 +378,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_rscores = C.buf(MP * E * sizeof(float));
   b_mg_cat = C.buf(3u * MP * 2u * H * sizeof(uint16_t));
   b_mg_low = C.buf(3u * MP * gate_rank * sizeof(float));
-  b_attn_part = C.buf(size_t(MP) * nh * ASPLITS * 130u * sizeof(float));
+  b_attn_part = C.buf(size_t(MAXM) * nh * ASPLITS * 130u * sizeof(float));
 
   b_frag_q = C.buf(MP * H * sizeof(uint16_t));
   b_frag_k = C.buf(MP * H * sizeof(uint16_t));
@@ -502,7 +503,12 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   // Compile Metal 4 kernels
   std::string kdir = mtl::tree_root() + "/engine/kernels/";
   std::string ink_src = read_text(kdir + "inkling2.metal");
+  std::string attn_src = read_text(kdir + "inkling2_attn.metal");
   std::string mm_src = read_text(kdir + "mm2.metal");
+
+  p_attn_pf_local = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}});
+  p_attn_pf_global_bf16 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}});
+  p_attn_pf_global_kv8 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}});
 
   p_embed = C.pipe(ink_src, "ink_embed");
   p_attn_res = C.pipe(ink_src, "ink_attn_res");
@@ -855,31 +861,53 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     barrier();
     flush_prof("kv_conv");
 
-    // G. Barrier-free Simdgroup Split-K GQA Attention (BF16 or kv8)
-    AttnArgs aa{M, nh, nkv, hd, rel_extent, pos, st.cap, window, ly.is_local ? 1u : 0u, ASPLITS, st.kv8 ? 1u : 0u};
-    [enc setComputePipelineState:p_attn_split];
-    [enc setBuffer:b_Q offset:0 atIndex:0];
-    [enc setBuffer:(st.k_cache ? st.k_cache : b_dummy) offset:0 atIndex:1];
-    [enc setBuffer:(st.v_cache ? st.v_cache : b_dummy) offset:0 atIndex:2];
-    [enc setBuffer:b_rel_logits offset:0 atIndex:3];
-    [enc setBuffer:b_attn_part offset:0 atIndex:4];
-    [enc setBuffer:(st.k_i8 ? st.k_i8 : b_dummy) offset:0 atIndex:5];
-    [enc setBuffer:(st.k_sc ? st.k_sc : b_dummy) offset:0 atIndex:6];
-    [enc setBuffer:(st.v_i8 ? st.v_i8 : b_dummy) offset:0 atIndex:7];
-    [enc setBuffer:(st.v_sc ? st.v_sc : b_dummy) offset:0 atIndex:8];
-    [enc setBytes:&aa length:sizeof(aa) atIndex:9];
-    [enc dispatchThreadgroups:MTLSizeMake(M, nh, ASPLITS) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    barrier();
+    // G. Attention: Metal 4 matmul2d FlashAttention for prefill (pf), split-K GQA for decode/verify
+    if (pf) {
+      AttnPfArgs pfa{M, nh, nkv, hd, rel_extent, pos, st.cap, window};
+      id<MTLComputePipelineState> p_pf = ly.is_local ? p_attn_pf_local
+                                                     : (st.kv8 ? p_attn_pf_global_kv8 : p_attn_pf_global_bf16);
+      [enc setComputePipelineState:p_pf];
+      [enc setBuffer:b_Q offset:0 atIndex:0];
+      [enc setBuffer:(st.k_cache ? st.k_cache : b_dummy) offset:0 atIndex:1];
+      [enc setBuffer:(st.v_cache ? st.v_cache : b_dummy) offset:0 atIndex:2];
+      [enc setBuffer:b_rel_logits offset:0 atIndex:3];
+      [enc setBuffer:b_gate offset:0 atIndex:4];
+      [enc setBuffer:b_sinks offset:0 atIndex:5];
+      [enc setBuffer:b_frag_o offset:0 atIndex:6];
+      [enc setBuffer:(st.k_i8 ? st.k_i8 : b_dummy) offset:0 atIndex:7];
+      [enc setBuffer:(st.k_sc ? st.k_sc : b_dummy) offset:0 atIndex:8];
+      [enc setBuffer:(st.v_i8 ? st.v_i8 : b_dummy) offset:0 atIndex:9];
+      [enc setBuffer:(st.v_sc ? st.v_sc : b_dummy) offset:0 atIndex:10];
+      [enc setBytes:&pfa length:sizeof(pfa) atIndex:11];
+      [enc dispatchThreadgroups:MTLSizeMake((M + 15u) / 16u, nh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      barrier();
+      flush_prof("attn");
+    } else {
+      AttnArgs aa{M, nh, nkv, hd, rel_extent, pos, st.cap, window, ly.is_local ? 1u : 0u, ASPLITS, st.kv8 ? 1u : 0u};
+      [enc setComputePipelineState:p_attn_split];
+      [enc setBuffer:b_Q offset:0 atIndex:0];
+      [enc setBuffer:(st.k_cache ? st.k_cache : b_dummy) offset:0 atIndex:1];
+      [enc setBuffer:(st.v_cache ? st.v_cache : b_dummy) offset:0 atIndex:2];
+      [enc setBuffer:b_rel_logits offset:0 atIndex:3];
+      [enc setBuffer:b_attn_part offset:0 atIndex:4];
+      [enc setBuffer:(st.k_i8 ? st.k_i8 : b_dummy) offset:0 atIndex:5];
+      [enc setBuffer:(st.k_sc ? st.k_sc : b_dummy) offset:0 atIndex:6];
+      [enc setBuffer:(st.v_i8 ? st.v_i8 : b_dummy) offset:0 atIndex:7];
+      [enc setBuffer:(st.v_sc ? st.v_sc : b_dummy) offset:0 atIndex:8];
+      [enc setBytes:&aa length:sizeof(aa) atIndex:9];
+      [enc dispatchThreadgroups:MTLSizeMake(M, nh, ASPLITS) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      barrier();
 
-    [enc setComputePipelineState:p_attn_reduce];
-    [enc setBuffer:b_attn_part offset:0 atIndex:0];
-    [enc setBuffer:b_gate offset:0 atIndex:1];
-    [enc setBuffer:b_sinks offset:0 atIndex:2];
-    [enc setBuffer:b_frag_o offset:0 atIndex:3];
-    [enc setBytes:&aa length:sizeof(aa) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(M, nh, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    barrier();
-    flush_prof("attn");
+      [enc setComputePipelineState:p_attn_reduce];
+      [enc setBuffer:b_attn_part offset:0 atIndex:0];
+      [enc setBuffer:b_gate offset:0 atIndex:1];
+      [enc setBuffer:b_sinks offset:0 atIndex:2];
+      [enc setBuffer:b_frag_o offset:0 atIndex:3];
+      [enc setBytes:&aa length:sizeof(aa) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(M, nh, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      barrier();
+      flush_prof("attn");
+    }
 
     if (pf) {
       enc_mmp(enc, p_mmp_w8, ly.o_proj, b_frag_o, 0, b_o_out, 0, M, b_dummy);
