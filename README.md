@@ -17,7 +17,7 @@ Everything runs directly on Apple Silicon Metal without PyTorch, MLX, or llama.c
 - **Hardware**: Apple Silicon with Metal 4 / `MetalPerformancePrimitives` (`mpp::tensor_ops` cooperative `matmul2d`). Developed and benchmarked on an M5 Ultra. Other Apple Silicon chips with Metal 4 support should work but have not been benchmarked here.
 - **OS & toolchain**: macOS with Metal 4.0 support and Xcode Command Line Tools (`clang++` with C++20 and Objective-C++ ARC).
 - **Memory**:
-  - For **Inkling-2-Mini (`pack-inkling2-mini-w8`)**: ~19.91 GB mapped weights (including DSpark overlay) plus ~1.22 GB GPU state at `cap=32k` (~2.99 GB at `cap=128k`), fitting comfortably on a **32 GB MacBook Pro**.
+  - For **Inkling-2-Mini (`pack-inkling2-mini-w8`)**: ~19.91 GB mapped weights (including DSpark overlay) plus ~1.33 GB GPU state at `cap=32k` (~3.37 GB at `cap=128k`), fitting comfortably on a **32 GB MacBook Pro**.
   - For **Hy4 (`pack-g64-gptq-v3`)**: ~87.3 GB mapped weights plus ~6.5 GB wired GPU state for 4 concurrent lanes (512k main slot + 3x 32k side lanes), plus fast local NVMe for the 63 GB FP8 Engram table.
 - **Wired memory limit**: macOS defaults can cap wired GPU memory below what a 90+ GB model needs. The engine checks `iogpu.wired_limit_mb` at startup and prints the exact `sysctl` command if your limit is too low:
   ```sh
@@ -73,15 +73,15 @@ See [hy4/ARCHITECTURE_AND_PERF.md](hy4/ARCHITECTURE_AND_PERF.md) for per-op prof
 
 ## Benchmarks & Quickstart (Inkling-2-Mini, `pack-inkling2-mini-w8`)
 
-Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16), `kv8` on the 8 global layers, DSpark MTP (`K=7, cut=0.50`) + 3-gram lookup (`19.91 GB` mapped + `1.22 GB` GPU state at `cap=32k`):
+Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16), `kv8` on the 8 global layers, DSpark MTP (`K=7, cut=0.50`) + 3-gram lookup (`19.91 GB` mapped + `1.33 GB` GPU state at `cap=32k`; measured 2026-11-21 at `cf05d1f`):
 
 | Workload | M5 Ultra Mac Studio (96 GB) | Base M5 MacBook Pro (32 GB) |
 | :--- | :---: | :---: |
 | `vtest` (`M=5` vs `M=1`) | `0.000e+00` (BIT-EXACT) | `0.000e+00` (BIT-EXACT) |
-| Prefill 2,048 tok (`MP=256`) | **1,610.9 tok/s GPU** (1.28 s) | **314.2 tok/s GPU** (6.52 s) |
-| Prefill 8,192 tok (`MP=256`) | **1,272.5 tok/s GPU** (6.47 s) | **236.2 tok/s GPU** (34.71 s) |
-| Decode `M=1` (`ctx=512 / 2k / 8k`) | **75.9 / 73.2 / 69.0 tok/s GPU** | **24.2 / 23.4 / 22.4 tok/s GPU** |
-| Speculative (`code_prompt.bin`, 256 tok) | **167.8 tok/s wall** (256/256 exact) | **41.4 tok/s wall** (256/256 exact) |
+| Prefill 2,048 tok (`MP=512`) | **4,607.0 tok/s GPU** (0.44 s) | **729.7 tok/s GPU** (2.81 s) |
+| Prefill 8,192 tok (`MP=512`) | **4,335.3 tok/s GPU** (1.89 s) | **719.0 tok/s GPU** (11.39 s) |
+| Decode `M=1` (`ctx=512 / 2k / 8k`) | **82.3 / 79.2 / 76.7 tok/s GPU** | **25.8 / 24.8 / 24.5 tok/s GPU** |
+| Speculative (`code_prompt.bin`, 256 tok) | **204.9 tok/s wall** (256/256 exact) | **46.3 tok/s wall** (256/256 exact) |
 
 ```sh
 sh inkling2/build_inkling2.sh
