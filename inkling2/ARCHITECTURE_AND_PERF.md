@@ -75,6 +75,14 @@ Lanes are independent sequences with their own logical-layer KV rings, `sconv` s
 
 Every `ltest` / `jspec` run is bit-exact per lane vs. the same sequence alone. At 16 lanes (Studio) the step is 32.2 ms vs. 22.6 ms for 16 rows of one sequence; ~8 ms of the gap is MoE fan-out (16 unrelated contexts route to more experts), per-lane dispatch ≤ ~1.7 ms. Per-lane state is 0.83 GB at `cap=32768` and 0.42 GB at 8,192 (MBP fits ~8 lanes at 8k). `jspec` prompts are doc/source slices (they draft worse than `code_prompt.bin`); per-lane DSpark drafting is sequential (4.5 ms/round at 4 lanes on the Studio, 18 ms on the MBP) and is the next thing to batch.
 
+### Sampling & Serving (`c570a20`, `45031b4`, `ac82145`)
+
+- **Sampling** (`ink_sample_rows`, ported from Hy4): Gumbel-max keyed by `(seed, input position)` after `min_p` / `top_k` / `top_p` truncation, over the softcapped logits. DSpark picks draw with the same keys and report the drawn token's probability for the `p_max` cut, so speculation stays exact at any temperature (`spec` at T=1.0: 199.5 tok/s, 4.06 tok/round, 256/256 equal to plain sampled decode). Greedy rows keep the argmax bits.
+- **`serve`** (`engine/inkling2/serve.inc`): Hy4's OPUS/OPCX binary protocol, so `server/engine_frontend.py` drives it unchanged. Each loop prefills one chunk of one waiting request (256 rows while others decode), then one round over every decoding lane (lookup / DSpark drafts, one `step_lanes` verify, per-lane accept + rollback + DSpark commit right after the verify). A stop inside accepted drafts rolls the lane back to what was emitted. Prompt reuse: exact extension of a lane's history, or **rewind** to its last prefill end from saved `sconv` states (`save_conv` / `rewind`) when ≤ `MP + INK_RING_SLACK` tokens followed; clients that drop reasoning land there.
+- **Front end** (`server/inkling2_server.py`, `server/inkling2_serve.sh`): parses message tokens by id (`<|content_thinking|>` → `reasoning_content`, `<|content_text|>` → `content`, `<|content_invoke_tool_json|>` → `tool_calls`); strips the transformers `{% generation %}` tag and honours `tojson(sort_keys, separators)`; temperature 1.0 and `min_p` 0.02 by default.
+
+Studio, 4 lanes × 131,072 (`INK_RING_SLACK=4096`, 15.25 GB state), T=1.0, 2026-11-21: 27,193-token prompt prefill 3,262 tok/s; code effort low 178 tok/s decode (3.7 tok/round), effort high 141 tok/s; 4 concurrent chats 190 tok/s total; same-seed requests identical alone vs. concurrent (12/12); an OpenCode agent turn reused 16,913 / 20,025 prompt tokens (prefill 1.1 s vs. 4.7 s cold).
+
 ### Speculation Sweep & the MoE Expert Fan-Out Tax (`spec 256 code_prompt.bin`)
 
 Measured at `7ba4268`, before Waves 1–13; the ordering of configs still holds but absolute numbers are now higher (see the table above).
@@ -140,6 +148,10 @@ sh inkling2/build_inkling2.sh
 | `INK_DRAFT_K` | `7` | Max DSpark draft tokens per round (`1..7`, verify `M = 1 + K`) |
 | `INK_DRAFT_CUT` | `0.50` | Early-cut DSpark drafts when `p_max < INK_DRAFT_CUT` (`0.0` disables) |
 | `INK_LOOKUP` | `1` | `1`: enable 3-gram context-lookup drafting (`engine/lookup.h`, up to `M=16`) |
+| `INK_TEMP` / `INK_TOP_P` / `INK_TOP_K` / `INK_MIN_P` / `INK_SEED` | greedy | CLI sampling for every lane (lane `k` uses seed + `k`) |
+| `INK_LANES` | `4` | `serve`: lanes (independent sequences) at `INK_CAP` each |
+| `INK_RING_SLACK` | `0` (`4096` in `inkling2_serve.sh`) | Extra local-ring rows per layer so a lane can rewind `512 + slack` tokens (~0.17 GB per lane per 1k) |
+| `INK_PF_DEC_CHUNK` | `256` | `serve`: prefill chunk while other lanes decode |
 | `INK_PF_FAST` | `1` | `0`: compile out the interior-tile fast path in `ink_attn_pf_mma` (bit-identical either way; for A/B) |
 | `INK_QREL_MMA` | `1` | `0`: prefill relative logits via scalar `ink_q_rel` instead of `ink_q_rel_prep` + `ink_q_rel_mma` (rounding-level difference) |
 
@@ -161,6 +173,7 @@ sh inkling2/build_inkling2.sh
 - Base M5 on macOS 27.0 miscompiled (or otherwise mis-executed) a logically neutral edit in `ink_attn_pf_mma`. Re-check with `lgdump` Studio-vs-MBP bit equality after any attention-kernel change or OS update; `pfcheck`'s max diff alone is too noisy to catch it.
 
 ### Planned Next Steps (Not Yet Started)
-- **OpenAI-compatible `serve`** on the shared `server/engine_frontend.py`, with continuous batching over lanes + joint speculation, GPU sampling, and batched per-lane DSpark drafting.
+- **Batched DSpark drafting across lanes** (sequential today: 4.5 ms/round at 4 lanes on the Studio, 18 ms on the MBP) and one fused DSpark commit per round.
+- **Per-lane caps** (one long-context lane + short side lanes, like Hy4) and a prefix cache that survives engine restarts.
 - **MoE expert fan-out at `M=8` verify** (MBP: `moe_gu` + `moe_dn` = 63% of verify time) is the main lever for MBP speculation.
 - **Prefill attention** (29% at `M=512` on the Studio) and **MoE gate/up** (26%) are the remaining large prefill ops.
