@@ -64,6 +64,27 @@ def pack_scales(s):
     return s.reshape(N // 32, 32, G).transpose(0, 2, 1).astype(np.float16).reshape(-1).view(np.uint8)
 
 
+def pack_nvfp4_codes(u4):
+    """u4: uint8 array [N, K] of E2M1 nibble codes in 0..15.
+    Returns uint8 bytes in register-direct W4 order: [N/32][K/32][32 lanes][16 bytes]."""
+    N, K = u4.shape
+    assert N % 32 == 0 and K % 32 == 0
+    NF, KS = N // 32, K // 32
+    e = u4.reshape(NF, 32, KS, 32).transpose(0, 2, 1, 3)[:, :, RN, RK]  # [NF, KS, 32, 32]
+    e = e.reshape(NF, KS, 32, 4, 8)
+    return (e[..., :4] | (e[..., 4:] << 4)).astype(np.uint8).reshape(-1)
+
+
+def pack_mxfp8_codes(u8):
+    """u8: uint8 array [N, K] of raw FP8 E4M3FN bytes.
+    Returns uint8 bytes in register-direct W8 order: [N/32][K/32][32 lanes][32 bytes]."""
+    N, K = u8.shape
+    assert N % 32 == 0 and K % 32 == 0
+    NF, KS = N // 32, K // 32
+    e = u8.reshape(NF, 32, KS, 32).transpose(0, 2, 1, 3)[:, :, RN, RK]  # [NF, KS, 32, 32]
+    return np.ascontiguousarray(e, dtype=np.uint8).reshape(-1)
+
+
 def quantize(w, bits, gs, clip_search=True):
     """Symmetric per-(row, group) quantization. w: f32 [N, K]. Returns codes, scales [N, K/gs].
     With clip_search, each group's scale minimises squared error over a small clip grid."""

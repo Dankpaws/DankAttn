@@ -21,6 +21,12 @@ using namespace mpp::tensor_ops;
 #if WBITS == 6
 #define WLOAD uint2
 #define WV 3            // uint2 per lane per k-step (24 B = 16 B lo4 + 8 B hi2)
+#elif WBITS == 40       // NVFP4 (E2M1, GS=16, in-unpack scaling)
+#define WLOAD uint4
+#define WV 1            // uint4 per lane per k-step (16 B = 32 E2M1 nibbles)
+#elif WBITS == 80       // MXFP8 (E4M3FN, GS=32, f16 power-of-two scales)
+#define WLOAD uint4
+#define WV 2            // uint4 per lane per k-step (32 B = 32 FP8 bytes)
 #else
 #define WLOAD uint4
 #define WV (WBITS / 4)  // uint4 per lane per k-step
@@ -34,9 +40,26 @@ using namespace mpp::tensor_ops;
 
 static inline float xsilu(float x) { return x / (1.0f + exp(-x)); }
 
-// Unpack one lane's k-step of W4 / W6 / W8 weights into 32 bfloats (works for both cooperative_tensor and bfloat[32]).
+#if WBITS == 40
+constant float E2M1_LUT[16] = {
+  0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+#elif WBITS == 80
+static inline float decode_fp8_e4m3(uint b) {
+  const uint s = (b >> 7) & 1u, e = (b >> 3) & 15u, m = b & 7u;
+  const float v = (e == 0u) ? (float(m) * (1.0f / 512.0f)) : ldexp(1.0f + float(m) * 0.125f, int(e) - 7);
+  return s ? -v : v;
+}
+#endif
+
+// Unpack one lane's k-step of W4 / W6 / W8 / NVFP4(40) / MXFP8(80) weights into 32 bfloats.
+// For NVFP4 (WBITS == 40), sp0/sp1 are the two GS=16 half scale slabs for this 32-wide k-step
+// and nbase = ((l >> 1) & 3) + 4 * (l >> 4) is this lane's base output column in 0..7.
 template<typename Dst>
-static inline void unpack_w(thread const WLOAD* v, thread Dst& out) {
+static inline void unpack_w(thread const WLOAD* v, thread Dst& out,
+                            device const half* sp0 = nullptr, device const half* sp1 = nullptr,
+                            ushort nbase = 0) {
 #if WBITS == 4
   const uint w4[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
 #pragma clang loop unroll(full)
@@ -46,6 +69,22 @@ static inline void unpack_w(thread const WLOAD* v, thread Dst& out) {
       out[8 * j + i] = bfloat(float(int((w4[j] >> (8 * i)) & 15u) - 8));
       out[8 * j + 4 + i] = bfloat(float(int((w4[j] >> (8 * i + 4)) & 15u) - 8));
     }
+#elif WBITS == 40
+  const uint w4[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
+  const float sc[2][4] = {
+    {float(sp0[nbase]), float(sp0[nbase + 8]), float(sp0[nbase + 16]), float(sp0[nbase + 24])},
+    {float(sp1[nbase]), float(sp1[nbase + 8]), float(sp1[nbase + 16]), float(sp1[nbase + 24])}
+  };
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4; j++) {
+    const int kh = j >> 1, g0 = (j & 1) << 1;
+    const float s_lo = sc[kh][g0], s_hi = sc[kh][g0 + 1];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 4; i++) {
+      out[8 * j + i] = bfloat(E2M1_LUT[(w4[j] >> (8 * i)) & 15u] * s_lo);
+      out[8 * j + 4 + i] = bfloat(E2M1_LUT[(w4[j] >> (8 * i + 4)) & 15u] * s_hi);
+    }
+  }
 #elif WBITS == 6
   const uint w4[4] = {v[0].x, v[0].y, v[1].x, v[1].y};
   const uint h2[2] = {v[2].x, v[2].y};
@@ -58,6 +97,12 @@ static inline void unpack_w(thread const WLOAD* v, thread Dst& out) {
       out[8 * j + 4 + i] = bfloat(float(int(((w4[j] >> (8 * i + 4)) & 15u) | (((hw >> (2 * i + 8)) & 3u) << 4)) - 32));
     }
   }
+#elif WBITS == 80
+  const uint w8[8] = {v[0].x, v[0].y, v[0].z, v[0].w, v[1].x, v[1].y, v[1].z, v[1].w};
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 8; j++)
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 4; i++) out[4 * j + i] = bfloat(decode_fp8_e4m3((w8[j] >> (8 * i)) & 255u));
 #else
   const uint w8[8] = {v[0].x, v[0].y, v[0].z, v[0].w, v[1].x, v[1].y, v[1].z, v[1].w};
 #pragma clang loop unroll(full)
@@ -133,6 +178,11 @@ static inline void epilogue(device const float* Y, uint N, uint nb, uint Mloc, u
 #ifdef SWIGLU_LIMIT  // Hy4: gate clamped above, up both ways, before silu(gate) * up
     e0[frag_off(row0 + m, c0 + j, a.R)] = bfloat(xsilu(min(Y[m * N + nb + j], float(SWIGLU_LIMIT))) *
                                                  clamp(Y[m * N + nb + 16 + j], -float(SWIGLU_LIMIT), float(SWIGLU_LIMIT)));
+#elif defined(SWIGLU_SOFTCAP_G)  // Inkling2: softcap(g, G) * sigmoid(g) * softcap(u, U)
+    const float gv = Y[m * N + nb + j], uv = Y[m * N + nb + 16 + j];
+    e0[frag_off(row0 + m, c0 + j, a.R)] = bfloat(
+        (tanh(gv / float(SWIGLU_SOFTCAP_G)) * float(SWIGLU_SOFTCAP_G)) * esigm(gv) *
+        (tanh(uv / float(SWIGLU_SOFTCAP_U)) * float(SWIGLU_SOFTCAP_U)));
 #else
     e0[frag_off(row0 + m, c0 + j, a.R)] = bfloat(xsilu(Y[m * N + nb + j]) * Y[m * N + nb + 16 + j]);
 #endif
@@ -156,6 +206,10 @@ static inline void epi3_regs(thread const float* r2, uint nb, uint Mloc, uint ro
     const float g = r2[i], u = r2[i + 8];
 #ifdef SWIGLU_LIMIT
     e0[frag_off(row0 + m, c0 + j, a.R)] = bfloat(xsilu(min(g, float(SWIGLU_LIMIT))) * clamp(u, -float(SWIGLU_LIMIT), float(SWIGLU_LIMIT)));
+#elif defined(SWIGLU_SOFTCAP_G)
+    e0[frag_off(row0 + m, c0 + j, a.R)] = bfloat(
+        (tanh(g / float(SWIGLU_SOFTCAP_G)) * float(SWIGLU_SOFTCAP_G)) * esigm(g) *
+        (tanh(u / float(SWIGLU_SOFTCAP_U)) * float(SWIGLU_SOFTCAP_U)));
 #else
     e0[frag_off(row0 + m, c0 + j, a.R)] = bfloat(xsilu(g) * u);
 #endif
@@ -264,9 +318,15 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
   auto c3 = op.template get_destination_cooperative_tensor<decltype(xa), decltype(wb), float>();
 #endif
 
+#if WBITS == 40
+  const uint KS = a.K / 32, G = a.K / 16;
+  const uint ksper = KS / (a.ksplit * a.sgs);
+  const uint ks0 = (split * a.sgs + sl) * ksper, nks = ksper;
+#else
   const uint KS = a.K / 32, G = a.K / GS, KPG = GS / 32;
   const uint gper = G / (a.ksplit * a.sgs);            // groups per simdgroup slice
   const uint ks0 = (split * a.sgs + sl) * gper * KPG, nks = gper * KPG;
+#endif
   const ushort n0 = 4 * (l & 1) + 8 * ((l >> 3) & 1), m0 = ((l >> 1) & 3) + 4 * (l >> 4);
   device const WLOAD* Wp = W + (size_t(nf) * KS * 32 + l) * WV;
   device const half* Sp = S + size_t(nf) * G * 32;
@@ -304,7 +364,11 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       if (t + u >= nks) break;
       const uint ks = ks0 + t + u;
       // unpack straight into the operand (no int8 temporary: fewer live registers), once for every tile
+#if WBITS == 40
+      unpack_w(ring[u], wb, Sp + (2 * ks) * 32, Sp + (2 * ks + 1) * 32, m0);
+#else
       unpack_w(ring[u], wb);
+#endif
       if (t + u + PF < nks)
         for (int v = 0; v < WV; v++) ring[u][v] = Wp[size_t(ks + PF) * 32 * WV + v];
       // tile tt's left operand, then its multiply into c
@@ -349,6 +413,7 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       if (Mloc[3]) { LOAD_X(3) op.run(xa, wb, c3); }
 #endif
 #undef LOAD_X
+#if WBITS != 40
       if ((ks + 1) % KPG == 0) {
         const device half* sp = Sp + (ks / KPG) * 32;
         float s8[8];
@@ -365,8 +430,21 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
 #endif
         }
       }
+#endif
     }
   }
+#if WBITS == 40
+  for (int i = 0; i < 16; i++) {
+    acc[0][i] = c0[i];
+#if TILES > 1
+    acc[1][i] = c1[i];
+#endif
+#if TILES > 2
+    acc[2][i] = c2[i];
+    acc[3][i] = c3[i];
+#endif
+  }
+#endif
   // level 1: simdgroups of this threadgroup, in order (each tile on its own)
   if (a.sgs > 1) {
     for (int t = 0; t < TILES; t++)
@@ -489,7 +567,8 @@ kernel void mmp(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
   const uint nf0 = tg.x * 2;
   const bool has1 = (nf0 + 1) < N32;
   const uint rb = tg.y * CH + sg;
-  const uint KS = a.K / 32, G = a.K / GS, KPG = GS / 32;
+  const uint KS = a.K / 32, G = a.K / (WBITS == 40 ? 16 : GS);
+  const uint KPG = (WBITS == 40) ? 1u : (GS / 32u);
   const bool live = rb * 16 < a.M;
   const uint Mloc = live ? min(16u, a.M - rb * 16) : 0;
   const uint row0 = rb * 16;
@@ -516,7 +595,13 @@ kernel void mmp(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       WLOAD v[WV];
       for (int q = 0; q < WV; q++) v[q] = Wpu[size_t(kc + uk) * 32 * WV + q];
       bfloat e[32];
+#if WBITS == 40
+      device const half* Spu = uf ? Sp1 : Sp0;
+      const uint ks_u = kc + uk;
+      unpack_w(v, e, Spu + (2 * ks_u) * 32, Spu + (2 * ks_u + 1) * 32, m0);
+#else
       unpack_w(v, e);
+#endif
       for (int q = 0; q < 8; q++)
         Wt[uf][uk][q][l] = bfloat4(e[4 * q], e[4 * q + 1], e[4 * q + 2], e[4 * q + 3]);
     }
@@ -541,6 +626,7 @@ kernel void mmp(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
         }
         op.run(xa, wb, c1);
       }
+#if WBITS != 40
       if ((ks + 1) % KPG == 0) {
         const uint gi = ks / KPG;
         const device half* sp0 = Sp0 + gi * 32;
@@ -553,9 +639,13 @@ kernel void mmp(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
           for (int i = 0; i < 16; i++) { acc1[i] = fma(c1[i], s8[(i & 3) + 4 * (i >> 3)], acc1[i]); c1[i] = 0.0f; }
         }
       }
+#endif
     }
   }
   if (!live) return;
+#if WBITS == 40
+  for (int i = 0; i < 16; i++) { acc0[i] = c0[i]; if (has1) acc1[i] = c1[i]; }
+#endif
   const uint nb0 = nf0 * 32;
 #if EPI == 3
   epi3_regs(acc0, nb0, Mloc, row0, n0, m0, E0, a);
@@ -579,7 +669,8 @@ kernel void mmp(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
   constexpr uint CH = MMP_CH;               // k-steps per chunk = simdgroups per threadgroup
   threadgroup bfloat Wt[CH][4][32][8];      // [k-step][8-element quarter][lane][8]
   const uint nf = tg.x, rb = tg.y * CH + sg;
-  const uint KS = a.K / 32, G = a.K / GS, KPG = GS / 32;
+  const uint KS = a.K / 32, G = a.K / (WBITS == 40 ? 16 : GS);
+  const uint KPG = (WBITS == 40) ? 1u : (GS / 32u);
 #if MMP_FAST == 0
   const uint sks = G / (a.ksplit * a.sgs) * KPG;  // k-steps per mm2 slice
 #endif
@@ -717,7 +808,8 @@ kernel void mmpg(device const WLOAD* W [[buffer(0)]], device const half* S [[buf
   const uint nf0 = tg.x * 2;
   const bool has1 = (nf0 + 1) < N32;
   const uint rb = ty * CH + sg;
-  const uint KS = a.K / 32, G = a.K / GS, KPG = GS / 32;
+  const uint KS = a.K / 32, G = a.K / (WBITS == 40 ? 16 : GS);
+  const uint KPG = (WBITS == 40) ? 1u : (GS / 32u);
   const bool live = rb * 16 < count;
   const uint Mloc = live ? min(16u, count - rb * 16) : 0;
   constexpr auto desc =
@@ -753,7 +845,13 @@ kernel void mmpg(device const WLOAD* W [[buffer(0)]], device const half* S [[buf
       WLOAD v[WV];
       for (int q = 0; q < WV; q++) v[q] = Wpu[size_t(kc + uk) * 32 * WV + q];
       bfloat e[32];
+#if WBITS == 40
+      device const half* Spu = uf ? Sp1 : Sp0;
+      const uint ks_u = kc + uk;
+      unpack_w(v, e, Spu + (2 * ks_u) * 32, Spu + (2 * ks_u + 1) * 32, m0);
+#else
       unpack_w(v, e);
+#endif
       for (int q = 0; q < 8; q++)
         Wt[uf][uk][q][l] = bfloat4(e[4 * q], e[4 * q + 1], e[4 * q + 2], e[4 * q + 3]);
     }
@@ -787,6 +885,7 @@ kernel void mmpg(device const WLOAD* W [[buffer(0)]], device const half* S [[buf
         }
         op.run(xa, wb, c1);
       }
+#if WBITS != 40
       if ((ks + 1) % KPG == 0) {
         const uint gi = ks / KPG;
         const device half* sp0 = Sp0 + gi * 32;
@@ -799,9 +898,13 @@ kernel void mmpg(device const WLOAD* W [[buffer(0)]], device const half* S [[buf
           for (int i = 0; i < 16; i++) { acc1[i] = fma(c1[i], s8[(i & 3) + 4 * (i >> 3)], acc1[i]); c1[i] = 0.0f; }
         }
       }
+#endif
     }
   }
   if (!live) return;
+#if WBITS == 40
+  for (int i = 0; i < 16; i++) { acc0[i] = c0[i]; if (has1) acc1[i] = c1[i]; }
+#endif
   const uint nb0 = nf0 * 32, row0 = off + rb * 16;
 #if EPI == 3
   epi3_regs(acc0, nb0, Mloc, row0, n0, m0, E0, a);
@@ -834,7 +937,8 @@ kernel void mmpg(device const WLOAD* W [[buffer(0)]], device const half* S [[buf
   S += size_t(slots[z]) * a.sstride;
   if (a.ldx == 1) X += size_t(z) * a.xstride;
   const uint nf = tg.x, rb = ty * CH + sg;
-  const uint KS = a.K / 32, G = a.K / GS, KPG = GS / 32;
+  const uint KS = a.K / 32, G = a.K / (WBITS == 40 ? 16 : GS);
+  const uint KPG = (WBITS == 40) ? 1u : (GS / 32u);
 #ifndef MMP_FAST
 #define MMP_FAST 0
 #endif
