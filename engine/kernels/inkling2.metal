@@ -297,92 +297,92 @@ kernel void ink_q_rel(device const float* qgrs [[buffer(0)]],
   }
 }
 
-// 6. K/V short convolution (static on local, dynamic on global) + K L2-clip / V RMSNorm -> KV cache.
+// 6. Parallel K/V short convolution (static on local, dynamic on global) + K L2-clip / V RMSNorm -> KV cache.
 //    Also records raw inputs into conv_hist[3 + MAXM, C] for exact speculative rollback.
-// Grid: (nkv, 1, 1), TG: 128 threads.
+//    Reads conv_state_in (read-only) and row M-1 writes conv_state_out (double-buffered, zero race).
+// Grid: (M, nkv, 1), TG: 128 threads.
 struct KvConvArgs {
   uint M, nkv, hd, k_stride, pos0, cap, is_global, is_key, ks, kv8;
   float qk_clip, eps;
 };
 kernel void ink_kv_conv_cache(device const float* in_kv [[buffer(0)]],
                               device const float* sconv_w [[buffer(1)]],
-                              device float* conv_state [[buffer(2)]],
+                              device const float* conv_state_in [[buffer(2)]],
                               device bfloat* kv_cache [[buffer(3)]],
                               device char* kv_i8 [[buffer(4)]],
                               device half* kv_sc [[buffer(5)]],
                               device float* conv_hist [[buffer(6)]],
                               constant KvConvArgs& a [[buffer(7)]],
-                              uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+                              device float* conv_state_out [[buffer(8)]],
+                              uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint m = tg.x, h = tg.y;
   const uint C = a.nkv * a.hd;
   const uint ch = h * a.hd + tid;
-  float h0 = conv_state[0u * C + ch];
-  float h1 = conv_state[1u * C + ch];
-  float h2 = conv_state[2u * C + ch];
   const bool save_hist = (a.M <= 16u);
-  if (save_hist) {
-    conv_hist[0u * C + ch] = h0;
-    conv_hist[1u * C + ch] = h1;
-    conv_hist[2u * C + ch] = h2;
-  }
-  const float inv_denom = a.is_global ? rsqrt(float(2u * a.ks + 1u)) : rsqrt(float(a.ks + 1u));
 
-  float sw0, sw1, sw2, sw3;
+  const float x  = in_kv[size_t(m) * a.k_stride + ch];
+  const float h2 = (m >= 1u) ? in_kv[size_t(m - 1u) * a.k_stride + ch] : conv_state_in[2u * C + ch];
+  const float h1 = (m >= 2u) ? in_kv[size_t(m - 2u) * a.k_stride + ch] : conv_state_in[(1u + m) * C + ch];
+  const float h0 = (m >= 3u) ? in_kv[size_t(m - 3u) * a.k_stride + ch] : conv_state_in[(0u + m) * C + ch];
+
+  if (save_hist) {
+    if (m == 0u) {
+      conv_hist[0u * C + ch] = h0;
+      conv_hist[1u * C + ch] = h1;
+      conv_hist[2u * C + ch] = h2;
+    }
+    conv_hist[(3u + m) * C + ch] = x;
+  }
+  if (m + 1u == a.M) {
+    conv_state_out[0u * C + ch] = h1;
+    conv_state_out[1u * C + ch] = h2;
+    conv_state_out[2u * C + ch] = x;
+  }
+
+  const float inv_denom = a.is_global ? rsqrt(float(2u * a.ks + 1u)) : rsqrt(float(a.ks + 1u));
+  float y;
   if (!a.is_global) {
-    sw3 = sconv_w[ch * 4u + 0u];
-    sw2 = sconv_w[ch * 4u + 1u];
-    sw1 = sconv_w[ch * 4u + 2u];
-    sw0 = sconv_w[ch * 4u + 3u];
+    const float sw3 = sconv_w[ch * 4u + 0u];
+    const float sw2 = sconv_w[ch * 4u + 1u];
+    const float sw1 = sconv_w[ch * 4u + 2u];
+    const float sw0 = sconv_w[ch * 4u + 3u];
+    y = (sw0 * x + sw1 * h2 + sw2 * h1 + sw3 * h0 + x) * inv_denom;
   } else {
-    sw0 = sconv_w[0u * C + ch];
-    sw1 = sconv_w[1u * C + ch];
-    sw2 = sconv_w[2u * C + ch];
-    sw3 = sconv_w[3u * C + ch];
+    const float sw0 = sconv_w[0u * C + ch];
+    const float sw1 = sconv_w[1u * C + ch];
+    const float sw2 = sconv_w[2u * C + ch];
+    const float sw3 = sconv_w[3u * C + ch];
+    device const float* dw = in_kv + size_t(m) * a.k_stride + C + h * 4u;
+    y = ((sw0 + dw[0]) * x + (sw1 + dw[1]) * h2 + (sw2 + dw[2]) * h1 + (sw3 + dw[3]) * h0 + x) * inv_denom;
   }
 
   threadgroup float sm[4];
-  for (uint m = 0; m < a.M; m++) {
-    const float x = in_kv[size_t(m) * a.k_stride + ch];
-    if (save_hist) conv_hist[(3u + m) * C + ch] = x;
-    float y;
-    if (!a.is_global) {
-      y = (sw0 * x + sw1 * h2 + sw2 * h1 + sw3 * h0 + x) * inv_denom;
-    } else {
-      device const float* dw = in_kv + size_t(m) * a.k_stride + C + h * 4u;
-      y = ((sw0 + dw[0]) * x + (sw1 + dw[1]) * h2 + (sw2 + dw[2]) * h1 + (sw3 + dw[3]) * h0 + x) * inv_denom;
-    }
-    h0 = h1; h1 = h2; h2 = x;
-
-    float n2 = simd_sum(y * y);
-    if ((tid & 31u) == 0u) sm[tid >> 5] = n2;
+  float n2 = simd_sum(y * y);
+  if ((tid & 31u) == 0u) sm[tid >> 5] = n2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    const float tot = sm[0] + sm[1] + sm[2] + sm[3];
+    sm[0] = a.is_key ? min(a.qk_clip / (sqrt(tot) + 1e-6f), 1.0f) : rsqrt(tot / float(a.hd) + a.eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float v = y * sm[0];
+  const uint slot = (a.pos0 + m) % a.cap;
+  if (a.kv8) {
+    float am = simd_max(fabs(v));
+    if ((tid & 31u) == 0u) sm[tid >> 5] = am;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-      const float tot = sm[0] + sm[1] + sm[2] + sm[3];
-      sm[0] = a.is_key ? min(a.qk_clip / (sqrt(tot) + 1e-6f), 1.0f) : rsqrt(tot / float(a.hd) + a.eps);
+      const float mx = max(max(sm[0], sm[1]), max(sm[2], sm[3]));
+      const half sc = half(max(mx / 127.0f, 1e-6f));
+      sm[0] = float(sc);
+      kv_sc[size_t(slot) * a.nkv + h] = sc;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float v = y * sm[0];
-    const uint slot = (a.pos0 + m) % a.cap;
-    if (a.kv8) {
-      float am = simd_max(fabs(v));
-      if ((tid & 31u) == 0u) sm[tid >> 5] = am;
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (tid == 0u) {
-        const float mx = max(max(sm[0], sm[1]), max(sm[2], sm[3]));
-        const half sc = half(max(mx / 127.0f, 1e-6f));
-        sm[0] = float(sc);
-        kv_sc[size_t(slot) * a.nkv + h] = sc;
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const int q = int(clamp(rint(v / sm[0]), -127.0f, 127.0f));
-      kv_i8[(size_t(slot) * a.nkv + h) * a.hd + tid] = char(q);
-    } else {
-      kv_cache[(size_t(slot) * a.nkv + h) * a.hd + tid] = bfloat(v);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int q = int(clamp(rint(v / sm[0]), -127.0f, 127.0f));
+    kv_i8[(size_t(slot) * a.nkv + h) * a.hd + tid] = char(q);
+  } else {
+    kv_cache[(size_t(slot) * a.nkv + h) * a.hd + tid] = bfloat(v);
   }
-  conv_state[0u * C + ch] = h0;
-  conv_state[1u * C + ch] = h1;
-  conv_state[2u * C + ch] = h2;
 }
 
 // 7a. Barrier-free Simdgroup Split-K GQA Attention (supports both BF16 and kv8 int8 KV cache).
@@ -503,56 +503,63 @@ kernel void ink_attn_reduce(device const float* part_in [[buffer(0)]],  // [M, n
   out_frag[frag_off(row, col0 + 3u, K)] = o4.w;
 }
 
-// 8. Post-attention / Post-MLP static sconv + residual add / block boundary save.
-// Grid: (ceil(H / 256), 1, 1), TG: 256 threads.
+// 8. Parallel post-attention / post-MLP static sconv + residual add / block boundary save.
+//    Reads conv_state_in (read-only) and row M-1 writes conv_state_out (double-buffered, zero race).
+// Grid: (M, ceil(H / 256), 1), TG: 256 threads.
 struct PostConvArgs {
   uint M, H, ks, is_boundary, is_mlp, b_slot, b_stride;
 };
 kernel void ink_post_sconv_add(device const float* y_in [[buffer(0)]],
                                device const float* sconv_w [[buffer(1)]],
-                               device float* conv_state [[buffer(2)]],
+                               device const float* conv_state_in [[buffer(2)]],
                                device float* h_res [[buffer(3)]],
                                device float* blocks [[buffer(4)]],
                                device float* conv_hist [[buffer(5)]],
                                constant PostConvArgs& a [[buffer(6)]],
-                               uint ch [[thread_position_in_grid]]) {
+                               device float* conv_state_out [[buffer(7)]],
+                               uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint m = tg.x;
+  const uint ch = tg.y * 256u + tid;
   if (ch >= a.H) return;
-  float h0 = conv_state[0u * a.H + ch];
-  float h1 = conv_state[1u * a.H + ch];
-  float h2 = conv_state[2u * a.H + ch];
+
+  const float x  = y_in[size_t(m) * a.H + ch];
+  const float h2 = (m >= 1u) ? y_in[size_t(m - 1u) * a.H + ch] : conv_state_in[2u * a.H + ch];
+  const float h1 = (m >= 2u) ? y_in[size_t(m - 2u) * a.H + ch] : conv_state_in[(1u + m) * a.H + ch];
+  const float h0 = (m >= 3u) ? y_in[size_t(m - 3u) * a.H + ch] : conv_state_in[(0u + m) * a.H + ch];
+
   const bool save_hist = (a.M <= 16u);
   if (save_hist) {
-    conv_hist[0u * a.H + ch] = h0;
-    conv_hist[1u * a.H + ch] = h1;
-    conv_hist[2u * a.H + ch] = h2;
+    if (m == 0u) {
+      conv_hist[0u * a.H + ch] = h0;
+      conv_hist[1u * a.H + ch] = h1;
+      conv_hist[2u * a.H + ch] = h2;
+    }
+    conv_hist[(3u + m) * a.H + ch] = x;
   }
+  if (m + 1u == a.M) {
+    conv_state_out[0u * a.H + ch] = h1;
+    conv_state_out[1u * a.H + ch] = h2;
+    conv_state_out[2u * a.H + ch] = x;
+  }
+
   const float sw3 = sconv_w[ch * 4u + 0u];
   const float sw2 = sconv_w[ch * 4u + 1u];
   const float sw1 = sconv_w[ch * 4u + 2u];
   const float sw0 = sconv_w[ch * 4u + 3u];
   const float inv_denom = rsqrt(float(a.ks + 1u));
+  const float cv = (sw0 * x + sw1 * h2 + sw2 * h1 + sw3 * h0 + x) * inv_denom;
 
-  for (uint m = 0; m < a.M; m++) {
-    const float x = y_in[size_t(m) * a.H + ch];
-    if (save_hist) conv_hist[(3u + m) * a.H + ch] = x;
-    const float cv = (sw0 * x + sw1 * h2 + sw2 * h1 + sw3 * h0 + x) * inv_denom;
-    h0 = h1; h1 = h2; h2 = x;
-
-    const float r_old = h_res[size_t(m) * a.H + ch];
-    if (!a.is_mlp) {
-      if (a.is_boundary) {
-        blocks[size_t(a.b_slot) * a.b_stride + size_t(m) * a.H + ch] = r_old;
-        h_res[size_t(m) * a.H + ch] = cv;
-      } else {
-        h_res[size_t(m) * a.H + ch] = r_old + cv;
-      }
+  const float r_old = h_res[size_t(m) * a.H + ch];
+  if (!a.is_mlp) {
+    if (a.is_boundary) {
+      blocks[size_t(a.b_slot) * a.b_stride + size_t(m) * a.H + ch] = r_old;
+      h_res[size_t(m) * a.H + ch] = cv;
     } else {
-      h_res[size_t(m) * a.H + ch] = float(bfloat(r_old + cv));
+      h_res[size_t(m) * a.H + ch] = r_old + cv;
     }
+  } else {
+    h_res[size_t(m) * a.H + ch] = float(bfloat(r_old + cv));
   }
-  conv_state[0u * a.H + ch] = h0;
-  conv_state[1u * a.H + ch] = h1;
-  conv_state[2u * a.H + ch] = h2;
 }
 
 // 9a. Parallel FP32 router logits (float4 vectorized): scores[m, e] = sigmoid(dot(mn[m], rw[e])).
@@ -1140,7 +1147,7 @@ kernel void ink_moe_topk_pf(device const float* scores [[buffer(0)]],
   }
 }
 
-// P2. Plan compact grouped MoE worklist for mmpg (CH=4 -> 64 rows/tile, NF=2 -> 64 cols/TG).
+// P2. Parallel 128-thread compact grouped MoE worklist planner for mmpg (CH=4 -> 64 rows/tile, NF=2 -> 64 cols/TG).
 // Grid: (1, 1, 1), TG: 128 threads.
 struct PlanArgs {
   uint M, E, topk, gx_gu, gx_dn;
@@ -1157,40 +1164,47 @@ kernel void ink_moe_plan_pf(device const uint* top_idx [[buffer(0)]],  // [M, 8]
                             device uint* ind_dn [[buffer(9)]],
                             constant PlanArgs& a [[buffer(10)]],
                             uint tid [[thread_index_in_threadgroup]]) {
-  if (tid != 0u) return;
-  uint cnt[128];
-  for (uint e = 0; e < a.E; e++) cnt[e] = 0u;
+  threadgroup atomic_uint tg_cnt[128];
+  threadgroup uint tg_e2s[128];
+  threadgroup atomic_uint tg_cur[128];
+
+  atomic_store_explicit(&tg_cnt[tid], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
   const uint tot = a.M * a.topk;
-  for (uint i = 0; i < tot; i++) cnt[top_idx[i]]++;
-
-  uint ns = 0, off = 0, nt = 0;
-  uint e2s[128];
-  uint cur[128];
-  for (uint e = 0; e < a.E; e++) {
-    if (cnt[e] > 0u) {
-      e2s[e] = ns;
-      slots[ns] = e;
-      roff[ns] = off;
-      rcnt[ns] = cnt[e];
-      cur[ns] = off;
-      const uint tiles = (cnt[e] + 63u) / 64u;
-      for (uint ty = 0; ty < tiles; ty++) wtile[nt++] = (ns << 16) | ty;
-      // Pad expert's compact row offset to multiple of 16 so frag_off(off + row) is block-aligned!
-      off += (cnt[e] + 15u) & ~15u;
-      ns++;
-    }
+  for (uint i = tid; i < tot; i += 128u) {
+    atomic_fetch_add_explicit(&tg_cnt[top_idx[i]], 1u, memory_order_relaxed);
   }
-  nslots[0] = ns;
-  ind_gu[0] = a.gx_gu; ind_gu[1] = nt; ind_gu[2] = 1u;
-  ind_dn[0] = a.gx_dn; ind_dn[1] = nt; ind_dn[2] = 1u;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint m = 0; m < a.M; m++) {
-    for (uint k = 0; k < a.topk; k++) {
-      const uint s = e2s[top_idx[m * a.topk + k]];
-      const uint pos = cur[s]++;
-      rlist[pos] = m;
-      rpos[m * a.topk + k] = pos;
+  if (tid == 0u) {
+    uint ns = 0, off = 0, nt = 0;
+    for (uint e = 0; e < a.E; e++) {
+      const uint c = atomic_load_explicit(&tg_cnt[e], memory_order_relaxed);
+      if (c > 0u) {
+        tg_e2s[e] = ns;
+        slots[ns] = e;
+        roff[ns] = off;
+        rcnt[ns] = c;
+        atomic_store_explicit(&tg_cur[ns], off, memory_order_relaxed);
+        const uint tiles = (c + 63u) >> 6;
+        for (uint ty = 0; ty < tiles; ty++) wtile[nt++] = (ns << 16) | ty;
+        off += (c + 15u) & ~15u;
+        ns++;
+      }
     }
+    nslots[0] = ns;
+    ind_gu[0] = a.gx_gu; ind_gu[1] = nt; ind_gu[2] = 1u;
+    ind_dn[0] = a.gx_dn; ind_dn[1] = nt; ind_dn[2] = 1u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint i = tid; i < tot; i += 128u) {
+    const uint m = i / a.topk;
+    const uint s = tg_e2s[top_idx[i]];
+    const uint pos = atomic_fetch_add_explicit(&tg_cur[s], 1u, memory_order_relaxed);
+    rlist[pos] = m;
+    rpos[i] = pos;
   }
 }
 

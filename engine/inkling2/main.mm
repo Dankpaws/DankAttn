@@ -88,6 +88,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "dprof") {
       uint32_t n_ctx = argc > 3 ? uint32_t(atoi(argv[3])) : 128u;
+      uint32_t m_step = argc > 4 ? uint32_t(atoi(argv[4])) : 1u;
       std::vector<uint32_t> chunk;
       for (uint32_t i = 0; i < n_ctx; i += ink2::MP) {
         uint32_t n = std::min(ink2::MP, n_ctx - i);
@@ -95,19 +96,26 @@ int main(int argc, char** argv) {
         for (uint32_t j = 0; j < n; j++) chunk[j] = paris_ids[(i + j) % paris_ids.size()];
         M.step(chunk);
       }
-      // Warmup 4 decode steps
-      uint32_t tok = 152717;
-      for (int i = 0; i < 4; i++) tok = M.step({tok})[0];
+      // Warmup
+      std::vector<uint32_t> probe(m_step);
+      for (uint32_t i = 0; i < m_step; i++) probe[i] = paris_ids[(n_ctx + i) % paris_ids.size()];
+      if (m_step == 1u) {
+        uint32_t tok = 152717;
+        for (int i = 0; i < 4; i++) tok = M.step({tok})[0];
+        probe[0] = tok;
+      } else {
+        M.step(probe);
+      }
       double unprof_ms = 0;
-      tok = M.step({tok}, &unprof_ms)[0];
+      M.step(probe, &unprof_ms);
       std::map<std::string, double> prof;
-      M.step({tok}, nullptr, nullptr, &prof);
+      M.step(probe, nullptr, nullptr, &prof);
       std::vector<std::pair<double, std::string>> rows;
       double tot = 0;
       for (auto& [k, v] : prof) { rows.push_back({v, k}); tot += v; }
       std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
-      printf("dprof (ctx=%u, unprofiled=%.2f ms = %.1f tok/s, profiled_sum=%.2f ms):\n",
-             n_ctx, unprof_ms, 1000.0 / unprof_ms, tot);
+      printf("dprof (ctx=%u, M=%u, unprofiled=%.2f ms = %.1f tok/s, profiled_sum=%.2f ms):\n",
+             n_ctx, m_step, unprof_ms, 1000.0 * m_step / unprof_ms, tot);
       for (auto& [v, k] : rows) printf("  %-14s %6.2f ms (%4.1f%%)\n", k.c_str(), v, 100.0 * v / tot);
       return 0;
     }

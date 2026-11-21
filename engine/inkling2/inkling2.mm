@@ -344,9 +344,13 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
       st.v_cache = C.buf(kv_bytes);
     }
     st.k_conv = C.buf(3u * nkv * hd * sizeof(float));
+    st.k_conv_next = C.buf(3u * nkv * hd * sizeof(float));
     st.v_conv = C.buf(3u * nkv * hd * sizeof(float));
+    st.v_conv_next = C.buf(3u * nkv * hd * sizeof(float));
     st.attn_conv = C.buf(3u * H * sizeof(float));
+    st.attn_conv_next = C.buf(3u * H * sizeof(float));
     st.mlp_conv = C.buf(3u * H * sizeof(float));
+    st.mlp_conv_next = C.buf(3u * H * sizeof(float));
     st.k_hist = C.buf((3u + MAXM) * nkv * hd * sizeof(float));
     st.v_hist = C.buf((3u + MAXM) * nkv * hd * sizeof(float));
     st.attn_hist = C.buf((3u + MAXM) * H * sizeof(float));
@@ -536,12 +540,14 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
       {"WBITS", "40"}, {"GS", "16"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"},
       {"EPI", "3"}, {"SWIGLU_SOFTCAP_G", "4.0"}, {"SWIGLU_SOFTCAP_U", "25.0"}});
   p_mmpg_fp4_dn = C.pipe(mm_src, "mmpg", {
-      {"WBITS", "40"}, {"GS", "16"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"}});
+      {"WBITS", "40"}, {"GS", "16"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"},
+      {"CONTIG_X", "1"}});
   p_mmpg_fp8_gu = C.pipe(mm_src, "mmpg", {
       {"WBITS", "80"}, {"GS", "32"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"},
       {"EPI", "3"}, {"SWIGLU_SOFTCAP_G", "4.0"}, {"SWIGLU_SOFTCAP_U", "25.0"}});
   p_mmpg_fp8_dn = C.pipe(mm_src, "mmpg", {
-      {"WBITS", "80"}, {"GS", "32"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"}});
+      {"WBITS", "80"}, {"GS", "32"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"},
+      {"CONTIG_X", "1"}});
 
   if (has_mtp) {
     p_mtp_mix = C.pipe(ink_src, "ink_mtp_mix_norm");
@@ -679,7 +685,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
   auto run_layer = [&](uint32_t log_idx, uint32_t phys_idx, uint32_t& n_blocks, bool has_msgs) {
     maybe_capture(log_idx);
     const auto& ly = L[phys_idx];
-    const auto& st = S[log_idx];
+    auto& st = S[log_idx];
 
     // A. Pre-attention Block Attention Residual -> b_qkv_in
     id<MTLBuffer> q_in_buf = b_qkv_in, k_in_buf = b_qkv_in, v_in_buf = b_qkv_in;
@@ -830,7 +836,9 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     [enc setBuffer:(st.k_sc ? st.k_sc : b_dummy) offset:0 atIndex:5];
     [enc setBuffer:st.k_hist offset:0 atIndex:6];
     [enc setBytes:&kca length:sizeof(kca) atIndex:7];
-    [enc dispatchThreadgroups:MTLSizeMake(nkv, 1, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+    [enc setBuffer:st.k_conv_next offset:0 atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake(M, nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+    std::swap(st.k_conv, st.k_conv_next);
 
     KvConvArgs vca{M, nkv, hd, ly.v_proj.N, pos, st.cap, ly.is_local ? 0u : 1u, 0u, ks, st.kv8 ? 1u : 0u, qk_clip, eps};
     [enc setBuffer:b_v_raw offset:0 atIndex:0];
@@ -841,7 +849,9 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     [enc setBuffer:(st.v_sc ? st.v_sc : b_dummy) offset:0 atIndex:5];
     [enc setBuffer:st.v_hist offset:0 atIndex:6];
     [enc setBytes:&vca length:sizeof(vca) atIndex:7];
-    [enc dispatchThreadgroups:MTLSizeMake(nkv, 1, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+    [enc setBuffer:st.v_conv_next offset:0 atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake(M, nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+    std::swap(st.v_conv, st.v_conv_next);
     barrier();
     flush_prof("kv_conv");
 
@@ -889,7 +899,9 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     [enc setBuffer:b_blocks offset:0 atIndex:4];
     [enc setBuffer:st.attn_hist offset:0 atIndex:5];
     [enc setBytes:&pca length:sizeof(pca) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake((H + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc setBuffer:st.attn_conv_next offset:0 atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(M, (H + 255u) / 256u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    std::swap(st.attn_conv, st.attn_conv_next);
     if (ly.is_boundary) n_blocks++;
     barrier();
     flush_prof("post_conv");
@@ -1051,7 +1063,9 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_
     [enc setBuffer:b_blocks offset:0 atIndex:4];
     [enc setBuffer:st.mlp_hist offset:0 atIndex:5];
     [enc setBytes:&mpca length:sizeof(mpca) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake((H + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc setBuffer:st.mlp_conv_next offset:0 atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(M, (H + 255u) / 256u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    std::swap(st.mlp_conv, st.mlp_conv_next);
     barrier();
     flush_prof("post_conv");
   };

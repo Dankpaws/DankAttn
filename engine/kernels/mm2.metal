@@ -821,7 +821,7 @@ kernel void mmpg(device const WLOAD* W [[buffer(0)]], device const half* S [[buf
   auto c1 = op.template get_destination_cooperative_tensor<decltype(xa), decltype(wb), float>();
   const ushort n0 = 4 * (l & 1) + 8 * ((l >> 3) & 1), m0 = ((l >> 1) & 3) + 4 * (l >> 4);
 #ifdef CONTIG_X
-  X += size_t(rb) * KS * 64;
+  X += size_t((a.ldx == 2 ? (off >> 4) : 0u) + rb) * KS * 64;
 #else
   uint goff[2][2];
   bool gok[2];

@@ -54,10 +54,10 @@ struct LogicalState {
   id<MTLBuffer> v_cache = nil;
   id<MTLBuffer> k_i8 = nil, k_sc = nil;
   id<MTLBuffer> v_i8 = nil, v_sc = nil;
-  id<MTLBuffer> k_conv = nil, k_hist = nil;       // [3, C] and [3 + MAXM, C] f32
-  id<MTLBuffer> v_conv = nil, v_hist = nil;
-  id<MTLBuffer> attn_conv = nil, attn_hist = nil;
-  id<MTLBuffer> mlp_conv = nil, mlp_hist = nil;
+  id<MTLBuffer> k_conv = nil, k_conv_next = nil, k_hist = nil;       // [3, C] and [3 + MAXM, C] f32
+  id<MTLBuffer> v_conv = nil, v_conv_next = nil, v_hist = nil;
+  id<MTLBuffer> attn_conv = nil, attn_conv_next = nil, attn_hist = nil;
+  id<MTLBuffer> mlp_conv = nil, mlp_conv_next = nil, mlp_hist = nil;
 };
 
 struct MtpLayer {
