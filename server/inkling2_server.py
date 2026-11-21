@@ -165,12 +165,12 @@ class InkParser:
 app = FastAPI()
 register_common_routes(app, eng, args.model_id, args.cap, lambda: args.lanes, render, tok)
 
-_FPR_ALIAS_RE = re.compile(r":(\d+)x-(select|genselect|synth)$")
+_FPR_ALIAS_RE = re.compile(r":(\d+)x-(select|genselect|synth|fast)$")
 _BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
 
 
 def parse_fpr_opts(body):
-    """Parse optional Fork-Prune-Resolve settings from model alias (:4x-select|:4x-genselect|:4x-synth) or extra_body."""
+    """Parse optional Fork-Prune-Resolve / Parallel-Fill settings from model alias (:4x-select|:4x-genselect|:4x-synth|:4x-fast) or extra_body."""
     model_name = body.get("model") or args.model_id
     fpr_lanes, fpr_mode = 0, None
     m = _FPR_ALIAS_RE.search(model_name)
@@ -181,8 +181,8 @@ def parse_fpr_opts(body):
         fpr_lanes = num(body, "dankattn_lanes", int, 0, 1, 16)
     if body.get("dankattn_mode") is not None:
         fpr_mode = str(body["dankattn_mode"])
-        if fpr_mode not in ("select", "genselect", "synth"):
-            raise BadRequest("dankattn_mode must be one of select, genselect, synth")
+        if fpr_mode not in ("select", "genselect", "synth", "fast"):
+            raise BadRequest("dankattn_mode must be one of select, genselect, synth, fast")
     if fpr_lanes < 2 or not fpr_mode:
         return None
     fpr_lanes = min(fpr_lanes, args.lanes)
@@ -215,17 +215,19 @@ def _cand_sig(p):
     return (p.content.strip(), json.dumps([c["function"] for c in p.calls], sort_keys=True, ensure_ascii=False))
 
 
-async def _collect_fpr_candidates(ids, max_new, temp, top_p, top_k, seed, budget, min_p, extra_stops, fpr, request):
-    """Run C++ FPR in candidate mode (mode=1): zero-copy Split-KV fork, GPU Self-Certainty, DeepConf prune, quorum.
-    Rewinds Lane 0 to len(ids) on completion so any judge/synth pass reuses 100% of the prompt prefix.
+async def _collect_fpr_candidates(ids, max_new, temp, top_p, top_k, seed, budget, min_p, extra_stops, fpr, request,
+                                  mode_code=1, fpr_suffixes=None):
+    """Run C++ FPR in candidate/parallel-fill mode (mode_code=1 or 2): zero-copy Split-KV fork, batched DSpark.
+    Rewinds Lane 0 to len(ids) on completion so any follow-up pass reuses 100% of the prompt prefix.
     """
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
-    opts = 1 | (fpr["prune"] << 4)
+    opts = mode_code | ((0 if mode_code == 2 else fpr["prune"]) << 4)
+    quorum = fpr["lanes"] if mode_code == 2 else fpr["quorum"]
     cb = eng.metered(lambda item: loop.call_soon_threadsafe(q.put_nowait, item))
     eid = eng.submit(ids, max_new, not args.no_spec, temp, top_p, top_k, seed, cb,
-                     group=(fpr["lanes"], fpr["quorum"], opts),
-                     think_budget=budget, min_p=min_p, extra_stops=extra_stops)
+                     group=(fpr["lanes"], quorum, opts),
+                     think_budget=budget, min_p=min_p, extra_stops=extra_stops, fpr_suffixes=fpr_suffixes)
     watch = Watch(q, request)
     cands = []
     cur = None
@@ -292,6 +294,122 @@ async def chat(request: Request):
     budget = tb if tb is not None else args.thinking_budget
     rid, created = "chatcmpl-" + uuid.uuid4().hex[:16], int(time.time())
     resp_model = fpr["model"] if fpr else args.model_id
+
+    # Lever 2: Parallel Section Fill (:4x-fast / :8x-fast) — fast JSON outline -> K parallel forked section fills -> stitch!
+    if fpr and fpr["mode"] == "fast" and not body.get("tools"):
+        t_fast0 = time.perf_counter()
+        n_sec = fpr["lanes"]
+        outline_suf = (
+            f"<|end_message|><|message_user|><|content_text|>"
+            f"Break the response to the request above into {n_sec} independent, non-overlapping sections that can be written in parallel "
+            f"(or 1 section if the request is very short). "
+            f"Reply ONLY with compact JSON: {{\"sections\":[{{\"title\":\"...\",\"spec\":\"1-sentence exact spec / function signatures\"}}]}}."
+            f"<|end_message|><|message_model|><|content_text|>{{\"sections\":["
+        )
+        outline_ids = ids + tok.encode(outline_suf, add_special_tokens=False).ids
+        loop = asyncio.get_running_loop()
+        oq: asyncio.Queue = asyncio.Queue()
+        ocb = eng.metered(lambda item: loop.call_soon_threadsafe(oq.put_nowait, item))
+        oeid = eng.submit(outline_ids, 1024, not args.no_spec, 0.0, 1.0, 0, seed, ocb,
+                          think_budget=0, min_p=min_p, extra_stops=[END_MSG] + extra_stops)
+        owatch = Watch(oq, request)
+        otoks, st_out = [], {}
+        try:
+            while True:
+                it = await owatch.get()
+                if isinstance(it, dict):
+                    if "error" in it:
+                        return error_response(it["error"])
+                    st_out = it
+                    break
+                if isinstance(it, int) and it not in (END_MSG, EOS):
+                    otoks.append(it)
+        except ClientGone:
+            eng.cancel(oeid)
+            return Response(status_code=499)
+        outline_ms = (time.perf_counter() - t_fast0) * 1000.0
+        raw_json = '{"sections":[' + tok.decode(otoks, skip_special_tokens=True).strip()
+        sections = []
+        try:
+            m_obj = re.search(r"\{.*\}", raw_json, re.S)
+            obj = json.loads(m_obj.group(0) if m_obj else raw_json)
+            if isinstance(obj, dict) and isinstance(obj.get("sections"), list):
+                sections = [s for s in obj["sections"] if isinstance(s, dict) and s.get("title")][:n_sec]
+        except Exception:
+            sections = []
+        if len(sections) < 2:
+            for t_m, s_m in re.findall(r'"title"\s*:\s*"((?:[^"\\]|\\.)+)"\s*,\s*"spec"\s*:\s*"((?:[^"\\]|\\.)+)"', raw_json):
+                sections.append({"title": t_m, "spec": s_m})
+            sections = sections[:n_sec]
+
+        if len(sections) >= 2:
+            K = len(sections)
+            outline_str = json.dumps({"sections": sections}, ensure_ascii=False)
+            shared_ctx = (
+                f"<|end_message|><|message_user|><|content_text|>"
+                f"Full response outline (shared across parallel writers):\n{outline_str}\n"
+            )
+            shared_ids = ids + tok.encode(shared_ctx, add_special_tokens=False).ids
+            suffixes = []
+            for idx_s, sec in enumerate(sections):
+                stxt = (
+                    f"Write ONLY Section {idx_s+1} (\"{sec.get('title','')}\"): {sec.get('spec','')}\n"
+                    f"Start directly with the section heading and complete content. Do not write any other sections."
+                    f"<|end_message|><|message_model|><|content_text|>"
+                )
+                suffixes.append(tok.encode(stxt, add_special_tokens=False).ids)
+            fpr_fill = dict(fpr, lanes=K, quorum=K)
+            per_sec_max = max(256, max_new // K + 256)
+            t_fill0 = time.perf_counter()
+            try:
+                cands, st_fill = await _collect_fpr_candidates(
+                    shared_ids, per_sec_max, temp, top_p, top_k, seed, 0, min_p, [END_MSG] + extra_stops,
+                    fpr_fill, request, mode_code=2, fpr_suffixes=suffixes
+                )
+            except Unavailable as e:
+                return unavailable(str(e))
+            except ClientGone:
+                return Response(status_code=499)
+            fill_ms = (time.perf_counter() - t_fill0) * 1000.0
+            parts = []
+            vis_toks = 0
+            for c in cands:
+                ctoks = [t for t in c["toks"] if t not in (END_MSG, EOS)]
+                vis_toks += len(ctoks)
+                txt = tok.decode(ctoks, skip_special_tokens=True).strip()
+                if txt:
+                    parts.append(txt)
+            final_text = "\n\n".join(parts)
+            wall_ms = (time.perf_counter() - t_fast0) * 1000.0
+            usage = {
+                "prompt_tokens": len(ids), "completion_tokens": vis_toks,
+                "total_tokens": len(ids) + vis_toks,
+                "completion_tokens_details": {"reasoning_tokens": 0},
+                "dankattn": {
+                    "fpr_mode": "fast", "sections": K,
+                    "outline_ms": round(outline_ms, 1), "fill_ms": round(fill_ms, 1),
+                    "wall_ms": round(wall_ms, 1),
+                    "eff_tok_s": round(1000.0 * vis_toks / max(wall_ms, 1.0), 1),
+                    "fill_tok_s": round(1000.0 * vis_toks / max(fill_ms, 1.0), 1),
+                },
+            }
+            if body.get("stream"):
+                async def gen_fast():
+                    def ch(delta, finish=None, u=None):
+                        d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": resp_model,
+                             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                        if u:
+                            d["usage"] = u
+                        return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
+                    yield ch({"role": "assistant", "content": ""})
+                    yield ch({"content": final_text})
+                    yield ch({}, "stop", usage)
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(gen_fast(), media_type="text/event-stream")
+            return {"id": rid, "object": "chat.completion", "created": created, "model": resp_model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": final_text}, "finish_reason": "stop"}],
+                    "usage": usage}
+        fpr = None  # fallback to normal 1-lane decode when outline has <= 1 section
 
     # FPR genselect / synth: Stage 1 in C++ (Split-KV fork + DeepConf prune + quorum -> Lane 0 rewound to len(ids)),
     # Stage 2 either short-circuits on unanimous consensus or runs zero-prefill judge/synth on Lane 0!

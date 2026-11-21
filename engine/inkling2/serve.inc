@@ -28,7 +28,8 @@ constexpr uint32_t END = 0xFFFFFFFFu, ERR = 0xFFFFFFFEu, READY = 0xFFFFFFFDu, CA
 
 struct Req {
   uint32_t rid = 0, max_new = 0, flags = 0;
-  uint32_t fpr_lanes = 0, fpr_quorum = 0, fpr_opts = 0;  // flags & 2: Fork-Prune-Resolve
+  uint32_t fpr_lanes = 0, fpr_quorum = 0, fpr_opts = 0;  // flags & 2: Fork-Prune-Resolve / Parallel Fill
+  std::vector<std::vector<uint32_t>> fpr_suffixes;       // mode == 2: per-lane section prompts
   std::vector<uint32_t> ids, stops, force;
   uint32_t budget = 0, think_end = 0;
   float temp = 0, top_p = 1, min_p = -1.0f;
@@ -86,6 +87,17 @@ void reader() {
       q->fpr_lanes = g3[0];
       q->fpr_quorum = g3[1];
       q->fpr_opts = g3[2];
+      if ((q->fpr_opts & 0xFu) == 2u) {
+        q->fpr_suffixes.resize(q->fpr_lanes);
+        bool ok = true;
+        for (uint32_t k = 0; k < q->fpr_lanes; k++) {
+          uint32_t slen = 0;
+          if (!rd(&slen, 4)) { ok = false; break; }
+          q->fpr_suffixes[k].resize(slen);
+          if (slen && !rd(q->fpr_suffixes[k].data(), size_t(slen) * 4u)) { ok = false; break; }
+        }
+        if (!ok) break;
+      }
     }
     if (q->flags & 4) {
       uint32_t t3[3];
@@ -276,7 +288,7 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
   for (uint32_t k = 1; k < K; k++) {
     m.fork_lane(0, int(k));
     ink2::Model::Samp spk = base_sp;
-    if (spk.temp <= 0.0f) { spk.temp = 0.8f; if (spk.min_p <= 0.0f) spk.min_p = 0.02f; }
+    if (mode != 2u && spk.temp <= 0.0f) { spk.temp = 0.8f; if (spk.min_p <= 0.0f) spk.min_p = 0.02f; }
     spk.seed = q->seed + k;
     m.lanes_[k].samp = spk;
     lane_hist()[k] = h0;
@@ -298,6 +310,26 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     fls[k].b = b0;
     fls[k].b_conf = conf0;
     fls[k].lk = std::make_unique<opus_lookup::Lookup>();
+  }
+
+  // Mode 2 (Parallel Section Fill): feed each lane's short section prompt (chunks <= MAXM to use Split-KV decode path!)
+  if (mode == 2u) {
+    for (uint32_t k = 0; k < K; k++) {
+      if (k >= q->fpr_suffixes.size() || q->fpr_suffixes[k].empty()) continue;
+      m.use_lane(int(k));
+      const auto& suf = q->fpr_suffixes[k];
+      for (size_t i = 0; i < suf.size(); i += ink2::MAXM) {
+        std::vector<uint32_t> c(suf.begin() + long(i), suf.begin() + long(std::min(suf.size(), i + ink2::MAXM)));
+        double g = 0;
+        fls[k].b = m.step(c, &g).back();
+        fls[k].b_conf = m.last_conf.empty() ? 0.0f : m.last_conf.back();
+        pms += g;
+        if (m.has_mtp) m.mtp_commit(uint32_t(c.size()));
+        auto& hk = lane_hist()[k];
+        hk.insert(hk.end(), c.begin(), c.end());
+      }
+    }
+    m.use_lane(0);
   }
 
   auto push_tok = [&](FprLane& fl, uint32_t t, float cf) -> bool {
@@ -445,11 +477,15 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
   };
 
   std::vector<uint32_t> cands;
-  for (uint32_t k = 0; k < K; k++) if (fls[k].done && !fls[k].pruned) cands.push_back(k);
-  if (cands.empty()) {
-    for (uint32_t k = 0; k < K; k++) if (!fls[k].pruned) cands.push_back(k);
+  if (mode == 2u) {
+    for (uint32_t k = 0; k < K; k++) cands.push_back(k);  // exact section order 0..K-1
+  } else {
+    for (uint32_t k = 0; k < K; k++) if (fls[k].done && !fls[k].pruned) cands.push_back(k);
+    if (cands.empty()) {
+      for (uint32_t k = 0; k < K; k++) if (!fls[k].pruned) cands.push_back(k);
+    }
+    if (cands.empty()) cands.push_back(0u);
   }
-  if (cands.empty()) cands.push_back(0u);
 
   uint32_t n_emit = 0;
   bool out_len = false;
@@ -515,7 +551,7 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
   fwrite(f2, 4, 2, stdout);
   fflush(stdout);
   fprintf(stderr, "inkling2: rid %u FPR(%s) K=%u Q=%u pruned=%u prompt %zu (reused %u, prefill %.0f ms) emit %u (agg %u) in %.0f ms (win=L%d sc=%.2f)\n",
-          q->rid, mode == 0u ? "select" : "cands", K, Q, n_pruned, q->ids.size(), reuse, pms, n_emit, tot_acc, wall, win_lane, win_conf);
+          q->rid, mode == 0u ? "select" : (mode == 2u ? "fast" : "cands"), K, Q, n_pruned, q->ids.size(), reuse, pms, n_emit, tot_acc, wall, win_lane, win_conf);
   std::lock_guard<std::mutex> g(mu);
   live.erase(q->rid);
 }

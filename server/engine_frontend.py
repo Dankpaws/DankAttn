@@ -180,7 +180,7 @@ class EngineProc:
             time.sleep(2)
 
     def submit(self, ids, max_new, spec, temp, top_p, top_k, seed, cb,
-               group=None, think_budget=0, strict=False, min_p=None, extra_stops=(), vision_imgs=None):
+               group=None, think_budget=0, strict=False, min_p=None, extra_stops=(), vision_imgs=None, fpr_suffixes=None):
         if self.state["state"] != "up":
             raise Unavailable(self.state["state"])
         rid = next(self.rids)
@@ -201,6 +201,9 @@ class EngineProc:
         req += struct.pack("<ffIQ", temp, top_p, top_k, seed)
         if group:
             req += struct.pack("<III", *group)
+            if (group[2] & 0xF) == 2 and fpr_suffixes is not None:
+                for suf in fpr_suffixes:
+                    req += struct.pack("<I", len(suf)) + (struct.pack(f"<{len(suf)}I", *suf) if suf else b"")
         if think_budget:
             req += struct.pack("<III", think_budget, self.think_end, len(self.think_force))
             req += struct.pack(f"<{len(self.think_force)}I", *self.think_force)
