@@ -12,8 +12,8 @@
 namespace ink2 {
 
 constexpr uint32_t MAXM = 16;   // rows per decode / verify step (mm2)
-constexpr uint32_t MP = 256;    // max rows per chunked prefill step (mmp / mmpg)
-constexpr uint32_t PF_COMPACT = 4096;  // max compact padded MoE rows for MP=256 (256*8 + 128*15 = 3968)
+constexpr uint32_t MP = 512;    // max rows per chunked prefill step (mmp / mmpg)
+constexpr uint32_t PF_COMPACT = 6144;  // max compact padded MoE rows for MP=512 (512*8 + 128*15 = 6016)
 constexpr uint32_t MAX_BLOCKS = 12;
 constexpr uint32_t ASPLITS = 24; // max attention key splits (fixed per layer -> bit-exact across M)
 
