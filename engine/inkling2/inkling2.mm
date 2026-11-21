@@ -505,11 +505,13 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
       b_mtp_base_logits = C.buf(MAXM * vocab_pad * sizeof(float));
       b_mtp_bias = C.buf(vocab_pad * sizeof(float));
       b_mtp_rnn_state = C.buf(mtp_rank * sizeof(float));
+      b_mtp_rnn_static = C.buf(7u * 3u * mtp_rank * sizeof(float));
       b_mtp_rnn_proj = C.buf(3u * mtp_rank * sizeof(float));
       b_mtp_lat_frag = C.buf(16u * mtp_rank * sizeof(uint16_t));
       b_mtp_prev_tok = C.buf(16);
       b_mtp_draft_out = C.buf(MAXM * sizeof(uint32_t));
       b_mtp_draft_probs = C.buf(MAXM * sizeof(float));
+      b_mtp_part_l = C.buf(64u * sizeof(float));
     }
   }
 
@@ -583,10 +585,12 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     p_mtp_embed = C.pipe(ink_src, "ink_mtp_embed");
     p_mtp_qkv_rope = C.pipe(ink_src, "ink_mtp_qkv_rope");
     p_mtp_attn = C.pipe(ink_src, "ink_mtp_attn");
-    p_add_f32 = C.pipe(ink_src, "ink_add_f32");
-    p_mtp_rnn_proj = C.pipe(ink_src, "ink_mtp_rnn_proj");
+    p_add_rms_frag = C.pipe(ink_src, "ink_add_rms_frag");
+    p_mtp_rnn_static = C.pipe(ink_src, "ink_mtp_rnn_static");
+    p_mtp_rnn_dyn = C.pipe(ink_src, "ink_mtp_rnn_dyn");
     p_mtp_rnn_gates = C.pipe(ink_src, "ink_mtp_rnn_gates");
-    p_mtp_add_argmax = C.pipe(ink_src, "ink_mtp_add_argmax");
+    p_mtp_add_argmax_p1 = C.pipe(ink_src, "ink_mtp_add_argmax_p1");
+    p_mtp_add_argmax_p2 = C.pipe(ink_src, "ink_mtp_add_argmax_p2");
     const std::string mb = std::to_string(MtpL[0].mlp_gu.bits);
     p_mm_w6_gu = C.pipe(mm_src, "mm2", {{"WBITS", mb}, {"GS", "128"}, {"TILES", "1"}, {"EPI", "3"}});
     p_mm_w6_dn = C.pipe(mm_src, "mm2", {{"WBITS", mb}, {"GS", "128"}, {"TILES", "1"}});
@@ -1394,23 +1398,22 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
   barrier();
 
   const uint32_t zero_u = 0, one_u = 1;
-  const uint32_t bh4 = (B * H) / 4u;
 
-  // 2. Run 3 dense DFlare MTP layers
+  // Initial attn_norm for layer 0 -> b_mtp_frag
+  [enc setComputePipelineState:p_rms_frag];
+  [enc setBuffer:b_mtp_h offset:0 atIndex:0];
+  [enc setBuffer:MtpL[0].attn_norm.b offset:MtpL[0].attn_norm.off atIndex:1];
+  [enc setBuffer:b_mtp_frag offset:0 atIndex:2];
+  [enc setBuffer:b_dummy offset:0 atIndex:3];
+  [enc setBytes:&H length:4 atIndex:4];
+  [enc setBytes:&eps length:4 atIndex:5];
+  [enc setBytes:&zero_u length:4 atIndex:6];
+  [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  barrier();
+
+  // 2. Run 3 dense DFlare MTP layers (fused add + next RMSNorm!)
   for (uint32_t l = 0; l < mtp_nL; l++) {
     auto& ml = MtpL[l];
-    // attn_norm -> b_mtp_frag
-    [enc setComputePipelineState:p_rms_frag];
-    [enc setBuffer:b_mtp_h offset:0 atIndex:0];
-    [enc setBuffer:ml.attn_norm.b offset:ml.attn_norm.off atIndex:1];
-    [enc setBuffer:b_mtp_frag offset:0 atIndex:2];
-    [enc setBuffer:b_dummy offset:0 atIndex:3];
-    [enc setBytes:&H length:4 atIndex:4];
-    [enc setBytes:&eps length:4 atIndex:5];
-    [enc setBytes:&zero_u length:4 atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    barrier();
-
     enc_mm2(enc, p_mm_w8, ml.qkv, b_mtp_frag, 0, b_mtp_qkv, 0, B, nil, b_dummy, nil, nil, nil, false);
     barrier();
 
@@ -1441,22 +1444,16 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     enc_mm2(enc, p_mm_w8, ml.o, b_mtp_o_frag, 0, b_mtp_o_out, 0, B, nil, b_dummy, nil, nil, nil, false);
     barrier();
 
-    [enc setComputePipelineState:p_add_f32];
+    // Fused residual add + mlp_norm -> b_mtp_frag
+    [enc setComputePipelineState:p_add_rms_frag];
     [enc setBuffer:b_mtp_h offset:0 atIndex:0];
     [enc setBuffer:b_mtp_o_out offset:0 atIndex:1];
-    [enc setBytes:&bh4 length:4 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake((bh4 + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    barrier();
-
-    // MLP: mlp_norm -> mlp_gu (EPI=3 SiLU SwiGLU) -> mlp_dn -> residual add
-    [enc setComputePipelineState:p_rms_frag];
-    [enc setBuffer:b_mtp_h offset:0 atIndex:0];
-    [enc setBuffer:ml.mlp_norm.b offset:ml.mlp_norm.off atIndex:1];
-    [enc setBuffer:b_mtp_frag offset:0 atIndex:2];
-    [enc setBuffer:b_dummy offset:0 atIndex:3];
-    [enc setBytes:&H length:4 atIndex:4];
-    [enc setBytes:&eps length:4 atIndex:5];
-    [enc setBytes:&zero_u length:4 atIndex:6];
+    [enc setBuffer:ml.mlp_norm.b offset:ml.mlp_norm.off atIndex:2];
+    [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+    [enc setBuffer:b_dummy offset:0 atIndex:4];
+    [enc setBytes:&H length:4 atIndex:5];
+    [enc setBytes:&eps length:4 atIndex:6];
+    [enc setBytes:&zero_u length:4 atIndex:7];
     [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     barrier();
 
@@ -1466,43 +1463,49 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     enc_mm2(enc, p_mm_w6_dn, ml.mlp_dn, b_mtp_gu_frag, 0, b_mtp_dn_out, 0, B, nil, b_dummy, nil, nil, nil, false);
     barrier();
 
-    [enc setComputePipelineState:p_add_f32];
+    // Fused residual add + next layer attn_norm (or final mtp_norm + b_mtp_base_h)
+    const bool last_l = (l + 1u == mtp_nL);
+    const Raw& next_nw = last_l ? mtp_norm : MtpL[l + 1u].attn_norm;
+    const uint32_t wf32 = last_l ? one_u : zero_u;
+    [enc setComputePipelineState:p_add_rms_frag];
     [enc setBuffer:b_mtp_h offset:0 atIndex:0];
     [enc setBuffer:b_mtp_dn_out offset:0 atIndex:1];
-    [enc setBytes:&bh4 length:4 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake((bh4 + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc setBuffer:next_nw.b offset:next_nw.off atIndex:2];
+    [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+    [enc setBuffer:(last_l ? b_mtp_base_h : b_dummy) offset:0 atIndex:4];
+    [enc setBytes:&H length:4 atIndex:5];
+    [enc setBytes:&eps length:4 atIndex:6];
+    [enc setBytes:&wf32 length:4 atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     barrier();
   }
 
-  // 3. Final MTP norm -> b_mtp_frag (all B rows) & b_mtp_base_h (f32 for RNN)
-  [enc setComputePipelineState:p_rms_frag];
-  [enc setBuffer:b_mtp_h offset:0 atIndex:0];
-  [enc setBuffer:mtp_norm.b offset:mtp_norm.off atIndex:1];
-  [enc setBuffer:b_mtp_frag offset:0 atIndex:2];
-  [enc setBuffer:b_mtp_base_h offset:0 atIndex:3];
-  [enc setBytes:&H length:4 atIndex:4];
-  [enc setBytes:&eps length:4 atIndex:5];
-  [enc setBytes:&one_u length:4 atIndex:6];
-  [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-  barrier();
-
-  // Base logits for all B rows (we use rows 1..7)
+  // 3. Base logits for all B rows || Precompute static Markov RNN projections concurrently!
   enc_mm2(enc, p_mm_w8, lm_head, b_mtp_frag, 0, b_mtp_base_logits, 0, B, nil, b_dummy, nil, nil, nil, false);
+  {
+    RnnArgs sra{H, mtp_rank, gamma};
+    [enc setComputePipelineState:p_mtp_rnn_static];
+    [enc setBuffer:b_mtp_base_h offset:0 atIndex:0];
+    [enc setBuffer:b_mtp_f_rnn offset:0 atIndex:1];
+    [enc setBuffer:mtp_mh_rnn_w.b offset:mtp_mh_rnn_w.off atIndex:2];
+    [enc setBuffer:mtp_mh_rnn_b.b offset:mtp_mh_rnn_b.off atIndex:3];
+    [enc setBuffer:b_mtp_rnn_static offset:0 atIndex:4];
+    [enc setBytes:&sra length:sizeof(sra) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((3u * mtp_rank + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  }
   barrier();
 
-  // 4. Sequential Markov RNN head for 7 draft tokens (all inside this single command buffer!)
+  // 4. Sequential Markov RNN head for gamma draft tokens (10x smaller rnn_dyn + 64-TG parallel argmax!)
   for (uint32_t k = 0; k < gamma; k++) {
     RnnArgs ra{H, mtp_rank, k};
-    [enc setComputePipelineState:p_mtp_rnn_proj];
+    [enc setComputePipelineState:p_mtp_rnn_dyn];
     [enc setBuffer:b_mtp_rnn_state offset:0 atIndex:0];
     [enc setBuffer:mtp_mh_markov_w1.b offset:mtp_mh_markov_w1.off atIndex:1];
     [enc setBuffer:b_mtp_prev_tok offset:0 atIndex:2];
-    [enc setBuffer:b_mtp_base_h offset:0 atIndex:3];
-    [enc setBuffer:b_mtp_f_rnn offset:0 atIndex:4];
-    [enc setBuffer:mtp_mh_rnn_w.b offset:mtp_mh_rnn_w.off atIndex:5];
-    [enc setBuffer:mtp_mh_rnn_b.b offset:mtp_mh_rnn_b.off atIndex:6];
-    [enc setBuffer:b_mtp_rnn_proj offset:0 atIndex:7];
-    [enc setBytes:&ra length:sizeof(ra) atIndex:8];
+    [enc setBuffer:b_mtp_rnn_static offset:0 atIndex:3];
+    [enc setBuffer:mtp_mh_rnn_w.b offset:mtp_mh_rnn_w.off atIndex:4];
+    [enc setBuffer:b_mtp_rnn_proj offset:0 atIndex:5];
+    [enc setBytes:&ra length:sizeof(ra) atIndex:6];
     [enc dispatchThreadgroups:MTLSizeMake((3u * mtp_rank + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     barrier();
 
@@ -1519,15 +1522,26 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
     barrier();
 
     MtpPickArgs pa{vocab_valid, vocab_pad, k, logit_softcap};
-    [enc setComputePipelineState:p_mtp_add_argmax];
+    [enc setComputePipelineState:p_mtp_add_argmax_p1];
     [enc setBuffer:b_mtp_base_logits offset:(size_t(vocab_pad) * sizeof(float)) atIndex:0];  // row 1..7!
     [enc setBuffer:b_mtp_bias offset:0 atIndex:1];
     [enc setBuffer:mtp_mh_fold_b.b offset:mtp_mh_fold_b.off atIndex:2];
+    [enc setBuffer:b_argmax_v offset:0 atIndex:3];
+    [enc setBuffer:b_argmax_i offset:0 atIndex:4];
+    [enc setBuffer:b_mtp_part_l offset:0 atIndex:5];
+    [enc setBytes:&pa length:sizeof(pa) atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    [enc setComputePipelineState:p_mtp_add_argmax_p2];
+    [enc setBuffer:b_argmax_v offset:0 atIndex:0];
+    [enc setBuffer:b_argmax_i offset:0 atIndex:1];
+    [enc setBuffer:b_mtp_part_l offset:0 atIndex:2];
     [enc setBuffer:b_mtp_prev_tok offset:0 atIndex:3];
     [enc setBuffer:b_mtp_draft_out offset:0 atIndex:4];
     [enc setBuffer:b_mtp_draft_probs offset:0 atIndex:5];
     [enc setBytes:&pa length:sizeof(pa) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     barrier();
   }
 

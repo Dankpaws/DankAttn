@@ -1321,48 +1321,115 @@ kernel void ink_mtp_attn(device const float4* Q [[buffer(0)]],
   }
 }
 
-// M6. Simple residual add: h += y (bf16-rounded).
-kernel void ink_add_f32(device float4* h [[buffer(0)]], device const float4* y [[buffer(1)]],
-                        constant uint& n4 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
-  if (gid < n4) h[gid] = float4(bfloat4(h[gid] + y[gid]));
+// M6. Fused residual add (bf16-rounded) + RMSNorm -> bf16 frag (+ optional f32 copy).
+// Grid: (M, 1, 1), TG: 256 threads.
+kernel void ink_add_rms_frag(device float4* h [[buffer(0)]], device const float4* y [[buffer(1)]],
+                             device const float4* w [[buffer(2)]],
+                             device bfloat* frag [[buffer(3)]], device float4* f32_out [[buffer(4)]],
+                             constant uint& H [[buffer(5)]], constant float& eps [[buffer(6)]],
+                             constant uint& write_f32 [[buffer(7)]],
+                             uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint tpg [[threads_per_threadgroup]]) {
+  threadgroup float sm[8];
+  const uint H4 = H >> 2;
+  device float4* hr = h + size_t(row) * H4;
+  device const float4* yr = y + size_t(row) * H4;
+  float s2 = 0.0f;
+  for (uint c = tid; c < H4; c += tpg) {
+    const float4 v = float4(bfloat4(hr[c] + yr[c]));
+    hr[c] = v;
+    s2 += dot(v, v);
+  }
+  s2 = simd_sum(s2);
+  if ((tid & 31u) == 0u) sm[tid >> 5] = s2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float t = 0.0f;
+    for (uint i = 0; i < (tpg >> 5); i++) t += sm[i];
+    sm[0] = rsqrt(t / float(H) + eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = sm[0];
+  for (uint c4 = tid; c4 < H4; c4 += tpg) {
+    const bfloat4 bv = bfloat4(hr[c4] * inv * w[c4]);
+    const uint c = c4 << 2;
+    frag[frag_off(row, c + 0u, H)] = bv.x;
+    frag[frag_off(row, c + 1u, H)] = bv.y;
+    frag[frag_off(row, c + 2u, H)] = bv.z;
+    frag[frag_off(row, c + 3u, H)] = bv.w;
+    if (write_f32) f32_out[size_t(row) * H4 + c4] = float4(bv);
+  }
 }
 
-// M7a. Build Markov RNN input [5120] = [state(256) | markov_w1[prev_tok](256) | base_h[step+1](2304) | f_rnn(2304)]
-//      and project through rnn_proj [768, 5120] + bias -> rnn_out [768].
-// Grid: (24, 1, 1), TG: 128 threads (4 simdgroups x 32 -> 4 rows/TG -> 96 rows? Use Grid (768/4=192) -> 4 rows/TG).
+// M7a-static. Precompute static Markov RNN projection ONCE for all gamma steps:
+//             static_out[k, out_r] = dot(base_h[k+1], W_bh[out_r]) + dot(f_rnn, W_fr[out_r]) + rnn_b[out_r].
+//             Reads W_bh & W_fr (7.08 MB) ONCE instead of 7 times (saves 42.5 MB/round!).
+// Grid: ((3*R + 3) / 4, 1, 1), TG: 128 threads (4 simdgroups, 1 out_r per simdgroup).
 struct RnnArgs {
-  uint H, R, step;  // R=256, H=2304
+  uint H, R, step;  // R=256, H=2304; for static, step = gamma (1..7)
 };
-kernel void ink_mtp_rnn_proj(device const float* state [[buffer(0)]],
-                             device const bfloat* markov_w1 [[buffer(1)]],
-                             device const uint* prev_tok_buf [[buffer(2)]],
-                             device const float* base_h [[buffer(3)]],  // [B, H]
-                             device const float* f_rnn [[buffer(4)]],   // [H]
-                             device const bfloat4* rnn_w [[buffer(5)]], // [3*R, (2*R+2*H)/4]
-                             device const float* rnn_b [[buffer(6)]],   // [3*R]
-                             device float* proj_out [[buffer(7)]],      // [3*R]
-                             constant RnnArgs& a [[buffer(8)]],
-                             uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+kernel void ink_mtp_rnn_static(device const float* base_h [[buffer(0)]],  // [B, H]
+                               device const float* f_rnn [[buffer(1)]],   // [H]
+                               device const bfloat4* rnn_w [[buffer(2)]], // [3*R, (2*R+2*H)/4]
+                               device const float* rnn_b [[buffer(3)]],   // [3*R]
+                               device float* static_out [[buffer(4)]],    // [gamma, 3*R]
+                               constant RnnArgs& a [[buffer(5)]],
+                               uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   const uint sg = tid >> 5, lane = tid & 31u;
   const uint out_r = tg * 4u + sg;
   if (out_r >= 3u * a.R) return;
 
   const uint R4 = a.R >> 2, H4 = a.H >> 2;
-  const uint in4 = 2u * R4 + 2u * H4;  // 5120 / 4 = 1280
+  const uint in4 = 2u * R4 + 2u * H4;
+  const uint gamma = a.step;
+  device const bfloat4* wr = rnn_w + size_t(out_r) * in4;
+  device const float4* fr4 = (device const float4*)f_rnn;
+
+  float f_acc = 0.0f;
+  for (uint c = lane; c < H4; c += 32u) f_acc += dot(fr4[c], float4(wr[2u * R4 + H4 + c]));
+  const float f_dot = simd_sum(f_acc) + rnn_b[out_r];
+
+  float acc[7] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  for (uint c = lane; c < H4; c += 32u) {
+    const float4 wv = float4(wr[2u * R4 + c]);
+    for (uint k = 0; k < gamma; k++) {
+      device const float4* bh4 = (device const float4*)(base_h + size_t(k + 1u) * a.H);
+      acc[k] += dot(bh4[c], wv);
+    }
+  }
+  for (uint k = 0; k < gamma; k++) {
+    const float v = simd_sum(acc[k]);
+    if (lane == 0u) static_out[size_t(k) * (3u * a.R) + out_r] = v + f_dot;
+  }
+}
+
+// M7a-dyn. Dynamic Markov RNN projection (only state[256] + markov_w1[prev_tok][256] = 0.78 MB -> 10x smaller!).
+// Grid: ((3*R + 3) / 4, 1, 1), TG: 128 threads.
+kernel void ink_mtp_rnn_dyn(device const float* state [[buffer(0)]],
+                            device const bfloat* markov_w1 [[buffer(1)]],
+                            device const uint* prev_tok_buf [[buffer(2)]],
+                            device const float* static_in [[buffer(3)]],  // [gamma, 3*R]
+                            device const bfloat4* rnn_w [[buffer(4)]],    // [3*R, (2*R+2*H)/4]
+                            device float* proj_out [[buffer(5)]],         // [3*R]
+                            constant RnnArgs& a [[buffer(6)]],
+                            uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint out_r = tg * 4u + sg;
+  if (out_r >= 3u * a.R) return;
+
+  const uint R4 = a.R >> 2, H4 = a.H >> 2;
+  const uint in4 = 2u * R4 + 2u * H4;
   const uint tok = prev_tok_buf[0];
   device const float4* st4 = (device const float4*)state;
   device const bfloat4* mw4 = (device const bfloat4*)(markov_w1 + size_t(tok) * a.R);
-  device const float4* bh4 = (device const float4*)(base_h + size_t(a.step + 1u) * a.H);
-  device const float4* fr4 = (device const float4*)f_rnn;
   device const bfloat4* wr = rnn_w + size_t(out_r) * in4;
 
   float acc = 0.0f;
-  for (uint c = lane; c < R4; c += 32u) acc += dot(st4[c], float4(wr[c]));
-  for (uint c = lane; c < R4; c += 32u) acc += dot(float4(mw4[c]), float4(wr[R4 + c]));
-  for (uint c = lane; c < H4; c += 32u) acc += dot(bh4[c], float4(wr[2u * R4 + c]));
-  for (uint c = lane; c < H4; c += 32u) acc += dot(fr4[c], float4(wr[2u * R4 + H4 + c]));
+  for (uint c = lane; c < R4; c += 32u) {
+    acc += dot(st4[c], float4(wr[c])) + dot(float4(mw4[c]), float4(wr[R4 + c]));
+  }
   acc = simd_sum(acc);
-  if (lane == 0u) proj_out[out_r] = acc + rnn_b[out_r];
+  if (lane == 0u) proj_out[out_r] = acc + static_in[size_t(a.step) * (3u * a.R) + out_r];
 }
 
 // M7b. RNN gates update: state' = sigm(g)*state + (1-sigm(g))*tanh(c), latent = tanh(o) -> bf16 frag (M=1, K=256).
@@ -1382,21 +1449,20 @@ kernel void ink_mtp_rnn_gates(device const float* proj [[buffer(0)]],
   lat_frag[frag_off(0u, tid, R)] = bfloat(o);
 }
 
-// M8. Add base_logits[step] + bias + fold_b -> softcap(30) -> argmax + online p_max.
-// Grid: (1, 1, 1), TG: 256 threads.
+// M8. Parallel 2-stage add base_logits[step] + bias + fold_b -> softcap(30) -> argmax + online p_max.
+// Stage 1: Grid (64, 1, 1), TG 256 threads -> 16,384 threads!
 struct MtpPickArgs {
   uint V_valid, V_pad, step;
   float cap;
 };
-kernel void ink_mtp_add_argmax(device const float* base_logits [[buffer(0)]],
-                               device const float* bias [[buffer(1)]],
-                               device const float* fold_b [[buffer(2)]],
-                               device uint* prev_tok_buf [[buffer(3)]],
-                               device uint* draft_out [[buffer(4)]],
-                               device float* draft_probs [[buffer(5)]],
-                               constant MtpPickArgs& a [[buffer(6)]],
-                               uint tid [[thread_index_in_threadgroup]],
-                               uint tpg [[threads_per_threadgroup]]) {
+kernel void ink_mtp_add_argmax_p1(device const float* base_logits [[buffer(0)]],
+                                  device const float* bias [[buffer(1)]],
+                                  device const float* fold_b [[buffer(2)]],
+                                  device float* part_v [[buffer(3)]],
+                                  device uint* part_i [[buffer(4)]],
+                                  device float* part_l [[buffer(5)]],
+                                  constant MtpPickArgs& a [[buffer(6)]],
+                                  uint blk [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   threadgroup float sm_v[8];
   threadgroup uint sm_i[8];
   threadgroup float sm_l[8];
@@ -1405,7 +1471,8 @@ kernel void ink_mtp_add_argmax(device const float* base_logits [[buffer(0)]],
   uint bi = 0u;
   float lsum = 0.0f;
   const float inv_cap = 1.0f / a.cap;
-  for (uint v = tid; v < a.V_valid; v += tpg) {
+  const uint stride = 64u * 256u;
+  for (uint v = blk * 256u + tid; v < a.V_valid; v += stride) {
     const float val = tanh((bl[v] + bias[v] + fold_b[v]) * inv_cap) * a.cap;
     if (val > bv) {
       lsum = lsum * exp(bv - val) + 1.0f;
@@ -1415,25 +1482,60 @@ kernel void ink_mtp_add_argmax(device const float* base_logits [[buffer(0)]],
       lsum += exp(val - bv);
     }
   }
-  // Merge online (bv, bi, lsum) across simdgroup
   for (ushort d = 16; d > 0; d >>= 1) {
     const float ov = simd_shuffle_down(bv, d);
     const uint oi = simd_shuffle_down(bi, d);
     const float ol = simd_shuffle_down(lsum, d);
     const float mn = max(bv, ov);
     lsum = lsum * exp(bv - mn) + ol * exp(ov - mn);
-    if (ov > bv) { bv = ov; bi = oi; }
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
   }
   if ((tid & 31u) == 0u) { sm_v[tid >> 5] = bv; sm_i[tid >> 5] = bi; sm_l[tid >> 5] = lsum; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0u) {
     float fv = sm_v[0], fl = sm_l[0];
     uint fi = sm_i[0];
-    for (uint i = 1; i < (tpg >> 5); i++) {
+    for (uint i = 1; i < 8u; i++) {
       const float mn = max(fv, sm_v[i]);
       fl = fl * exp(fv - mn) + sm_l[i] * exp(sm_v[i] - mn);
-      if (sm_v[i] > fv) { fv = sm_v[i]; fi = sm_i[i]; }
+      if (sm_v[i] > fv || (sm_v[i] == fv && sm_i[i] < fi)) { fv = sm_v[i]; fi = sm_i[i]; }
     }
+    part_v[blk] = fv;
+    part_i[blk] = fi;
+    part_l[blk] = fl;
+  }
+}
+
+// Stage 2: Grid (1, 1, 1), TG 64 threads -> reduces 64 online-softmax partials.
+kernel void ink_mtp_add_argmax_p2(device const float* part_v [[buffer(0)]],
+                                  device const uint* part_i [[buffer(1)]],
+                                  device const float* part_l [[buffer(2)]],
+                                  device uint* prev_tok_buf [[buffer(3)]],
+                                  device uint* draft_out [[buffer(4)]],
+                                  device float* draft_probs [[buffer(5)]],
+                                  constant MtpPickArgs& a [[buffer(6)]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float sm_v[2];
+  threadgroup uint sm_i[2];
+  threadgroup float sm_l[2];
+  float bv = part_v[tid];
+  uint bi = part_i[tid];
+  float lsum = part_l[tid];
+  for (ushort d = 16; d > 0; d >>= 1) {
+    const float ov = simd_shuffle_down(bv, d);
+    const uint oi = simd_shuffle_down(bi, d);
+    const float ol = simd_shuffle_down(lsum, d);
+    const float mn = max(bv, ov);
+    lsum = lsum * exp(bv - mn) + ol * exp(ov - mn);
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+  }
+  if ((tid & 31u) == 0u) { sm_v[tid >> 5] = bv; sm_i[tid >> 5] = bi; sm_l[tid >> 5] = lsum; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    const float mn = max(sm_v[0], sm_v[1]);
+    const float fl = sm_l[0] * exp(sm_v[0] - mn) + sm_l[1] * exp(sm_v[1] - mn);
+    const bool pick1 = (sm_v[1] > sm_v[0]) || (sm_v[1] == sm_v[0] && sm_i[1] < sm_i[0]);
+    const uint fi = pick1 ? sm_i[1] : sm_i[0];
     prev_tok_buf[0] = fi;
     draft_out[a.step] = fi;
     draft_probs[a.step] = 1.0f / max(fl, 1.0f);

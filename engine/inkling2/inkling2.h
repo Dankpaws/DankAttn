@@ -125,7 +125,8 @@ struct Model {
   id<MTLComputePipelineState> p_mmpg_fp8_gu, p_mmpg_fp8_dn;
   // DSpark pipelines
   id<MTLComputePipelineState> p_mtp_mix, p_mtp_kv_ctx, p_mtp_embed, p_mtp_qkv_rope;
-  id<MTLComputePipelineState> p_mtp_attn, p_add_f32, p_mtp_rnn_proj, p_mtp_rnn_gates, p_mtp_add_argmax;
+  id<MTLComputePipelineState> p_mtp_attn, p_add_rms_frag, p_mtp_rnn_static, p_mtp_rnn_dyn, p_mtp_rnn_gates;
+  id<MTLComputePipelineState> p_mtp_add_argmax_p1, p_mtp_add_argmax_p2;
   id<MTLResidencySet> rs = nil;
 
   // Scratch buffers (sized for MAXM = 16)
@@ -145,7 +146,8 @@ struct Model {
   id<MTLBuffer> b_mtp_h, b_mtp_frag, b_mtp_qkv, b_mtp_kv_ctx, b_mtp_Q, b_mtp_K_blk, b_mtp_V_blk;
   id<MTLBuffer> b_mtp_o_frag, b_mtp_o_out, b_mtp_gu_frag, b_mtp_dn_out;
   id<MTLBuffer> b_mtp_base_h, b_mtp_base_logits, b_mtp_bias;
-  id<MTLBuffer> b_mtp_rnn_state, b_mtp_rnn_proj, b_mtp_lat_frag, b_mtp_prev_tok, b_mtp_draft_out, b_mtp_draft_probs;
+  id<MTLBuffer> b_mtp_rnn_state, b_mtp_rnn_static, b_mtp_rnn_proj, b_mtp_lat_frag;
+  id<MTLBuffer> b_mtp_prev_tok, b_mtp_draft_out, b_mtp_draft_probs, b_mtp_part_l;
 
   void load(const std::string& pack_dir, uint32_t max_cap = 32768, uint32_t passes_override = 0, bool kv8 = true);
   void reset();
