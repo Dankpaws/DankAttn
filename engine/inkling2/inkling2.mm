@@ -81,6 +81,7 @@ struct SampRow { uint32_t N, ld, pos, s0, s1; float inv_t, lmin, top_p; uint32_t
 // Split-K (Lin.ksplit > 1, dense M <= 16 only): per-split partials and self-resetting last-arrival counters for
 // mm2's reduce, allocated at load.
 static id<MTLBuffer> g_mmpart = nil, g_mmcnt = nil;
+static bool g_big_gpu = false;
 static constexpr size_t kSplitPartBytes = size_t(16) * 16u * 8192u * sizeof(float);  // per pslot: ksplit <= 16, N <= 8192
 static constexpr size_t kSplitCntBytes = size_t(1) << 14;                            // per pslot
 
@@ -107,11 +108,11 @@ void enc_mm2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
     a.ystride = ystride_f;
     a.rm = 1;
   }
-  // INK_NFT: 32-column fragments per threadgroup (layout only, same bits). 1 (default): one, measured -0.08 ms
-  // over the per-call choice at ctx 512 M=1; 2: two where possible; 0: the per-call choice (prefer_nft1).
-  static const int nft_force = getenv("INK_NFT") ? atoi(getenv("INK_NFT")) : 1;
-  if (nft_force == 1) prefer_nft1 = true;
-  if (nft_force == 2) prefer_nft1 = false;
+  // INK_NFT: 32-column fragments per threadgroup (layout only, same bits). Default 1 on Ultra/Max (measured -0.08 ms
+  // at ctx 512 M=1), 0 on Base M5 (per-call choice, nft=2 where possible).
+  static const int nft_env = getenv("INK_NFT") ? atoi(getenv("INK_NFT")) : -1;
+  if (nft_env == 1 || (nft_env == -1 && g_big_gpu)) prefer_nft1 = true;
+  else if (nft_env == 2) prefer_nft1 = false;
   const bool use_nft2 = !prefer_nft1 && ((lin.N / 32u) % 2u == 0u && lin.sgs <= 4u);
   const uint32_t nsg = use_nft2 ? (lin.sgs * 2u) : lin.sgs;
   const uint32_t nft = nsg / lin.sgs;
@@ -250,6 +251,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   {
     NSString* dname = [C.dev name];
     big_gpu = dname && ([dname containsString:@"Ultra"] || [dname containsString:@"Max"]);
+    g_big_gpu = big_gpu;
     // Decode attention key splits (one serial key chain per simdgroup, so more splits = shorter chains). M5 Ultra
     // 2026-11-22, 12/24 -> 24/64: ctx 512 +0.05 ms, 8k -0.39, 30k -1.18 (13.55 -> 12.37 ms); 96/128 global splits
     // lose to the longer reduce. Base M5 keeps 8/8 (not re-measured).
@@ -339,11 +341,10 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     else if (units % 3u == 0u) ln.sgs = 3;
     else if (units % 2u == 0u) ln.sgs = 2;
     else ln.sgs = 1;
-    // Decode split table (INK_SPLIT_TAB=0 drops it): measured 2026-11-22 on M5 Ultra, ctx 512 M=1, against the
-    // sgs heuristic above: attn.o 1 x 12 -0.33 ms, NVFP4 moe gu / dn sgs 2 -0.22 / -0.12 ms, together -0.73 ms
-    // (with INK_NFT 1: -0.76). Teacher-forced NLL moves within the reordering noise (+0.0036 / +0.0001 nats on two
-    // 8k-token texts; other reorders scatter -0.0007 .. +0.0027).
-    if (!(getenv("INK_SPLIT_TAB") && atoi(getenv("INK_SPLIT_TAB")) == 0)) {
+    // Decode split table (default on for Ultra/Max, off for Base M5 where 10 cores lose ~1.4 ms to 12-way o_proj
+    // split atomics; INK_SPLIT_TAB=0/1 overrides): measured 2026-11-22 on M5 Ultra, ctx 512 M=1 (-0.73 ms).
+    const bool use_split_tab = getenv("INK_SPLIT_TAB") ? (atoi(getenv("INK_SPLIT_TAB")) != 0) : big_gpu;
+    if (use_split_tab) {
       static const uint32_t tab[][5] = {{8, 2304, 3072, 1, 12}, {40, 2304, 2304, 2, 1}, {40, 2304, 1152, 2, 1}};
       for (const auto& r : tab)
         if (r[0] == ln.bits && r[1] == ln.N && r[2] == ln.K && units % (r[3] * r[4]) == 0) {
@@ -1209,7 +1210,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   static const bool fuse = getenv("INK_FUSE") && atoi(getenv("INK_FUSE")) != 0;
   // Batch all n_core*4 loop messages per pass + skip tap-capture barriers + fused final attn_res_rms (default on, bit-identical).
   static const bool batch_msg = !(getenv("INK_BATCH_MSG") && atoi(getenv("INK_BATCH_MSG")) == 0);
-  // Replicated-row stream fusions for M <= 16 (default 15 = all 4 on, bit-identical):
+  // Replicated-row stream fusions for M <= 16 (default 15 = all 4 on; wins on both Ultra and Base M5, bit-identical):
   //   1: attn_res+rms+scores (plain), 2: rms+scores (msg), 4: attn_res+mg_down (msg mlp), 8: attn_res+mg_down3 (msg attn).
   static const uint32_t stream_fuse = getenv("INK_STREAM_FUSE") ? uint32_t(atoi(getenv("INK_STREAM_FUSE"))) : 15u;
   // Fuse post-attention sconv + residual/boundary into o_proj mm2 epilogue (single-lane M <= 16, bit-identical).
@@ -1676,10 +1677,10 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       a.H = ly.is_boundary ? 1u : 0u;
       a.HC = n_blocks;
       a.pf_z0 = ~0u;
-      static const int nft_force = getenv("INK_NFT") ? atoi(getenv("INK_NFT")) : 1;
+      static const int nft_env = getenv("INK_NFT") ? atoi(getenv("INK_NFT")) : -1;
       bool pref1 = big_gpu;
-      if (nft_force == 1) pref1 = true;
-      if (nft_force == 2) pref1 = false;
+      if (nft_env == 1) pref1 = true;
+      else if (nft_env == 2) pref1 = false;
       const bool use_nft2 = !pref1 && ((a.N / 32u) % 2u == 0u && a.sgs <= 4u);
       const uint32_t nsg = use_nft2 ? (a.sgs * 2u) : a.sgs;
       const uint32_t nft = nsg / a.sgs;

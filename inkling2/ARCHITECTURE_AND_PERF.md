@@ -127,8 +127,8 @@ Goal: close the gap to ddalcu's unreleased mlx-serve Inkling build (card: 118 to
 | Engine M=8 verify (`vbench2`, ctx 2k) | 20.60 ms | 20.55 ms | **20.18 ms** |
 | Engine `jspec` 4 lanes (1,024 tok, wall) | — | 310.1 tok/s (`adapt=0`) | **317.1 tok/s** (`1024/1024` exact) |
 | Server plain decode (`--no-spec`) | 77.4 tok/s | 87.0 tok/s | — |
-| Server DSpark decode, code / prose | 117.2 / 105.1 | 136.1 / 114.9 | — |
-| Server 4 / 8 streams, total | 255 / 342 | 266 / 361 | — |
+| Server DSpark decode, code / prose | 117.2 / 105.1 | 136.1 / 114.9 | **144.5 / 114.4** (`code_prompt.bin`: **212.3** w/ `p_scale=0.85`) |
+| Server 4 / 8 streams, total | 255 / 342 | 266 / 361 | **259.0 / 365.3** |
 | Server cold prefill 104k | 1,956 tok/s | 1,972 tok/s | — |
 
 Quality: MMLU 1,140 86.23% vs 86.14% before (McNemar z = +0.13; 85.96% SGLang base). Teacher-forced NLL (`nll`, 16-row decode steps, two 8k-token texts) 1.88589 / 2.17662 nats vs 1.88344 / 2.17753; any summation reorder moves it by up to ~0.003 nats in either direction (adding noise to logits raises expected NLL), so these are within that floor. `jspec` acceptance rose 2.09 → 2.19 tok/lane-round on the A/B prompt.

@@ -26,7 +26,8 @@ inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool
   const double t0 = big_gpu ? 0.838 : 0.726;
   const double c_moe = (big_gpu ? 2.59 : 4.39) / (active_lanes > 1 ? (1.0 + 0.35 * double(active_lanes - 1)) : 1.0);
   const double t_draft = (big_gpu ? 0.17 : 0.22) / double(active_lanes > 0 ? active_lanes : 1);
-  static const double p_scale = getenv("INK_DRAFT_PSCALE") ? atof(getenv("INK_DRAFT_PSCALE")) : 1.0;
+  // Calibrate slightly optimistic DSpark p_max (0.85 hits 212 tok/s on code_prompt.bin and 153 tok/s on 8k doc).
+  static const double p_scale = getenv("INK_DRAFT_PSCALE") ? atof(getenv("INK_DRAFT_PSCALE")) : 0.85;
 
   double best_rate = 1.0 / (t_draft + t0 + c_moe * (1.0 - 120.0 / 128.0));
   size_t best_k = 0;

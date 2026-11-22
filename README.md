@@ -80,10 +80,10 @@ Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`
 | `vtest` (`M=5` vs `M=1`) / `ctest` (SSD prefix) | `0.000e+00` (**BIT-EXACT**) | `0.000e+00` (**BIT-EXACT**) |
 | Prefill 2,048 / 8,192 / 32,768 tok (`MP=512`) | **4,588 / 4,288 / 3,371 tok/s GPU** | **730 / 719 tok/s GPU** (2k / 8k) |
 | Decode `M=1` (`ctx=512 / 2k / 8k`) | **93.3 / 90.6 / 89.4 tok/s GPU** (`90.6 / 88.2 / 86.9` wall) | **25.8 / 24.8 / 24.5 tok/s GPU** |
-| Speculative (`code_prompt.bin`, 256 tok) | **204.9+ tok/s wall** (256/256 exact) | **46.3 tok/s wall** (256/256 exact) |
+| Speculative (`code_prompt.bin`, 256 tok) | **212.3 tok/s wall** (256/256 exact) | **46.3 tok/s wall** (256/256 exact) |
 | Multi-lane (`jspec` 4 lanes / `lbench` 16 lanes) | **317.1 tok/s wall** (1024/1024 exact) / **501 tok/s GPU** | **65.8 tok/s wall** (4 lanes) |
 | Parallel Section Fill (`:4x-fast` / `:8x-fast`, live SSE) | **319.0 / 343.6 eff visible tok/s** (TTFT 1.55–2.15 s) | — |
-| SSD Prefix Cache restore (`ctest`, 8,000 tok) | **20.9 ms** (346 MB, `0.000e+00` exact) | — |
+| SSD Prefix Cache restore (`ctest`, 1.5k / 8k tok) | **12.8 ms / 20.9 ms** (211 / 346 MB, `0.000e+00` exact) | **23.0 ms** (1.5k, `0.000e+00` exact) |
 
 ```sh
 # Build & verify
