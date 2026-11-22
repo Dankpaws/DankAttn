@@ -4,12 +4,48 @@
 #pragma once
 #include "../mtl.h"
 #include "../mm_args.h"
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
 
 namespace ink2 {
+
+// Fan-out-aware expected-tokens/ms draft length selector (exactness-preserving: only trims draft count k in 0..K).
+// Models 128-expert top-8 MoE verify cost T(M) = t0 + c_moe * (1 - (120/128)^M) plus draft overhead t_draft.
+// Set INK_DRAFT_ADAPT=0 to fall back to the legacy per-token threshold `dp[k] >= draft_cut`.
+inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool big_gpu, uint32_t active_lanes = 1) {
+  static const int adapt = getenv("INK_DRAFT_ADAPT") ? atoi(getenv("INK_DRAFT_ADAPT")) : 1;
+  if (adapt == 0 || dp.empty()) {
+    size_t keep = 0;
+    while (keep < dp.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
+    return keep;
+  }
+  const double t0 = big_gpu ? 0.838 : 0.726;
+  const double c_moe = (big_gpu ? 2.59 : 4.39) / (active_lanes > 1 ? (1.0 + 0.35 * double(active_lanes - 1)) : 1.0);
+  const double t_draft = (big_gpu ? 0.17 : 0.22) / double(active_lanes > 0 ? active_lanes : 1);
+  static const double p_scale = getenv("INK_DRAFT_PSCALE") ? atof(getenv("INK_DRAFT_PSCALE")) : 1.0;
+
+  double best_rate = 1.0 / (t_draft + t0 + c_moe * (1.0 - 120.0 / 128.0));
+  size_t best_k = 0;
+  double cum_p = 1.0;
+  double exp_tok = 1.0;
+  double miss = 120.0 / 128.0;
+  for (size_t k = 0; k < dp.size(); k++) {
+    const double pk = std::min(1.0, std::max(0.0, double(dp[k]) * p_scale));
+    cum_p *= pk;
+    exp_tok += cum_p;
+    miss *= (120.0 / 128.0);
+    const double rate = exp_tok / (t_draft + t0 + c_moe * (1.0 - miss));
+    if (rate > best_rate) {
+      best_rate = rate;
+      best_k = k + 1;
+    }
+  }
+  return best_k;
+}
 
 constexpr uint32_t MAXM = 16;   // rows per decode / verify step (mm2)
 constexpr uint32_t MTP_MAXL = 8; // max lanes in one batched DSpark draft call

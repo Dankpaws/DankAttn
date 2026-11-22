@@ -111,19 +111,25 @@ Goal: close the gap to ddalcu's unreleased mlx-serve Inkling build (card: 118 to
 | Split table: attn.o 1 sgs × 12 ksplit, NVFP4 moe gu/dn 2 sgs (`INK_SPLIT_TAB`, `INK_SPLITS`); mm2 split-K partials/counters per `pslot` (qgrs ∥ k ∥ v need disjoint ones); prefill replays ksplit | −0.73 ms | reorder; vtest/jspec/ltest/forktest exact |
 | One 32-column fragment per threadgroup (`INK_NFT`, default 1) | −0.08 ms | bit-identical |
 | Attention key splits 12/24 → 24 local / 64 global (`INK_NSP_LOCAL/GLOBAL`, `ASPLITS` 64) | ctx 512 +0.05, 8k −0.39, 30k −1.18 ms | reorder |
+| Batched cross-pass `loop_msg` `p_attn_res` (1 dispatch/pass overlapped with restore copies) + tap-capture barrier removal + fused final `attn_res_rms` (`INK_BATCH_MSG`, `aef2b30`) | −0.14 ms M=1 | bit-identical |
+| Replicated-row multi-TG stream fusions (`INK_STREAM_FUSE=15`: `attn_res_rms_scores`, `rms_scores`, `attn_res_mg_down`, `attn_res_mg_down3`, `rms_frag3`, `aef2b30`) | −0.29 ms M=1, −0.40 ms M=8 verify | bit-identical |
+| `o_proj` `mm2` `EPI=4` post-attn `sconv` + residual/boundary epilogue (`INK_FUSE_OCONV`, single-lane `M=1`, `aef2b30`) | −0.07 ms M=1 | bit-identical |
+| Fan-out-aware expected-tok/ms DSpark draft length selector (`select_draft_k`, `INK_DRAFT_ADAPT=1`) | `spec` greedy 150.6 → 152.8, `T=1.0` 107.0 → 109.6, 4-lane `jspec` 310.1 → 317.1 tok/s | 100% exact |
 
-**Rejected** (measured, then removed or left off): decode fusions accum + MLP post-sconv and attn post-sconv + pre-MLP attn_res (`INK_FUSE=1`, bit-identical, +0.2 ms: the fused single-TG kernels cost more than the ~4 µs phases they absorb); last-arrival phase merges for router scores + top-k (−0.04 ms) and attention split + reduce (+1.35 ms: device atomics for partials are expensive); `PF` 2/4/8 weight prefetch (+0.3 to +8 ms, register pressure); NVFP4 E2M1 from bits instead of the constant LUT (+1.9 ms) and scale slab via simd shuffles (+0.6 ms); more simdgroups per MoE threadgroup (sgs 8/12: +0.5–1.3 ms); q/k/v and `lm_head` split changes (±0.05); attn_res block loop with loads hoisted ahead of the simd sums (no change, the compiler already overlaps them); commits every k layers (no change); 96/128 global attention splits (the reduce gets longer).
+**Rejected** (measured, then removed or left off): decode fusions accum + MLP post-sconv and attn post-sconv + pre-MLP attn_res (`INK_FUSE=1`, bit-identical, +0.2 ms: the fused single-TG kernels cost more than the ~4 µs phases they absorb); single-TG `mg_apply_rms` (+0.68–1.30 ms: 1 TG reading 1.18 MB starves the GPU); single-phase local SWA-1024 decode attention `ink_attn_dec_local_1p` (+0.42 ms at ctx 2k / +0.40 ms at M=8: 24-split GQA's 192 TGs win at full window); GQA `G=3` shared-KV prefill attention `ink_attn_pf_mma_gqa` (byte-identical on `lgdump`, but −10% @2k / −13% @8k / −18% @32k: 3× live cooperative tensors + 6 barriers/tile make prefill attention compute/occupancy-bound, not KV-bandwidth-bound); last-arrival phase merges for router scores + top-k (−0.04 ms) and attention split + reduce (+1.35 ms: device atomics for partials are expensive); `PF` 2/4/8 weight prefetch (+0.3 to +8 ms, register pressure); NVFP4 E2M1 from bits instead of the constant LUT (+1.9 ms) and scale slab via simd shuffles (+0.6 ms); more simdgroups per MoE threadgroup (sgs 8/12: +0.5–1.3 ms); q/k/v and `lm_head` split changes (±0.05); attn_res block loop with loads hoisted ahead of the simd sums (no change, the compiler already overlaps them); commits every k layers (no change); 96/128 global attention splits (the reduce gets longer).
 
 **Result** (M5 Ultra; engine `bench`, `INK_CAP=32768`; server = `inkling2_server.py` production profile, bake-off `bench.py`):
 
-| | Before (`d4b551e`) | After (`a501d5d`) |
-| :--- | :---: | :---: |
-| Engine M=1, ctx 512: GPU ms / wall tok/s | 12.21 / 76.4 | 11.20 / 86.8 |
-| Engine M=1 GPU ms, ctx 8k / 30k | 13.11 / 13.55 | 11.66 / 12.37 |
-| Server plain decode (`--no-spec`) | 77.4 tok/s | 87.0 tok/s |
-| Server DSpark decode, code / prose | 117.2 / 105.1 | 136.1 / 114.9 |
-| Server 4 / 8 streams, total | 255 / 342 | 266 / 361 |
-| Server cold prefill 104k | 1,956 tok/s | 1,972 tok/s |
+| | Before (`d4b551e`) | After (`a501d5d`) | Stream Fusion + Adapt (`aef2b30`+) |
+| :--- | :---: | :---: | :---: |
+| Engine M=1, ctx 512: GPU ms / wall tok/s | 12.21 / 76.4 | 11.20 / 86.8 | **10.72 / 90.6** (`10.45 / 93.0` w/ `INK_MOE_GEMV=1`) |
+| Engine M=1 GPU ms, ctx 8k / 30k | 13.11 / 13.55 | 11.66 / 12.37 | **11.19** (8k) / — |
+| Engine M=8 verify (`vbench2`, ctx 2k) | 20.60 ms | 20.55 ms | **20.18 ms** |
+| Engine `jspec` 4 lanes (1,024 tok, wall) | — | 310.1 tok/s (`adapt=0`) | **317.1 tok/s** (`1024/1024` exact) |
+| Server plain decode (`--no-spec`) | 77.4 tok/s | 87.0 tok/s | — |
+| Server DSpark decode, code / prose | 117.2 / 105.1 | 136.1 / 114.9 | — |
+| Server 4 / 8 streams, total | 255 / 342 | 266 / 361 | — |
+| Server cold prefill 104k | 1,956 tok/s | 1,972 tok/s | — |
 
 Quality: MMLU 1,140 86.23% vs 86.14% before (McNemar z = +0.13; 85.96% SGLang base). Teacher-forced NLL (`nll`, 16-row decode steps, two 8k-token texts) 1.88589 / 2.17662 nats vs 1.88344 / 2.17753; any summation reorder moves it by up to ~0.003 nats in either direction (adding noise to logits raises expected NLL), so these are within that floor. `jspec` acceptance rose 2.09 → 2.19 tok/lane-round on the A/B prompt.
 

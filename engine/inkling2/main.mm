@@ -439,8 +439,7 @@ int main(int argc, char** argv) {
           for (size_t di = 0; di < dreqs.size(); di++) {
             auto& dr = d_out[di];
             const auto& dp = d_probs[di];
-            uint32_t keep = 0;
-            while (keep < dr.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
+            const uint32_t keep = uint32_t(ink2::select_draft_k(dp, draft_cut, M.big_gpu, uint32_t(act.size())));
             dr.resize(std::min<uint32_t>(keep, budget - 1u));
             lane_drafts[dmap[di]] = std::move(dr);
           }
@@ -672,8 +671,7 @@ int main(int argc, char** argv) {
           pending_commit = 0;
           t_draft += dms;
           if (draft_cut > 0.0f) {
-            uint32_t keep = 0;
-            while (keep < drafts.size() && dprobs[keep] >= draft_cut) keep++;
+            const uint32_t keep = uint32_t(ink2::select_draft_k(dprobs, draft_cut, M.big_gpu, 1u));
             drafts.resize(keep);
           }
         } else if (pending_commit > 0) {

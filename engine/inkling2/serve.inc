@@ -441,8 +441,7 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
       for (size_t di = 0; di < dreqs.size(); di++) {
         auto& dr = d_out[di];
         const auto& dp = d_probs[di];
-        uint32_t keep = 0;
-        while (keep < dr.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
+        const uint32_t keep = uint32_t(ink2::select_draft_k(dp, draft_cut, m.big_gpu, uint32_t(step_idx.size())));
         dr.resize(std::min<uint32_t>(keep, budget - 1u));
         lane_drafts[dreq_map[di]] = std::move(dr);
       }
@@ -831,8 +830,7 @@ int main(ink2::Model& m) {
           for (size_t di = 0; di < dreqs.size(); di++) {
             auto& dr = d_out[di];
             const auto& dp = d_probs[di];
-            uint32_t keep = 0;
-            while (keep < dr.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
+            const uint32_t keep = uint32_t(ink2::select_draft_k(dp, draft_cut, m.big_gpu, uint32_t(step_idx.size())));
             dr.resize(std::min<uint32_t>(keep, budget - 1u));
             lane_drafts[dreq_map[di]] = std::move(dr);
           }
