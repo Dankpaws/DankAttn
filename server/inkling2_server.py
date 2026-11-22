@@ -37,6 +37,12 @@ ap.add_argument("--min-p", type=float, default=float(os.environ.get("DANKATTN_MI
                 help="min_p when a request sets none (0: off); at temperature 1.0 over a 200k vocabulary it keeps junk tail tokens out")
 ap.add_argument("--thinking-budget", type=int, default=int(os.environ.get("DANKATTN_THINK_BUDGET", "0")),
                 help="default cap on thinking tokens (0: none); a request's thinking_budget overrides it")
+ap.add_argument("--power", choices=("auto", "performance", "eco"), default=os.environ.get("INK_POWER", "auto"),
+                help="power profile: auto (eco on battery/Low Power Mode, performance on AC), performance, or eco")
+ap.add_argument("--no-eco-draft", action="store_true",
+                help="keep speed-maximizing DSpark draft lengths even in eco/battery mode (INK_ECO_DRAFT=0)")
+ap.add_argument("--idle-unload", type=float, default=float(os.environ.get("DANKATTN_IDLE_UNLOAD", "0")),
+                help="unload engine after N seconds idle (saves Lane 0 to pcache, wakes on next request; 0: off)")
 args = ap.parse_args()
 
 tok = Tokenizer.from_file(os.path.join(args.pack, "tokenizer.json"))
@@ -57,12 +63,17 @@ CONTENT = {T("<|content_text|>"): "text", T("<|content_thinking|>"): "think",
 STOPS = [EOS, T("<|message_user|>"), T("<|message_system|>"), T("<|message_tool|>")]
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
+_eng_env = dict(os.environ, INK_CAP=str(args.cap), INK_LANES=str(args.lanes), INK_POWER=args.power)
+if args.no_eco_draft:
+    _eng_env["INK_ECO_DRAFT"] = "0"
+
 eng = EngineProc(
     [args.engine, args.pack, "serve"],
-    env=dict(os.environ, INK_CAP=str(args.cap), INK_LANES=str(args.lanes)),
+    env=_eng_env,
     default_stops=STOPS,
     think_end=END_MSG,
     think_force=[END_MSG],
+    idle_unload_s=args.idle_unload,
 )
 splicer = PrefixSplicer(tok, max_held=16)
 
@@ -296,6 +307,10 @@ async def chat(request: Request):
     except jinja2.exceptions.TemplateError as e:
         return bad_request(f"chat template: {e}")
     ids = await asyncio.to_thread(splicer.splice, prompt)
+    try:
+        await asyncio.to_thread(eng.ensure_awake)
+    except Unavailable as e:
+        return unavailable(str(e))
     extra_stops = []
     for s in stop_strs:
         sids = tok.encode(s, add_special_tokens=False).ids

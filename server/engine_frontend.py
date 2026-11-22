@@ -75,21 +75,28 @@ class EngineProc:
     CRASH_WINDOW_S = 300
     CRASH_MAX = 3
 
-    def __init__(self, cmd, env=None, default_stops=(), think_end=0, think_force=()):
+    def __init__(self, cmd, env=None, default_stops=(), think_end=0, think_force=(), idle_unload_s=0):
         self.cmd = list(cmd)
         self.env = env
         self.default_stops = list(default_stops)
         self.think_end = think_end
         self.think_force = list(think_force)
+        self.idle_unload_s = max(0.0, float(idle_unload_s or 0))
         self.write_lock = threading.Lock()
         self.streams_lock = threading.Lock()
         self.load_lock = threading.Lock()
+        self.state_cv = threading.Condition()
+        self._sleep_req = False
+        self._wake_req = False
+        self.last_active = time.monotonic()
         self.streams = {}
         self.rids = itertools.count(1)
         self.engine = None
-        self.state = {"state": "starting", "restarts": 0, "pid": 0, "since": time.time()}
+        self.state = {"state": "starting", "restarts": 0, "pid": 0, "since": time.time(), "idle_unload_s": self.idle_unload_s}
         self.load = {"instance": uuid.uuid4().hex, "running": 0, "waiting": 0, "decode": 0, "prefill": 0, "prefill_us": 0}
         threading.Thread(target=self._supervise, daemon=True).start()
+        if self.idle_unload_s > 0:
+            threading.Thread(target=self._idle_watchdog, daemon=True).start()
 
     def metered(self, cb):
         """Wrap a request callback to track waiting, running, decode, and prefill counters."""
@@ -128,7 +135,10 @@ class EngineProc:
             while True:
                 rid, w = struct.unpack("<II", read_exact(out, 8))
                 if w == 0xFFFFFFFD:
-                    self.state.update(state="up", since=time.time())
+                    with self.state_cv:
+                        self.state.update(state="up", since=time.time())
+                        self.last_active = time.monotonic()
+                        self.state_cv.notify_all()
                     print(f"dankattn: engine pid {proc.pid} ready", file=sys.stderr, flush=True)
                     continue
                 final = w >= 0xFFFFFFFE
@@ -148,25 +158,88 @@ class EngineProc:
                     item = w
                 with self.streams_lock:
                     cb = self.streams.pop(rid, None) if final else self.streams.get(rid)
+                if final:
+                    self.last_active = time.monotonic()
                 if cb:
                     cb(item)
         except (EOFError, struct.error, OSError, ValueError):
             pass
-        self.state["state"] = "down"
+        with self.state_cv:
+            if not self._sleep_req:
+                self.state["state"] = "down"
+            self.state_cv.notify_all()
         with self.streams_lock:
             dead = list(self.streams.values())
             self.streams.clear()
         for cb in dead:
             cb({"error": "engine exited"})
 
+    def _idle_watchdog(self):
+        poll = min(5.0, max(0.5, self.idle_unload_s / 4.0))
+        while True:
+            time.sleep(poll)
+            proc_to_close = None
+            with self.state_cv:
+                if self.state["state"] != "up" or self._sleep_req:
+                    continue
+                if time.monotonic() - self.last_active < self.idle_unload_s:
+                    continue
+                with self.streams_lock, self.load_lock:
+                    if self.streams or self.load["waiting"] > 0 or self.load["running"] > 0:
+                        continue
+                self._sleep_req = True
+                self.state.update(state="sleeping", since=time.time())
+                self.state_cv.notify_all()
+                proc_to_close = self.engine
+            if proc_to_close is not None:
+                try:
+                    with self.write_lock:
+                        proc_to_close.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
+    def ensure_awake(self, timeout=60.0):
+        deadline = time.monotonic() + timeout
+        with self.state_cv:
+            self.last_active = time.monotonic()
+            if self.state["state"] == "up" and not self._sleep_req:
+                return
+            if self.state["state"] == "sleeping" or self._sleep_req:
+                self._wake_req = True
+                self.state_cv.notify_all()
+            while self.state["state"] != "up" or self._sleep_req:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise Unavailable(self.state["state"])
+                if self.state["state"] == "down" and not self._wake_req:
+                    raise Unavailable("down")
+                self.state_cv.wait(timeout=min(rem, 1.0))
+            self.last_active = time.monotonic()
+
     def _supervise(self):
         exits = []
         while True:
-            self.state.update(state="starting", since=time.time())
+            with self.state_cv:
+                self.state.update(state="starting", since=time.time())
+                self.state_cv.notify_all()
             self.engine = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=self.env)
             self.state["pid"] = self.engine.pid
             self._demux(self.engine)
             code = self.engine.wait()
+            with self.state_cv:
+                if self._sleep_req:
+                    self._sleep_req = False
+                    self.state.update(state="sleeping", pid=0, since=time.time())
+                    self.state_cv.notify_all()
+                    print(
+                        f"dankattn: engine sleeping after {self.idle_unload_s:.0f}s idle (RAM released, exit={code})",
+                        file=sys.stderr, flush=True,
+                    )
+                    while not self._wake_req:
+                        self.state_cv.wait()
+                    self._wake_req = False
+                    print("dankattn: waking engine...", file=sys.stderr, flush=True)
+                    continue
             now = time.time()
             exits = [t for t in exits if now - t < self.CRASH_WINDOW_S] + [now]
             print(
@@ -181,8 +254,7 @@ class EngineProc:
 
     def submit(self, ids, max_new, spec, temp, top_p, top_k, seed, cb,
                group=None, think_budget=0, strict=False, min_p=None, extra_stops=(), vision_imgs=None, fpr_suffixes=None):
-        if self.state["state"] != "up":
-            raise Unavailable(self.state["state"])
+        self.ensure_awake()
         rid = next(self.rids)
         stops = list(self.default_stops)
         for t in extra_stops:
@@ -418,11 +490,11 @@ def register_common_routes(app, eng: EngineProc, model_id: str, cap: int, lanes_
     @app.get("/health")
     def health():
         st = dict(eng.state, since=round(time.time() - eng.state["since"], 1))
-        return JSONResponse(st, status_code=200 if eng.state["state"] == "up" else 503)
+        return JSONResponse(st, status_code=200 if eng.state["state"] in ("up", "sleeping") else 503)
 
     @app.get("/v1/models")
     def models():
-        if eng.state["state"] != "up":
+        if eng.state["state"] not in ("up", "sleeping"):
             return unavailable(eng.state["state"])
         entry = {"id": model_id, "object": "model", "owned_by": "DankAttn", "max_model_len": cap}
         if extra_model_fields:
@@ -433,7 +505,7 @@ def register_common_routes(app, eng: EngineProc, model_id: str, cap: int, lanes_
     def load():
         with eng.load_lock:
             return {
-                "model": model_id, "instance": eng.load["instance"], "parked": False, "lanes": lanes_fn(),
+                "model": model_id, "instance": eng.load["instance"], "parked": eng.state["state"] == "sleeping", "lanes": lanes_fn(),
                 "running": eng.load["running"], "waiting": eng.load["waiting"],
                 "tokens": {"decode": eng.load["decode"], "prefill_compute": eng.load["prefill"]},
                 "busy_us": {"prefill": eng.load["prefill_us"]},

@@ -977,8 +977,9 @@ int main(ink2::Model& m) {
   const bool use_lookup = getenv("INK_LOOKUP") ? (atoi(getenv("INK_LOOKUP")) != 0) : true;
   const uint32_t pf_dec_chunk = getenv("INK_PF_DEC_CHUNK") ? uint32_t(atoi(getenv("INK_PF_DEC_CHUNK"))) : 256u;
   pcache().init(m, mtl::tree_root() + "/pcache_ink");
-  fprintf(stderr, "inkling2: serving %u lanes (L0=%u, side=%u, rewind slack %u), GPU state %.2f GB, DSpark %s\n", n_lanes,
-          m.cap, side_cap ? side_cap : m.cap, m.rewind_slack(), m.C.allocated / 1e9, m.has_mtp ? "on" : "off");
+  fprintf(stderr, "inkling2: serving %u lanes (L0=%u, side=%u, rewind slack %u), GPU state %.2f GB, DSpark %s, power %s\n", n_lanes,
+          m.cap, side_cap ? side_cap : m.cap, m.rewind_slack(), m.C.allocated / 1e9, m.has_mtp ? "on" : "off",
+          ink2::power_mode_name());
   std::thread rt(reader);
   put(0, READY);
   fflush(stdout);
@@ -1006,7 +1007,8 @@ int main(ink2::Model& m) {
       // 1) One prefill chunk for the first prefilling request (smaller while other lanes decode, to bound ITL)
       bool any_decoding = false;
       for (const auto& a : active) if (!a.prefilling) { any_decoding = true; break; }
-      const uint32_t chunk = any_decoding ? std::max<uint32_t>(ink2::MAXM + 1u, std::min(ink2::MP, pf_dec_chunk)) : ink2::MP;
+      const uint32_t max_pf = ink2::eco_mode() ? std::min<uint32_t>(ink2::MP, 256u) : ink2::MP;
+      const uint32_t chunk = any_decoding ? std::max<uint32_t>(ink2::MAXM + 1u, std::min(max_pf, pf_dec_chunk)) : max_pf;
       for (auto& a : active) {
         if (!a.prefilling) continue;
         const size_t end = std::min(a.rest.size(), a.pref_off + chunk);

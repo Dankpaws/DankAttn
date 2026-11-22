@@ -1,7 +1,10 @@
 // DankAttn (Inkling-2-Mini): model loader, kv8 global KV, Wave 2A forward step, rollback, and DSpark MTP drafter.
 #import "inkling2.h"
 #import <Foundation/Foundation.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +16,51 @@
 #include <unistd.h>
 
 namespace ink2 {
+
+// Native macOS power awareness (INK_POWER=auto|performance|eco; default auto).
+static int parse_power_policy() {
+  const char* env = getenv("INK_POWER");
+  if (!env || !*env || strcmp(env, "auto") == 0) return 0;  // auto
+  if (strcmp(env, "eco") == 0 || strcmp(env, "battery") == 0 || strcmp(env, "1") == 0) return 1;  // forced eco
+  return 2;  // forced performance
+}
+
+static bool query_macos_battery_or_lpm() {
+  if ([NSProcessInfo processInfo].lowPowerModeEnabled) return true;
+  CFTypeRef info = IOPSCopyPowerSourcesInfo();
+  if (!info) return false;
+  CFStringRef src = IOPSGetProvidingPowerSourceType(info);
+  const bool on_batt = (src != nullptr && CFEqual(src, CFSTR(kIOPSBatteryPowerValue)));
+  CFRelease(info);
+  return on_batt;
+}
+
+bool eco_mode() {
+  static const int policy = parse_power_policy();
+  if (policy == 1) return true;
+  if (policy == 2) return false;
+  static auto last_check = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  static bool cached = false;
+  static bool init = false;
+  const auto now = std::chrono::steady_clock::now();
+  if (!init || std::chrono::duration_cast<std::chrono::seconds>(now - last_check).count() >= 5) {
+    const bool next = query_macos_battery_or_lpm();
+    if (init && next != cached) {
+      fprintf(stderr, "inkling2: power state changed -> %s\n", next ? "eco (battery/LPM)" : "performance (AC)");
+    }
+    cached = next;
+    last_check = now;
+    init = true;
+  }
+  return cached;
+}
+
+const char* power_mode_name() {
+  const int p = parse_power_policy();
+  if (p == 1) return "eco";
+  if (p == 2) return "performance";
+  return eco_mode() ? "auto(eco)" : "auto(performance)";
+}
 
 namespace {
 

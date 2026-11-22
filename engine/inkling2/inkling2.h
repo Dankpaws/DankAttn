@@ -14,9 +14,14 @@
 
 namespace ink2 {
 
-// Fan-out-aware expected-tokens/ms draft length selector (exactness-preserving: only trims draft count k in 0..K).
-// Models 128-expert top-8 MoE verify cost T(M) = t0 + c_moe * (1 - (120/128)^M) plus draft overhead t_draft.
-// Set INK_DRAFT_ADAPT=0 to fall back to the legacy per-token threshold `dp[k] >= draft_cut`.
+// Native macOS power awareness (INK_POWER=auto|performance|eco; default auto).
+// In auto mode, returns true when on battery or macOS Low Power Mode (cached ~5s; desktop Macs return false).
+bool eco_mode();
+const char* power_mode_name();
+
+// Fan-out-aware draft length selector (exactness-preserving: only trims draft count k in 0..K).
+// Performance mode maximizes expected tok/ms; eco mode (when INK_ECO_DRAFT != 0) maximizes expected tok/GB read
+// to cut MoE fan-out DRAM energy on battery. Set INK_DRAFT_ADAPT=0 for legacy per-token `dp[k] >= draft_cut`.
 inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool big_gpu, uint32_t active_lanes = 1,
                              bool pre_calibrated = false, bool has_draft_cost = true) {
   static const int adapt = getenv("INK_DRAFT_ADAPT") ? atoi(getenv("INK_DRAFT_ADAPT")) : 1;
@@ -25,14 +30,22 @@ inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool
     while (keep < dp.size() && (draft_cut <= 0.0f || dp[keep] >= draft_cut)) keep++;
     return keep;
   }
-  const double t0 = big_gpu ? 0.838 : 0.726;
-  const double c_moe = (big_gpu ? 2.59 : 4.39) / (active_lanes > 1 ? (1.0 + 0.35 * double(active_lanes - 1)) : 1.0);
-  const double t_draft = has_draft_cost ? ((big_gpu ? 0.17 : 0.22) / double(active_lanes > 0 ? active_lanes : 1)) : 0.0;
+  static const int eco_draft_env = getenv("INK_ECO_DRAFT") ? atoi(getenv("INK_ECO_DRAFT")) : 1;
+  const bool use_eco = (eco_draft_env != 0) && eco_mode();
+
   // Calibrate slightly optimistic DSpark p_max (0.85 hits 212 tok/s on code_prompt.bin and 153 tok/s on 8k doc).
   static const double p_scale = getenv("INK_DRAFT_PSCALE") ? atof(getenv("INK_DRAFT_PSCALE")) : 0.85;
   const double scale = pre_calibrated ? 1.0 : p_scale;
 
-  double best_rate = 1.0 / (t_draft + t0 + c_moe * (1.0 - 120.0 / 128.0));
+  // Cost model: performance -> time (ms); eco -> DRAM traffic (GB: ~1.55 dense + 29.44*(1-(120/128)^M) MoE + 0.38 draft).
+  const double lane_div = active_lanes > 1 ? (1.0 + 0.35 * double(active_lanes - 1)) : 1.0;
+  const double c0 = use_eco ? 1.55 : (big_gpu ? 0.838 : 0.726);
+  const double c_moe = (use_eco ? 29.44 : (big_gpu ? 2.59 : 4.39)) / lane_div;
+  const double c_draft = has_draft_cost
+      ? ((use_eco ? 0.38 : (big_gpu ? 0.17 : 0.22)) / double(active_lanes > 0 ? active_lanes : 1))
+      : 0.0;
+
+  double best_rate = 1.0 / ((use_eco ? 0.0 : c_draft) + c0 + c_moe * (1.0 - 120.0 / 128.0));
   size_t best_k = 0;
   double cum_p = 1.0;
   double exp_tok = 1.0;
@@ -42,7 +55,7 @@ inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool
     cum_p *= pk;
     exp_tok += cum_p;
     miss *= (120.0 / 128.0);
-    const double rate = exp_tok / (t_draft + t0 + c_moe * (1.0 - miss));
+    const double rate = exp_tok / (c_draft + c0 + c_moe * (1.0 - miss));
     if (rate > best_rate) {
       best_rate = rate;
       best_k = k + 1;
