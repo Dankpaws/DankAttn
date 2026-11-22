@@ -1,6 +1,6 @@
 # DankAttn (Inkling-2-Mini) Architecture, Benchmarks & Engineering Log
 
-> Last updated: 2026-11-21 (branch `inkling2-lanes-fpr`, HEAD `9bcfe2b` after optimization Waves 1–13 + Split-KV, batched DSpark, FPR, and Parallel Section Fill; benchmarked on Apple M5 Ultra Mac Studio 96 GB and Base M5 MacBook Pro 32 GB).
+> Last updated: 2026-11-22 (branch `inkling2-decode-fusion`, HEAD `a501d5d`: decode tuning on top of `inkling2-lanes-fpr` `9bcfe2b`, see *Decode Tuning*; earlier tables measured at the commits they name; benchmarked on Apple M5 Ultra Mac Studio 96 GB and Base M5 MacBook Pro 32 GB).
 
 ## 1. Model & Pack Architecture (`pack-inkling2-mini-w8`)
 
@@ -96,6 +96,41 @@ Studio, 4 lanes × 131,072 (`INK_RING_SLACK=4096`, 15.25 GB state), T=1.0, 2026-
 
 W8 attention + `kv8` global KV + chunked prefill show no measurable quality loss. The 128k RULER gap is mostly SGLang truncating at the 4,096 cap (both-finished: 90 vs 95%); DankAttn generated 28% fewer tokens there, cause not isolated. n = 3 per RULER subtask. RULER 128k needs `INK_CAP=139264` (prompts average 127,878 tokens + 4,096 answer).
 
+### Decode Tuning (`ac3b49a`, `a501d5d`, branch `inkling2-decode-fusion`, 2026-11-22)
+
+Goal: close the gap to ddalcu's unreleased mlx-serve Inkling build (card: 118 tok/s plain decode on M5 Ultra). A token reads ~3.4 GB (experts 1.84, attention 0.93, `lm_head` 0.48 GB), a ~350 tok/s roofline at 1.2 TB/s; plain decode sat at 12.21 ms (~23% of peak), and Studio/MBP scaled 3.2x against 7.8x bandwidth, so the step is latency-bound, not bandwidth-bound.
+
+**Method.** Per-op in-stream cost = extra time when one op group runs twice (`INK_DUP=<mask>`, idempotent groups); `INK_SKIP` (drop a group) is unreliable here because stale buffers change routing downstream. An empty dispatch + barrier phase costs ~1.7 µs (`INK_XBAR`). Clean profile at ctx 512, M=1, µs per layer visit (48/token): MoE gate/up 39, MoE down 22, pre-attn attn_res/msg-gate/rms 21.5, pre-MLP 21.3, router 20.7, q/k/v proj 20.6, attention 19.3, o_proj 18.9, q_rel + kv_conv 14.1, post-sconvs ~4 each; `lm_head` 0.45 ms/token. W8 matmuls with many threadgroups reach ~1.0–1.17 TB/s (`lm_head`, q/k/v); NVFP4 MoE runs at ~570 GB/s and is bound by unpack instruction count, small-N W8 (o_proj) and single-threadgroup kernels by latency.
+
+**Kept** (each A/B'd interleaved on a clean GPU):
+
+| Change | Effect | Exactness |
+| :--- | :--- | :--- |
+| Early command-buffer commits (`INK_EARLY`, 4 CBs per step) | GPU unchanged, wall 76.4 → 80.0 tok/s (ctx 512), 71.6 → 74.5 (8k) | bit-identical |
+| `ink_moe_route_fast`: rank top-k + prefix slots, one phase for M ≤ 16 (`INK_ROUTE_FAST`) | −0.31 ms | bit-identical |
+| Split table: attn.o 1 sgs × 12 ksplit, NVFP4 moe gu/dn 2 sgs (`INK_SPLIT_TAB`, `INK_SPLITS`); mm2 split-K partials/counters per `pslot` (qgrs ∥ k ∥ v need disjoint ones); prefill replays ksplit | −0.73 ms | reorder; vtest/jspec/ltest/forktest exact |
+| One 32-column fragment per threadgroup (`INK_NFT`, default 1) | −0.08 ms | bit-identical |
+| Attention key splits 12/24 → 24 local / 64 global (`INK_NSP_LOCAL/GLOBAL`, `ASPLITS` 64) | ctx 512 +0.05, 8k −0.39, 30k −1.18 ms | reorder |
+
+**Rejected** (measured, then removed or left off): decode fusions accum + MLP post-sconv and attn post-sconv + pre-MLP attn_res (`INK_FUSE=1`, bit-identical, +0.2 ms: the fused single-TG kernels cost more than the ~4 µs phases they absorb); last-arrival phase merges for router scores + top-k (−0.04 ms) and attention split + reduce (+1.35 ms: device atomics for partials are expensive); `PF` 2/4/8 weight prefetch (+0.3 to +8 ms, register pressure); NVFP4 E2M1 from bits instead of the constant LUT (+1.9 ms) and scale slab via simd shuffles (+0.6 ms); more simdgroups per MoE threadgroup (sgs 8/12: +0.5–1.3 ms); q/k/v and `lm_head` split changes (±0.05); attn_res block loop with loads hoisted ahead of the simd sums (no change, the compiler already overlaps them); commits every k layers (no change); 96/128 global attention splits (the reduce gets longer).
+
+**Result** (M5 Ultra; engine `bench`, `INK_CAP=32768`; server = `inkling2_server.py` production profile, bake-off `bench.py`):
+
+| | Before (`d4b551e`) | After (`a501d5d`) |
+| :--- | :---: | :---: |
+| Engine M=1, ctx 512: GPU ms / wall tok/s | 12.21 / 76.4 | 11.20 / 86.8 |
+| Engine M=1 GPU ms, ctx 8k / 30k | 13.11 / 13.55 | 11.66 / 12.37 |
+| Server plain decode (`--no-spec`) | 77.4 tok/s | 87.0 tok/s |
+| Server DSpark decode, code / prose | 117.2 / 105.1 | 136.1 / 114.9 |
+| Server 4 / 8 streams, total | 255 / 342 | 266 / 361 |
+| Server cold prefill 104k | 1,956 tok/s | 1,972 tok/s |
+
+Quality: MMLU 1,140 86.23% vs 86.14% before (McNemar z = +0.13; 85.96% SGLang base). Teacher-forced NLL (`nll`, 16-row decode steps, two 8k-token texts) 1.88589 / 2.17662 nats vs 1.88344 / 2.17753; any summation reorder moves it by up to ~0.003 nats in either direction (adding noise to logits raises expected NLL), so these are within that floor. `jspec` acceptance rose 2.09 → 2.19 tok/lane-round on the A/B prompt.
+
+**Remaining gap** to ~118 tok/s plain (8.5 ms): the NVFP4 MoE matmuls (~3 ms/token, unpack-bound; a dedicated M = 1 GEMV would break the M = 1 vs verify bit-exactness speculation relies on), the msg-gate/attn_res blocks (~2 ms, chains of small single-threadgroup kernels), and attention (~1 ms at short context). ddalcu's build is not public, so whether it keeps decode/verify exactness is unknown.
+
+A/B tooling: `rdump` (all-row logits of one M-row step), `nll`, `Model::step_all`; harness scripts `check.sh` / `cmp.sh` / `kl.py` / `dupprof.sh` / `sweep.sh` live in the Mac's `~/dankattn-inkling2-dev` (not in the repo).
+
 ### Speculation Sweep & the MoE Expert Fan-Out Tax (`spec 256 code_prompt.bin`)
 
 Measured at `7ba4268`, before Waves 1–13; the ordering of configs still holds but absolute numbers are now higher (see the table above).
@@ -149,6 +184,8 @@ sh inkling2/build_inkling2.sh
 ./build/dankattn-inkling2 "$PACK" ltest ids.bin 4 16           # 4 lanes joint decode + mixed-width round, bit-exact vs alone
 ./build/dankattn-inkling2 "$PACK" lbench ids.bin 8 2048 32     # 8 lanes, ctx 2048 each, 32 joint decode steps (INK_LPROF=1: op profile)
 ./build/dankattn-inkling2 "$PACK" jspec ids.bin 2 256          # joint speculation, 2 lanes, exact check (INK_JCHECK=0 skips)
+./build/dankattn-inkling2 "$PACK" rdump ids.bin 6000 8 out.bin  # chunked prefill of 6000, then one M=8 step: all rows' logits
+./build/dankattn-inkling2 "$PACK" nll ids.bin 8000              # teacher-forced mean NLL through the decode/verify path
 ```
 
 ### Environment Variables
@@ -168,6 +205,13 @@ sh inkling2/build_inkling2.sh
 | `INK_PF_DEC_CHUNK` | `256` | `serve`: prefill chunk while other lanes decode |
 | `INK_PF_FAST` | `1` | `0`: compile out the interior-tile fast path in `ink_attn_pf_mma` (bit-identical either way; for A/B) |
 | `INK_QREL_MMA` | `1` | `0`: prefill relative logits via scalar `ink_q_rel` instead of `ink_q_rel_prep` + `ink_q_rel_mma` (rounding-level difference) |
+| `INK_EARLY` | `1` | `0`: encode the whole step into one command buffer (no early commits; same output) |
+| `INK_ROUTE_FAST` | `1` | `0`: old decode router (`ink_moe_route` / `topk_pf` + `pack_dec`; same output) |
+| `INK_SPLIT_TAB` / `INK_SPLITS` | `1` / unset | `0` drops the decode split table; `"bits:N:K:sgs:ksplit,..."` overrides per tensor shape (reorders sums) |
+| `INK_NFT` | `1` | 32-column fragments per mm2 threadgroup: `1`, `2`, or `0` = per-call choice (same output) |
+| `INK_NSP_LOCAL` / `INK_NSP_GLOBAL` | `24` / `64` (Ultra/Max), `8` / `8` | decode attention key splits per (row, kv head), up to `ASPLITS` = 64 |
+| `INK_FUSE` | `0` | `1`: decode fusions accum + MLP post-sconv, attn post-sconv + pre-MLP attn_res (same output, +0.2 ms) |
+| `INK_XBAR` / `INK_SKIP` / `INK_DUP` (+`INK_DUPN`) / `INK_PF_W8` / `INK_PF_MOE` | — | profiling screens (empty phases; drop / repeat op groups; mm2 weight prefetch depth) |
 
 ---
 
