@@ -1,6 +1,6 @@
 # DankAttn (Inkling-2-Mini) Architecture, Benchmarks & Engineering Log
 
-> Last updated: 2026-11-21 (branch `inkling2-mini`, HEAD `cf05d1f` after optimization Waves 1–13; benchmarked on Apple M5 Ultra Mac Studio 96 GB and Base M5 MacBook Pro 32 GB).
+> Last updated: 2026-11-21 (branch `inkling2-lanes-fpr`, HEAD `9bcfe2b` after optimization Waves 1–13 + Split-KV, batched DSpark, FPR, and Parallel Section Fill; benchmarked on Apple M5 Ultra Mac Studio 96 GB and Base M5 MacBook Pro 32 GB).
 
 ## 1. Model & Pack Architecture (`pack-inkling2-mini-w8`)
 
@@ -150,6 +150,7 @@ sh inkling2/build_inkling2.sh
 | `INK_LOOKUP` | `1` | `1`: enable 3-gram context-lookup drafting (`engine/lookup.h`, up to `M=16`) |
 | `INK_TEMP` / `INK_TOP_P` / `INK_TOP_K` / `INK_MIN_P` / `INK_SEED` | greedy | CLI sampling for every lane (lane `k` uses seed + `k`) |
 | `INK_LANES` | `4` | `serve`: lanes (independent sequences) at `INK_CAP` each |
+| `INK_SIDE_CAP` | `0` (same as `INK_CAP`) | `serve`: smaller global KV/MTP suffix cap for side lanes `1..INK_LANES-1` (Split-KV forked lanes; e.g. `16384` gives 8 lanes in 13.49 GB at `INK_CAP=131072`) |
 | `INK_RING_SLACK` | `0` (`4096` in `inkling2_serve.sh`) | Extra local-ring rows per layer so a lane can rewind `512 + slack` tokens (~0.17 GB per lane per 1k) |
 | `INK_PF_DEC_CHUNK` | `256` | `serve`: prefill chunk while other lanes decode |
 | `INK_PF_FAST` | `1` | `0`: compile out the interior-tile fast path in `ink_attn_pf_mma` (bit-identical either way; for A/B) |
@@ -167,13 +168,24 @@ sh inkling2/build_inkling2.sh
 - **`56fb0ad`..`180081e` (Waves 1–11)**: parallel `sconv`/`plan_pf`, `CONTIG_X` `mmpg` MoE down; `matmul2d` FlashAttention prefill (2.05–2.47×); GQA G=3 shared-KV decode attention and a `kv8` `sm2` race fix; fused `attn_res`+rms/`mg_prep`, batched `mg3`, parallel-M `moe_route`; DSpark static RNN precompute, 64-TG argmax, fused add+rms; `matmul2d` prefill message gates (6.2× MBP / 2.7× Studio on that op), `big_gpu` `nft=1`; `MP=512`; phase-aliased `MTLHeap` (−140 MB) and `matmul2d` prefill router; `mtp_commit` fused into the draft command buffer.
 - **`f68efe2` + `5ecec5d`**: interior-tile fast paths in `ink_attn_pf_mma` (+3–5% prefill). As first committed, its `(full_tile || s > -1e29)` softmax guard made base M5 / macOS 27.0 produce different prefill logits even on inputs where the fast branch never runs (`pfcheck` max diff 0.70 → 5.89); M5 Ultra / 27.0.1 was unaffected. `5ecec5d` restores the plain guard: prefill is now bit-identical fast-on vs fast-off and Studio vs MBP (`lgdump` at n=23/600/1,600).
 - **`cf05d1f` (Wave 13)**: `ink_attn_res_mg_prep_shared` (one TG per row on local `has_msgs` layers instead of 3), float4 `moe_accum`, `matmul2d` prefill `q_rel`. The shared `mg_prep` first shipped with a threadgroup-memory race (one `sm_m` row reused across the 3 slots), which made prefill nondeterministic; fixed before commit and verified bit-identical to `5ecec5d`. Studio prefill +1.0% @2k / +1.4% @8k; MBP neutral.
+- **`0c35fca`..`9bcfe2b` (branch `inkling2-lanes-fpr` — Single-Output Multi-Lane Engine, 2026-11-21)**:
+  - **Zero-copy Split-KV (`fork_lane` / `promote_lane`) & `INK_SIDE_CAP`**: Forked lanes read Lane 0's immutable global KV (`t < fork_pos`) in `ink_attn_split_gqa` and `ink_mtp_attn` while writing only to small suffix buffers (`INK_SIDE_CAP`), blitting only the 40 local SWA-1024 rings. `forktest` (`pref=1500, lanes=4, gen=16`): **100% BIT-EXACT** (`bad_tok=0, bad_lg=0, bad_draft=0, bad_prom=0`, GPU Self-Certainty `conf_err=3.42e-06`) — Studio `fork=4.79 ms`, `promote=0.78 ms`; MBP `fork=16.11 ms`, `promote=3.39 ms` (`0.32 GB` per side lane at `cap=2048`). Live Studio profile: 8 lanes (`L0=131072, side=16384`) in **13.49 GB GPU state** (less RAM than 4 × 131k = 15.25 GB).
+  - **Free GPU Self-Certainty**: Computed inside `ink_sample_rows` over the same softcapped logit pass (zero extra DRAM reads).
+  - **Batched DSpark (`draft_lanes` + `mtp_commit_lanes`, `f26a2fb`)**: Runs all 3 MTP layers once over `L × 8` rows (`mmp`, `MMP_CH=4, MMP_NF=1, MMP_FAST=0`), packs only the `L × gamma` (`≤ 16`) active rows for one `lm_head` matmul (`ink_pack_frag_rows`), and batches `mtp_mh_fold_w` over all `L` lanes per Markov RNN step. `jspec` exact check: **100% EXACT** on both Macs — Studio 4-lane draft **4.5 → 2.02 ms/round** (`512/512`), 8-lane draft **1.95 ms/round** (**428.8 tok/s wall**); MBP 4-lane draft **18 → 8.65 ms/round** (`256/256`).
+  - **In-Engine Single-Output Modes (`flags & 2` in `serve.inc` + OpenAI aliases in `inkling2_server.py`)**:
+    - **Parallel Test-Time Compute (`:Nx-select`, `:Nx-genselect`, `:Nx-synth`)**: Fork → parallel decode + DeepConf online confidence pruning + early quorum → resolve in-engine (`select` promotes winning lane to Lane 0; `genselect`/`synth` rewind Lane 0 for 100% prompt prefix reuse). On an 8-problem hard math/code suite: 1-lane **6/8 (75%)** (2 rambling failures) vs. 4-lane Majority & GenSelect **8/8 (100%)**; `:4x-select` hit **302–341 agg tok/s**, `:8x-select` **438.4 agg tok/s**; multi-turn prefix reuse verified (`3,031/3,052` tokens reused, 46 ms prefill).
+    - **Parallel Section Fill (`:4x-fast`, `:8x-fast`, `2a2788c` + `9bcfe2b`)**: Terse JSON outline (prefilling `<|content_text|>{"sections":[` to skip thinking) → Split-KV fork with batched per-lane suffix prefill (`step_lanes`) → live Section-1 streaming + progressive flush of Sections `2..K` (auto-falls back to 1-lane on short or tool-call turns). Live SSE on M5 Ultra:
+      - 4 Python data structures (`:4x-fast`): **TTFT 1.55 s**, outline 1.11 s, **4,887 visible tok in 15.32 s → 319.0 eff tok/s** (`344.6` fill tok/s; vs. 1-lane 1,321 visible tok in 27.0 s).
+      - 8-section systems guide (`:8x-fast`): **TTFT 2.15 s**, outline 1.42 s, **8,048 visible tok in 23.42 s → 343.6 eff tok/s** (`366.0` fill tok/s; **3.0×** 1-lane's 114.0 eff tok/s).
+  - **Empirical Dead Ends / Parked Experiments**:
+    - **`INK_PASSES=1/2` (`is_varloop: false`)**: Tested on MBP (`smoke`) — both 1-pass (49.6 tok/s) and 2-pass (34.6 tok/s) collapse into tight 7-token repetition loops and disable DSpark (`dspark=0`). All lanes must run 3 passes on `Inkling-2-Mini`; heterogeneous-pass scout lanes only apply to `varloop` checkpoints.
+    - **Top-2 Markov Beam-Tree DSpark (`tspec`, parked on branch `inkling2-tree-spec`, `e83d6b5`)**: 4-beam Top-2 tree in one command buffer (`draft` flat at 1.63 vs. 1.60 ms) lifted acceptance +12–23% per round, but 128-expert top-8 MoE fan-out raised verify time +9–13% (`15.7 → 17.1–17.8 ms`), capping net single-stream speedup at **+1.1% to +4.6%** (`132 → 138 tok/s` code, `131 → 132 tok/s` prose).
 
 ### Open Questions
 - Chunked prefill vs. `M=1` final-row KL is 1e-5..4e-3 depending on prompt length (`lgdump`, real text, 23–1,600 tok), which is above the `0.00042` golden KL quoted in §1. It predates Waves 1–13 (same band at `5ecec5d`). Worth one `inkling2_golden.py --ids` run at ~600 tokens to see which path sits closer to BF16.
 - Base M5 on macOS 27.0 miscompiled (or otherwise mis-executed) a logically neutral edit in `ink_attn_pf_mma`. Re-check with `lgdump` Studio-vs-MBP bit equality after any attention-kernel change or OS update; `pfcheck`'s max diff alone is too noisy to catch it.
 
 ### Planned Next Steps (Not Yet Started)
-- **Batched DSpark drafting across lanes** (sequential today: 4.5 ms/round at 4 lanes on the Studio, 18 ms on the MBP) and one fused DSpark commit per round.
-- **Per-lane caps** (one long-context lane + short side lanes, like Hy4) and a prefix cache that survives engine restarts.
+- **Prefix cache that survives engine restarts** (SSD prefix cache, like Hy4).
 - **MoE expert fan-out at `M=8` verify** (MBP: `moe_gu` + `moe_dn` = 63% of verify time) is the main lever for MBP speculation.
 - **Prefill attention** (29% at `M=512` on the Studio) and **MoE gate/up** (26%) are the remaining large prefill ops.
