@@ -177,6 +177,8 @@ struct Model {
   id<MTLComputePipelineState> p_scores, p_scores_mma, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
   id<MTLComputePipelineState> p_route_fast;      // decode router: rank top-k + prefix slots, one phase
+  id<MTLComputePipelineState> p_moe_gu_gemv, p_moe_dn_gemv;  // NVFP4 expert GEMV (decode/verify, INK_MOE_GEMV)
+  id<MTLBuffer> b_moe_act = nil;
   id<MTLComputePipelineState> p_moe_accum_conv;  // decode fusion: moe_accum + mlp post_sconv
   id<MTLComputePipelineState> p_conv_res_rms;    // decode fusion: attn post_sconv + pre-MLP attn_res_rms
   id<MTLComputePipelineState> p_conv_res_mg;     // decode fusion: attn post_sconv + pre-MLP attn_res_mg_prep

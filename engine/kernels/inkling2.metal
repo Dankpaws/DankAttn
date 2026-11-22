@@ -1612,6 +1612,155 @@ kernel void ink_moe_accum_post_sconv(device const float4* exp_y [[buffer(0)]],
   }
 }
 
+// 10c. Decode/verify NVFP4 expert GEMV over mm2's tiled bank, in place (technique after mlx-serve's inkling2
+//      ups/downs, MIT, David Dalcu: dot the packed E2M1 values against x in f32 and scale once per 16-value
+//      group, instead of unpacking every weight to bf16 for a 16-row tensor op that carries one row).
+//      Bank layout (mm2, WBITS 40): per fragment nf (32 output columns) and k-step ks (32 k), lane l holds one
+//      uint4 = 32 nibbles: word j, byte i, nibble h -> column m0 + 16 (j & 1) + 8 h, k n0 + i + 16 (j >> 1), with
+//      m0 = ((l >> 1) & 3) + 4 (l >> 4), n0 = 4 (l & 1) + 8 ((l >> 3) & 1). Scales half [nf][K / 16][32].
+//      Expert-major: one simdgroup = one fragment of one active expert; each k-step's nibbles are decoded once and
+//      used for every routed row (4 rows a pass), so a row's arithmetic does not depend on M or on its neighbours.
+//      Grid (ceil(N / 32 / 4), 1, slots), TG 128 threads (4 simdgroups = 4 fragments).
+#ifndef MAXM_ROWS
+#define MAXM_ROWS 16
+#endif
+struct GemvArgs {
+  uint N, K, M, wstride, sstride, xstride, ystride, I;
+};
+static inline float2 e2m1x2_half(uint t) {  // nibbles at bits 0..3 and 16..19 -> their E2M1 values x 2^-14
+  return float2(as_type<half2>(((t & 0x70007u) << 9) | ((t & 0x80008u) << 12)));
+}
+#ifndef GEMV_ROWS
+#define GEMV_ROWS 2
+#endif
+// One lane's k-step for GEMV_ROWS rows (slots past nr idle): partial dots of its 4 columns (q = 0..3 -> column
+// m0 + 8 q). Nibble pairs 16 bits apart share a column: in word j, bits (0, 16) = column q0 at k 0 and 2, (4, 20) =
+// column q0 + 1 at k 0 and 2, (8, 24) = column q0 at k 1 and 3, (12, 28) = column q0 + 1 at k 1 and 3 (q0 = 2 (j & 1),
+// k half j >> 1). Explicit fma chains: a row's bits do not depend on which batch slot it occupies.
+static inline void fp4_kstep(uint4 w, thread const float4 (&xlo)[GEMV_ROWS], thread const float4 (&xhi)[GEMV_ROWS],
+                             uint nr, thread const float (&sc)[2][4], thread float (&acc)[GEMV_ROWS][4]) {
+  const uint wd[4] = {w.x, w.y, w.z, w.w};
+#pragma clang loop unroll(full)
+  for (uint j = 0; j < 4; j++) {
+    const uint kh = j >> 1, q0 = 2u * (j & 1u);
+    const float2 a0 = e2m1x2_half(wd[j]), a1 = e2m1x2_half(wd[j] >> 4);
+    const float2 b0 = e2m1x2_half(wd[j] >> 8), b1 = e2m1x2_half(wd[j] >> 12);
+#pragma clang loop unroll(full)
+    for (uint r = 0; r < GEMV_ROWS; r++) {
+      if (r < nr) {
+        const float4 x = kh ? xhi[r] : xlo[r];
+        const float d0 = fma(x.w, b0.y, fma(x.z, a0.y, fma(x.y, b0.x, x.x * a0.x)));
+        const float d1 = fma(x.w, b1.y, fma(x.z, a1.y, fma(x.y, b1.x, x.x * a1.x)));
+        acc[r][q0] = fma(d0, sc[kh][q0], acc[r][q0]);
+        acc[r][q0 + 1] = fma(d1, sc[kh][q0 + 1], acc[r][q0 + 1]);
+      }
+    }
+  }
+}
+
+// A threadgroup = one fragment of one active expert; its 4 simdgroups split the k-steps (sg owns KS / 4 of them),
+// and their partials are summed in simdgroup order through threadgroup memory. Routed rows go GEMV_ROWS at a time
+// (each k-step's nibbles decoded once for them): a row's arithmetic is fixed, the same at every M.
+#define GEMV_PROLOGUE                                                                                             \
+  if (tg.z >= nslots[0]) return;                                                                                  \
+  const uint nf = tg.x;                                                                                           \
+  const uint e = slots[tg.z];                                                                                     \
+  const uint KS = a.K / 32u, G = a.K / 16u, KQ = KS / 4u, ks0 = sg * KQ;                                         \
+  device const uint4* Wp = W + size_t(e) * a.wstride + size_t(nf) * KS * 32u + l;                                 \
+  device const half* Sp = S + size_t(e) * a.sstride + size_t(nf) * G * 32u + ((l >> 1) & 3u) + 4u * (l >> 4);    \
+  const uint m0 = ((l >> 1) & 3u) + 4u * (l >> 4), n0 = 4u * (l & 1u) + 8u * ((l >> 3) & 1u);                    \
+  threadgroup float red[4][GEMV_ROWS][32];
+
+#define GEMV_ROW_LOOP(XROW)                                                                                       \
+    float acc[GEMV_ROWS][4] = {};                                                                                 \
+    for (uint ks = ks0; ks < ks0 + KQ; ks++) {                                                                    \
+      float sc[2][4];                                                                                             \
+      for (uint kh = 0; kh < 2u; kh++)                                                                            \
+        for (uint q = 0; q < 4u; q++) sc[kh][q] = float(Sp[(2u * ks + kh) * 32u + 8u * q]);                       \
+      float4 xlo[GEMV_ROWS], xhi[GEMV_ROWS];                                                                      \
+      _Pragma("clang loop unroll(full)")                                                                          \
+      for (uint r = 0; r < GEMV_ROWS; r++) {                                                                      \
+        if (r < nr) { const uint row = rows[r]; XROW }                                                            \
+      }                                                                                                           \
+      fp4_kstep(Wp[size_t(ks) * 32u], xlo, xhi, nr, sc, acc);                                                     \
+    }                                                                                                             \
+    _Pragma("clang loop unroll(full)")                                                                            \
+    for (uint r = 0; r < GEMV_ROWS; r++) {                                                                        \
+      for (uint q = 0; q < 4u; q++) {                                                                             \
+        float v = acc[r][q];                                                                                      \
+        v += simd_shuffle_xor(v, 1);                                                                              \
+        v += simd_shuffle_xor(v, 8);                                                                              \
+        if ((l & 9u) == 0u) red[sg][r][m0 + 8u * q] = v;                                                          \
+      }                                                                                                           \
+    }                                                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                                              \
+    _Pragma("clang loop unroll(full)")                                                                            \
+    for (uint r = 0; r < GEMV_ROWS; r++)                                                                          \
+      for (uint q = 0; q < 4u; q++) {                                                                             \
+        const uint c = m0 + 8u * q;                                                                               \
+        acc[r][q] = (((red[0][r][c] + red[1][r][c]) + red[2][r][c]) + red[3][r][c]) * 16384.0f;                   \
+      }                                                                                                           \
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#define GEMV_ROWS_BEGIN                                                                                           \
+  for (uint todo = rmask[tg.z * 4u]; todo;) {                                                                     \
+    uint rows[GEMV_ROWS], nr = 0;                                                                                 \
+    _Pragma("clang loop unroll(full)")                                                                            \
+    for (uint r = 0; r < GEMV_ROWS; r++) {                                                                        \
+      rows[r] = 0u;                                                                                               \
+      if (todo) { rows[r] = ctz(todo); todo &= todo - 1u; nr++; }                                                 \
+    }
+
+// Gate|up (interleaved by 16 inside each fragment) + the soft-capped SwiGLU -> act [slot][MAXM][I] bf16.
+kernel void ink_moe_gu_gemv(device const uint4* W [[buffer(0)]], device const half* S [[buffer(1)]],
+                            device const float* X [[buffer(2)]],           // [M, K] f32 (bf16-rounded values)
+                            device bfloat* act [[buffer(3)]],
+                            device const uint* slots [[buffer(4)]], device const uint* nslots [[buffer(5)]],
+                            device const uint* rmask [[buffer(6)]],
+                            constant GemvArgs& a [[buffer(7)]],
+                            uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                            ushort l [[thread_index_in_simdgroup]]) {
+  GEMV_PROLOGUE
+  GEMV_ROWS_BEGIN
+    GEMV_ROW_LOOP({
+      device const float* xr = X + size_t(row) * a.K + ks * 32u + n0;
+      xlo[r] = *(device const float4*)xr;
+      xhi[r] = *(device const float4*)(xr + 16u);
+    })
+    if (sg == 0u && (l & 9u) == 0u) {
+      for (uint r = 0; r < nr; r++)
+        for (uint p = 0; p < 2u; p++) {  // gate column m0 + 8 p, its up column m0 + 8 p + 16
+          const float g = acc[r][p], u = acc[r][p + 2u];
+          act[(size_t(tg.z) * MAXM_ROWS + rows[r]) * a.I + nf * 16u + m0 + 8u * p] =
+              bfloat((tanh(g / 4.0f) * 4.0f) * (1.0f / (1.0f + exp(-g))) * (tanh(u / 25.0f) * 25.0f));
+        }
+    }
+  }
+}
+
+// Down projection: act [slot][MAXM][I] -> y [slot][MAXM][N] f32 (ink_moe_accum's input, ystride per slot).
+kernel void ink_moe_dn_gemv(device const uint4* W [[buffer(0)]], device const half* S [[buffer(1)]],
+                            device const bfloat* act [[buffer(2)]],
+                            device float* Y [[buffer(3)]],
+                            device const uint* slots [[buffer(4)]], device const uint* nslots [[buffer(5)]],
+                            device const uint* rmask [[buffer(6)]],
+                            constant GemvArgs& a [[buffer(7)]],
+                            uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                            ushort l [[thread_index_in_simdgroup]]) {
+  GEMV_PROLOGUE
+  GEMV_ROWS_BEGIN
+    GEMV_ROW_LOOP({
+      device const bfloat* xr = act + (size_t(tg.z) * MAXM_ROWS + row) * a.K + ks * 32u + n0;
+      xlo[r] = float4(*(device const bfloat4*)xr);
+      xhi[r] = float4(*(device const bfloat4*)(xr + 16u));
+    })
+    if (sg == 0u && (l & 9u) == 0u)
+      for (uint r = 0; r < nr; r++)
+        for (uint q = 0; q < 4u; q++)
+          Y[size_t(tg.z) * a.ystride + size_t(rows[r]) * a.N + nf * 32u + m0 + 8u * q] = acc[r][q];
+  }
+}
+
 // 11. Parallel 2-stage final logit softcap (30.0 * tanh(x / 30.0)) + greedy argmax.
 // Stage 1: Grid (M, 64, 1), TG 256 threads -> 16,384 threads/row!
 kernel void ink_softcap_argmax_p1(device float* logits [[buffer(0)]],

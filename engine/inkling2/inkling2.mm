@@ -62,6 +62,7 @@ struct AttnPfArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window; };
 struct AttnDecArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, n_splits, fork_pos; };
 struct PostConvArgs { uint32_t M, H, ks, is_boundary, is_mlp, b_slot, b_stride; };
 struct AccumConvArgs { uint32_t m, H, ks, r0, ystride; };
+struct GemvArgs { uint32_t N, K, M, wstride, sstride, xstride, ystride, I; };
 struct ConvResRmsArgs { uint32_t H, m, n_prev, b_stride, r0, ks, is_boundary, b_slot; float eps; };
 struct RouteArgs { uint32_t M, H, E, topk; float route_scale; };
 struct PlanArgs { uint32_t M, E, topk, gx_gu, gx_dn; };
@@ -548,6 +549,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_conf_out = C.buf(MAXM * sizeof(float));
   b_samp_rows = C.buf(MAXM * sizeof(SampRow));
   b_dummy = C.buf(64);
+  b_moe_act = C.buf(size_t(128) * MAXM * 1152u * sizeof(uint16_t));  // [slot][MAXM][I] bf16 (NVFP4 GEMV)
   g_mmpart = C.buf(4u * kSplitPartBytes);  // pslots 0..3
   g_mmcnt = C.buf(4u * kSplitCntBytes);
   memset([g_mmcnt contents], 0, 4u * kSplitCntBytes);  // last-arrival counters start at 0; mm2 resets each after use
@@ -682,6 +684,8 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_pack_dec = C.pipe(ink_src, "ink_moe_pack_dec");
   p_moe_accum = C.pipe(ink_src, "ink_moe_accum");
   p_route_fast = C.pipe(ink_src, "ink_moe_route_fast");
+  p_moe_gu_gemv = C.pipe(ink_src, "ink_moe_gu_gemv", {{"MAXM_ROWS", std::to_string(MAXM)}, {"GEMV_ROWS", getenv("INK_GEMV_ROWS") ? getenv("INK_GEMV_ROWS") : "1"}});
+  p_moe_dn_gemv = C.pipe(ink_src, "ink_moe_dn_gemv", {{"MAXM_ROWS", std::to_string(MAXM)}, {"GEMV_ROWS", getenv("INK_GEMV_ROWS") ? getenv("INK_GEMV_ROWS") : "1"}});
   p_moe_accum_conv = C.pipe(ink_src, "ink_moe_accum_post_sconv");
   p_conv_res_rms = C.pipe(ink_src, "ink_post_sconv_attn_res_rms");
   p_conv_res_mg = C.pipe(ink_src, "ink_post_sconv_attn_res_mg_prep");
@@ -1195,6 +1199,26 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     done_cbs.push_back(cb);
     cb = [C.q commandBuffer];
     enc = new_enc();
+  };
+
+  // NVFP4 expert GEMV (INK_MOE_GEMV=1, INK_GEMV_ROWS rows a pass, default 1): ink_moe_gu_gemv / ink_moe_dn_gemv over
+  // the tiled bank, decode/verify only. M5 Ultra 2026-11-22, vbench2 ctx 2048: M=1 11.52 -> 11.13 ms, M=8 verify
+  // 20.56 -> 23.1 (rows re-read the bank; R=2: 11.31 / 22.17). Off by default: DSpark verify is the serving path.
+  static const bool moe_gemv = getenv("INK_MOE_GEMV") && atoi(getenv("INK_MOE_GEMV")) != 0;
+  auto enc_moe_gemv = [&](id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> pipe, const Lin& lin,
+                          id<MTLBuffer> X, id<MTLBuffer> Y, uint32_t M_, uint32_t ystride, uint32_t I_) {
+    GemvArgs ga{lin.N, lin.K, M_, (lin.N * lin.K / 2u) / 16u, lin.N * (lin.K / lin.gs), 0u, ystride, I_};
+    [e setComputePipelineState:pipe];
+    [e setBuffer:lin.w offset:lin.woff atIndex:0];
+    [e setBuffer:lin.s offset:lin.soff atIndex:1];
+    [e setBuffer:X offset:0 atIndex:2];
+    [e setBuffer:Y offset:0 atIndex:3];
+    [e setBuffer:b_slots offset:0 atIndex:4];
+    [e setBuffer:b_nslots offset:0 atIndex:5];
+    [e setBuffer:b_rmask offset:0 atIndex:6];
+    [e setBytes:&ga length:sizeof(ga) atIndex:7];
+    const uint32_t gz = std::min<uint32_t>(M_ * 8u, lin.experts);
+    [e dispatchThreadgroups:MTLSizeMake(lin.N / 32u, 1, gz) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   };
 
   auto copy_f32 = [&](id<MTLBuffer> src, size_t soff, id<MTLBuffer> dst, size_t doff, size_t bytes) {
@@ -1863,8 +1887,12 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     }
     for (uint32_t _r = 0, _n = ((skipm & (1u << 8)) ? 0u : 1u + ((dupm >> 8) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 8: moe gate/up
       if (_r > 0u) barrier();
+      if (moe_gemv && is_fp4) {
+        enc_moe_gemv(enc, p_moe_gu_gemv, ly.moe_gu, b_mn_f32, b_moe_act, M, 0u, I_moe);
+      } else {
       enc_mm2(enc, is_fp4 ? p_moe_fp4_gu : p_moe_fp8_gu, ly.moe_gu, b_frag_m, 0, b_dummy, 0, M,
               b_frag_gu, b_dummy, b_slots, b_nslots, b_rmask, true, I_moe, 0u, 0u);
+      }
       barrier();
       flush_prof("moe_gu");
     }
@@ -1872,8 +1900,12 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       const uint32_t ystride_dn = MAXM * H;
     for (uint32_t _r = 0, _n = ((skipm & (1u << 9)) ? 0u : 1u + ((dupm >> 9) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 9: moe down
       if (_r > 0u) barrier();
+      if (moe_gemv && is_fp4) {
+        enc_moe_gemv(enc, p_moe_dn_gemv, ly.moe_dn, b_moe_act, b_moe_y, M, ystride_dn, I_moe);
+      } else {
       enc_mm2(enc, is_fp4 ? p_moe_fp4_dn : p_moe_fp8_dn, ly.moe_dn, b_frag_gu, 0, b_moe_y, 0, M,
               nil, b_dummy, b_slots, b_nslots, b_rmask, true, 0u, xstride_dn, ystride_dn);
+      }
       barrier();
       flush_prof("moe_dn");
 
