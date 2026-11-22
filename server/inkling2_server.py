@@ -301,9 +301,9 @@ async def chat(request: Request):
         n_sec = fpr["lanes"]
         outline_suf = (
             f"<|end_message|><|message_user|><|content_text|>"
-            f"Break the response to the request above into {n_sec} independent, non-overlapping sections that can be written in parallel "
-            f"(or 1 section if the request is very short). "
-            f"Reply ONLY with compact JSON: {{\"sections\":[{{\"title\":\"...\",\"spec\":\"1-sentence exact spec / function signatures\"}}]}}."
+            f"Split the response above into {n_sec} independent, non-overlapping sections (or 1 if very short). "
+            f"Keep each title <=5 words and each spec <=10 words. "
+            f"Reply ONLY with compact JSON: {{\"sections\":[{{\"title\":\"...\",\"spec\":\"...\"}}]}}."
             f"<|end_message|><|message_model|><|content_text|>{{\"sections\":["
         )
         outline_ids = ids + tok.encode(outline_suf, add_special_tokens=False).ids
@@ -361,6 +361,85 @@ async def chat(request: Request):
             fpr_fill = dict(fpr, lanes=K, quorum=K)
             per_sec_max = max(256, max_new // K + 256)
             t_fill0 = time.perf_counter()
+            if body.get("stream"):
+                loop = asyncio.get_running_loop()
+                fq: asyncio.Queue = asyncio.Queue()
+                fcb = eng.metered(lambda item: loop.call_soon_threadsafe(fq.put_nowait, item))
+                try:
+                    feid = eng.submit(shared_ids, per_sec_max, not args.no_spec, temp, top_p, top_k, seed, fcb,
+                                      group=(K, K, 2), think_budget=0, min_p=min_p,
+                                      extra_stops=[END_MSG] + extra_stops, fpr_suffixes=suffixes)
+                except Unavailable as e:
+                    fcb({"error": str(e)})
+                    return unavailable(str(e))
+
+                async def gen_fast_live():
+                    def ch(delta, finish=None, u=None):
+                        d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": resp_model,
+                             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                        if u:
+                            d["usage"] = u
+                        return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
+                    done_f = False
+                    vis_toks = 0
+                    sec_idx = -1
+                    buf_toks, read_pos, pref_pos = [], 0, 0
+                    try:
+                        yield ch({"role": "assistant", "content": ""})
+                        while True:
+                            it = await fq.get()
+                            if isinstance(it, dict):
+                                if "error" in it:
+                                    yield "data: " + json.dumps({"error": api_error(it["error"])[1]}, ensure_ascii=False) + "\n\n"
+                                    done_f = True
+                                    break
+                                if buf_toks[read_pos:]:
+                                    tail = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
+                                    prev = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
+                                    if len(tail) > len(prev):
+                                        yield ch({"content": tail[len(prev):]})
+                                fill_ms = (time.perf_counter() - t_fill0) * 1000.0
+                                wall_ms = (time.perf_counter() - t_fast0) * 1000.0
+                                usage = {
+                                    "prompt_tokens": len(ids), "completion_tokens": vis_toks,
+                                    "total_tokens": len(ids) + vis_toks,
+                                    "completion_tokens_details": {"reasoning_tokens": 0},
+                                    "dankattn": {
+                                        "fpr_mode": "fast", "sections": K,
+                                        "outline_ms": round(outline_ms, 1), "fill_ms": round(fill_ms, 1),
+                                        "wall_ms": round(wall_ms, 1),
+                                        "eff_tok_s": round(1000.0 * vis_toks / max(wall_ms, 1.0), 1),
+                                        "fill_tok_s": round(1000.0 * vis_toks / max(fill_ms, 1.0), 1),
+                                    },
+                                }
+                                yield ch({}, "stop", usage)
+                                yield "data: [DONE]\n\n"
+                                done_f = True
+                                break
+                            if isinstance(it, tuple) and it[0] == "cand_sep":
+                                if sec_idx >= 0 and buf_toks[read_pos:]:
+                                    tail = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
+                                    prev = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
+                                    if len(tail) > len(prev):
+                                        yield ch({"content": tail[len(prev):]})
+                                sec_idx += 1
+                                if sec_idx > 0:
+                                    yield ch({"content": "\n\n"})
+                                buf_toks, read_pos, pref_pos = [], 0, 0
+                            elif isinstance(it, int) and it not in (END_MSG, EOS):
+                                vis_toks += 1
+                                buf_toks.append(it)
+                                before = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
+                                text = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
+                                if not text.endswith("\ufffd") and len(text) > len(before):
+                                    read_pos = len(buf_toks)
+                                    pref_pos = max(0, read_pos - 6)
+                                    yield ch({"content": text[len(before):]})
+                    finally:
+                        if not done_f:
+                            eng.cancel(feid)
+                return StreamingResponse(gen_fast_live(), media_type="text/event-stream")
+
             try:
                 cands, st_fill = await _collect_fpr_candidates(
                     shared_ids, per_sec_max, temp, top_p, top_k, seed, 0, min_p, [END_MSG] + extra_stops,
@@ -393,19 +472,6 @@ async def chat(request: Request):
                     "fill_tok_s": round(1000.0 * vis_toks / max(fill_ms, 1.0), 1),
                 },
             }
-            if body.get("stream"):
-                async def gen_fast():
-                    def ch(delta, finish=None, u=None):
-                        d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": resp_model,
-                             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-                        if u:
-                            d["usage"] = u
-                        return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
-                    yield ch({"role": "assistant", "content": ""})
-                    yield ch({"content": final_text})
-                    yield ch({}, "stop", usage)
-                    yield "data: [DONE]\n\n"
-                return StreamingResponse(gen_fast(), media_type="text/event-stream")
             return {"id": rid, "object": "chat.completion", "created": created, "model": resp_model,
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": final_text}, "finish_reason": "stop"}],
                     "usage": usage}

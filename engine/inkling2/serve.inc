@@ -312,29 +312,63 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     fls[k].lk = std::make_unique<opus_lookup::Lookup>();
   }
 
-  // Mode 2 (Parallel Section Fill): feed each lane's short section prompt (chunks <= MAXM to use Split-KV decode path!)
+  // Mode 2 (Parallel Section Fill): batch all K lanes' short section prompts via step_lanes() + mtp_commit_lanes()!
   if (mode == 2u) {
-    for (uint32_t k = 0; k < K; k++) {
-      if (k >= q->fpr_suffixes.size() || q->fpr_suffixes[k].empty()) continue;
-      m.use_lane(int(k));
-      const auto& suf = q->fpr_suffixes[k];
-      for (size_t i = 0; i < suf.size(); i += ink2::MAXM) {
-        std::vector<uint32_t> c(suf.begin() + long(i), suf.begin() + long(std::min(suf.size(), i + ink2::MAXM)));
-        double g = 0;
-        fls[k].b = m.step(c, &g).back();
-        fls[k].b_conf = m.last_conf.empty() ? 0.0f : m.last_conf.back();
-        pms += g;
-        if (m.has_mtp) m.mtp_commit(uint32_t(c.size()));
+    std::vector<size_t> soff(K, 0);
+    for (;;) {
+      std::vector<std::pair<int, std::vector<uint32_t>>> batches;
+      std::vector<uint32_t> bk;
+      uint32_t rem_budget = ink2::MAXM;
+      for (uint32_t k = 0; k < K && rem_budget > 0u; k++) {
+        if (k >= q->fpr_suffixes.size() || soff[k] >= q->fpr_suffixes[k].size()) continue;
+        const size_t rem = q->fpr_suffixes[k].size() - soff[k];
+        const uint32_t take = uint32_t(std::min<size_t>(rem, rem_budget));
+        std::vector<uint32_t> c(q->fpr_suffixes[k].begin() + long(soff[k]),
+                                q->fpr_suffixes[k].begin() + long(soff[k] + take));
+        soff[k] += take;
+        rem_budget -= take;
+        batches.push_back({int(k), std::move(c)});
+        bk.push_back(k);
+      }
+      if (batches.empty()) break;
+      double g = 0;
+      auto out = m.step_lanes(batches, &g);
+      pms += g;
+      std::vector<ink2::Model::MtpCommitReq> creqs;
+      uint32_t r0 = 0;
+      for (size_t j = 0; j < batches.size(); j++) {
+        const uint32_t k = bk[j];
+        const auto& c = batches[j].second;
+        const uint32_t mrows = uint32_t(c.size());
+        fls[k].b = out[r0 + mrows - 1u];
+        fls[k].b_conf = (r0 + mrows - 1u < m.last_conf.size()) ? m.last_conf[r0 + mrows - 1u] : 0.0f;
+        if (m.has_mtp) creqs.push_back({int(k), r0, mrows});
         auto& hk = lane_hist()[k];
         hk.insert(hk.end(), c.begin(), c.end());
+        r0 += mrows;
       }
+      if (m.has_mtp && !creqs.empty()) m.mtp_commit_lanes(creqs, r0);
     }
     m.use_lane(0);
+  }
+
+  uint32_t n_emit = 0;
+  uint32_t next_flush = 1u;  // for mode == 2: lane 0 streams live, lanes 1..K-1 flush in order as soon as ready
+  if (mode == 2u) {
+    const float zf = 0.0f; const uint32_t zu = 0u;
+    put(q->rid, CAND_SEP);
+    fwrite(&zf, 4, 1, stdout);
+    fwrite(&zu, 4, 1, stdout);
+    fflush(stdout);
   }
 
   auto push_tok = [&](FprLane& fl, uint32_t t, float cf) -> bool {
     fl.toks.push_back(t);
     fl.confs.push_back(cf);
+    if (mode == 2u && fl.lane == 0) {
+      put(q->rid, t);
+      n_emit++;
+    }
     if (is_stop(t)) { fl.done = true; return true; }
     const uint32_t lcap = m.lane_global_cap(fl.lane);
     const uint32_t used = (fl.lane == 0) ? m.lane_pos(0) : (m.lane_pos(fl.lane) - fork_pos);
@@ -344,6 +378,20 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
       return true;
     }
     return false;
+  };
+
+  auto flush_ready_sections = [&]() {
+    if (mode != 2u || !fls[0].done) return;
+    while (next_flush < K && fls[next_flush].done) {
+      const auto& fl = fls[next_flush];
+      const float tc = 0.0f;
+      const uint32_t cf = fl.length ? 1u : 0u;
+      put(q->rid, CAND_SEP);
+      fwrite(&tc, 4, 1, stdout);
+      fwrite(&cf, 4, 1, stdout);
+      for (uint32_t t : fl.toks) { put(q->rid, t); n_emit++; }
+      next_flush++;
+    }
   };
 
   uint32_t n_finished = 0, n_pruned = 0;
@@ -439,6 +487,10 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
       r0 += mrows;
     }
     if (m.has_mtp && !creqs.empty()) m.mtp_commit_lanes(creqs, r0);
+    if (mode == 2u) {
+      flush_ready_sections();
+      fflush(stdout);
+    }
 
     // Online DeepConf confidence pruning (drop clearly spiraling lanes early when n_alive > remaining needed)
     if (prune_lvl > 0u) {
@@ -487,12 +539,26 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     if (cands.empty()) cands.push_back(0u);
   }
 
-  uint32_t n_emit = 0;
   bool out_len = false;
   int win_lane = int(cands[0]);
   float win_conf = 0.0f;
 
   if (q->cancel.load()) {
+    m.use_lane(0);
+    m.rewind(fork_pos, ck0.conv);
+    lane_hist()[0] = q->ids;
+  } else if (mode == 2u) {
+    // Flush any remaining buffered sections in order 1..K-1 (lane 0 was streamed live!)
+    while (next_flush < K) {
+      const auto& fl = fls[next_flush];
+      const float tc = tail_conf(fl);
+      const uint32_t cf = fl.length ? 1u : 0u;
+      put(q->rid, CAND_SEP);
+      fwrite(&tc, 4, 1, stdout);
+      fwrite(&cf, 4, 1, stdout);
+      for (uint32_t t : fl.toks) { put(q->rid, t); n_emit++; }
+      next_flush++;
+    }
     m.use_lane(0);
     m.rewind(fork_pos, ck0.conv);
     lane_hist()[0] = q->ids;
