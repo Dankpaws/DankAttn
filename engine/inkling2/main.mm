@@ -409,39 +409,32 @@ int main(int argc, char** argv) {
         if (!creqs.empty()) M.mtp_commit_lanes(creqs, tot_tap);
 
         std::vector<std::vector<uint32_t>> lane_drafts(act.size());
+        std::vector<ink2::LookupProp> lprops(act.size());
         std::vector<ink2::Model::MtpDraftReq> dreqs;
         std::vector<size_t> dmap;
+        const uint32_t cmax = budget > 1u ? (budget - 1u) : 0u;
         for (size_t j = 0; j < act.size(); j++) {
           auto& L = ls[act[j]];
-          if (budget > 1u && use_lookup && L.hist.size() >= 4) {
-            L.lk.sync(L.hist, false);
-            std::vector<uint32_t> tail;
-            const size_t tlen = std::min<size_t>(L.hist.size(), 63);
-            tail.insert(tail.end(), L.hist.end() - long(tlen), L.hist.end());
-            tail.push_back(L.anchor);
-            uint32_t mlen = 0;
-            uint32_t mpos = L.lk.find(L.hist, tail, &mlen);
-            if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
-              const uint32_t cap_lk = std::min<uint32_t>(budget - 1u, uint32_t(L.hist.size() - mpos));
-              for (uint32_t i = 0; i < cap_lk; i++) lane_drafts[j].push_back(L.hist[mpos + i]);
+          if (cmax > 0u) {
+            lprops[j] = ink2::lookup_prepare(L.lk, L.hist, L.anchor, cmax, use_lookup);
+            if (lprops[j].lk_only) {
+              lane_drafts[j] = ink2::lookup_merge(L.lk, L.hist, lprops[j], {}, {}, cmax, draft_cut, M.big_gpu, uint32_t(act.size()));
               lk_hits++;
+            } else {
+              dreqs.push_back({int(act[j]), L.anchor});
+              dmap.push_back(j);
             }
-          }
-          if (lane_drafts[j].empty() && budget > 1u) {
-            dreqs.push_back({int(act[j]), L.anchor});
-            dmap.push_back(j);
           }
         }
         if (!dreqs.empty()) {
           std::vector<std::vector<uint32_t>> d_out;
           std::vector<std::vector<float>> d_probs;
-          M.draft_lanes(dreqs, std::min(draft_k, budget - 1u), d_out, &d_probs);
+          M.draft_lanes(dreqs, std::min(draft_k, cmax), d_out, &d_probs);
           for (size_t di = 0; di < dreqs.size(); di++) {
-            auto& dr = d_out[di];
-            const auto& dp = d_probs[di];
-            const uint32_t keep = uint32_t(ink2::select_draft_k(dp, draft_cut, M.big_gpu, uint32_t(act.size())));
-            dr.resize(std::min<uint32_t>(keep, budget - 1u));
-            lane_drafts[dmap[di]] = std::move(dr);
+            const size_t j = dmap[di];
+            auto& L = ls[act[j]];
+            lane_drafts[j] = ink2::lookup_merge(L.lk, L.hist, lprops[j], d_out[di], d_probs[di], cmax, draft_cut,
+                                                M.big_gpu, uint32_t(act.size()));
           }
         }
         std::vector<std::pair<int, std::vector<uint32_t>>> batches;
@@ -456,11 +449,14 @@ int main(int argc, char** argv) {
         auto out = M.step_lanes(batches, &vms);
         t_verify += vms;
         uint32_t r0 = 0;
-        for (auto& [k, v] : batches) {
+        for (size_t j = 0; j < batches.size(); j++) {
+          const int k = batches[j].first;
+          const auto& v = batches[j].second;
           auto& L = ls[k];
           const uint32_t m = uint32_t(v.size());
           uint32_t acc = 0;
           while (acc + 1u < m && out[r0 + acc] == v[acc + 1u]) acc++;
+          ink2::lookup_update(L.lk, lprops[j], acc);
           const uint32_t n_adv = acc + 1u;
           M.use_lane(k);
           M.rollback(n_adv, m);
@@ -649,35 +645,23 @@ int main(int argc, char** argv) {
         double dms = 0, vms = 0, cms = 0;
         std::vector<uint32_t> drafts;
 
-        // Optional 3-gram context lookup before DSpark
-        if (use_lookup && hist.size() >= 4) {
-          lk.sync(hist, false);
-          std::vector<uint32_t> tail;
-          const size_t tlen = std::min<size_t>(hist.size(), 63);
-          tail.insert(tail.end(), hist.end() - long(tlen), hist.end());
-          tail.push_back(anchor);
-          uint32_t mlen = 0;
-          uint32_t mpos = lk.find(hist, tail, &mlen);
-          if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
-            const uint32_t cap_lk = std::min<uint32_t>(ink2::MAXM - 1u, uint32_t(hist.size() - mpos));
-            for (uint32_t i = 0; i < cap_lk; i++) drafts.push_back(hist[mpos + i]);
-            lk_hits++;
+        // EMA-gated 3-gram context lookup + DSpark merge (up to MAXM-1 = 15 tokens)
+        const uint32_t cmax = ink2::MAXM - 1u;
+        ink2::LookupProp lp = ink2::lookup_prepare(lk, hist, anchor, cmax, use_lookup);
+        if (lp.lk_only) {
+          drafts = ink2::lookup_merge(lk, hist, lp, {}, {}, cmax, draft_cut, M.big_gpu, 1u);
+          lk_hits++;
+          if (pending_commit > 0) {
+            M.mtp_commit(pending_commit, &cms);
+            pending_commit = 0;
+            t_commit += cms;
           }
-        }
-
-        if (drafts.empty()) {
+        } else {
           std::vector<float> dprobs;
-          drafts = M.draft(anchor, draft_k, &dprobs, &dms, pending_commit);
+          auto d_toks = M.draft(anchor, draft_k, &dprobs, &dms, pending_commit);
           pending_commit = 0;
           t_draft += dms;
-          if (draft_cut > 0.0f) {
-            const uint32_t keep = uint32_t(ink2::select_draft_k(dprobs, draft_cut, M.big_gpu, 1u));
-            drafts.resize(keep);
-          }
-        } else if (pending_commit > 0) {
-          M.mtp_commit(pending_commit, &cms);
-          pending_commit = 0;
-          t_commit += cms;
+          drafts = ink2::lookup_merge(lk, hist, lp, d_toks, dprobs, cmax, draft_cut, M.big_gpu, 1u);
         }
 
         // Verify [anchor, d0, ..., d_{k-1}] (M = 1 + drafts.size() <= 16)
@@ -693,6 +677,7 @@ int main(int argc, char** argv) {
         // Count longest accepted prefix: v_out[i] predicts the token AFTER v_in[i]
         uint32_t acc = 0;
         while (acc < drafts.size() && v_out[acc] == drafts[acc]) acc++;
+        ink2::lookup_update(lk, lp, acc);
         const uint32_t n_adv = acc + 1u;
         M.rollback(n_adv, uint32_t(v_in.size()));
         pending_commit = n_adv;

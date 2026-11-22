@@ -2,6 +2,7 @@
 // Shares register-direct matmuls (kernels/mm2.metal: W8, W6, native NVFP4 WBITS=40, native MXFP8 WBITS=80)
 // and mtl.h with Hy4 and Flash-Next.
 #pragma once
+#include "../lookup.h"
 #include "../mtl.h"
 #include "../mm_args.h"
 #include <algorithm>
@@ -16,7 +17,8 @@ namespace ink2 {
 // Fan-out-aware expected-tokens/ms draft length selector (exactness-preserving: only trims draft count k in 0..K).
 // Models 128-expert top-8 MoE verify cost T(M) = t0 + c_moe * (1 - (120/128)^M) plus draft overhead t_draft.
 // Set INK_DRAFT_ADAPT=0 to fall back to the legacy per-token threshold `dp[k] >= draft_cut`.
-inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool big_gpu, uint32_t active_lanes = 1) {
+inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool big_gpu, uint32_t active_lanes = 1,
+                             bool pre_calibrated = false, bool has_draft_cost = true) {
   static const int adapt = getenv("INK_DRAFT_ADAPT") ? atoi(getenv("INK_DRAFT_ADAPT")) : 1;
   if (adapt == 0 || dp.empty()) {
     size_t keep = 0;
@@ -25,9 +27,10 @@ inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool
   }
   const double t0 = big_gpu ? 0.838 : 0.726;
   const double c_moe = (big_gpu ? 2.59 : 4.39) / (active_lanes > 1 ? (1.0 + 0.35 * double(active_lanes - 1)) : 1.0);
-  const double t_draft = (big_gpu ? 0.17 : 0.22) / double(active_lanes > 0 ? active_lanes : 1);
+  const double t_draft = has_draft_cost ? ((big_gpu ? 0.17 : 0.22) / double(active_lanes > 0 ? active_lanes : 1)) : 0.0;
   // Calibrate slightly optimistic DSpark p_max (0.85 hits 212 tok/s on code_prompt.bin and 153 tok/s on 8k doc).
   static const double p_scale = getenv("INK_DRAFT_PSCALE") ? atof(getenv("INK_DRAFT_PSCALE")) : 0.85;
+  const double scale = pre_calibrated ? 1.0 : p_scale;
 
   double best_rate = 1.0 / (t_draft + t0 + c_moe * (1.0 - 120.0 / 128.0));
   size_t best_k = 0;
@@ -35,7 +38,7 @@ inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool
   double exp_tok = 1.0;
   double miss = 120.0 / 128.0;
   for (size_t k = 0; k < dp.size(); k++) {
-    const double pk = std::min(1.0, std::max(0.0, double(dp[k]) * p_scale));
+    const double pk = std::min(1.0, std::max(0.0, double(dp[k]) * scale));
     cum_p *= pk;
     exp_tok += cum_p;
     miss *= (120.0 / 128.0);
@@ -46,6 +49,122 @@ inline size_t select_draft_k(const std::vector<float>& dp, float draft_cut, bool
     }
   }
   return best_k;
+}
+
+// EMA-gated 3-gram context-lookup merge (ported from hy4/spec.inc) unified with fan-out-aware draft selection.
+// Set INK_LK_MERGE=0 to fall back to the legacy `mlen >= 4` unconditional 15-token lookup.
+struct LookupProp {
+  std::vector<uint32_t> tail;
+  std::vector<uint8_t> src;   // 0=DSpark, 1=Lookup, 2=Both
+  std::vector<uint32_t> clen; // match length when proposed
+  uint32_t cp = opus_lookup::Lookup::NONE;
+  uint32_t cl = 0;
+  bool lk_only = false;
+};
+
+inline bool lookup_merge_enabled() {
+  static const int en = getenv("INK_LK_MERGE") ? atoi(getenv("INK_LK_MERGE")) : 1;
+  return en != 0;
+}
+
+inline LookupProp lookup_prepare(opus_lookup::Lookup& lk, const std::vector<uint32_t>& hist, uint32_t anchor,
+                                 uint32_t cmax, bool use_lookup) {
+  LookupProp lp;
+  if (!use_lookup || cmax == 0 || hist.size() < 4) return lp;
+  lk.sync(hist, false);
+  const size_t tlen = std::min<size_t>(hist.size(), opus_lookup::Lookup::MAXLEN - 1u);
+  lp.tail.reserve(tlen + 1u + cmax);
+  lp.tail.insert(lp.tail.end(), hist.end() - long(tlen), hist.end());
+  lp.tail.push_back(anchor);
+  lp.cp = lk.find(hist, lp.tail, &lp.cl);
+  if (lp.cp == opus_lookup::Lookup::NONE) return lp;
+
+  if (!lookup_merge_enabled()) {
+    // Legacy: skip DSpark on any mlen >= 4 match
+    lp.lk_only = (lp.cl >= 4u);
+    return lp;
+  }
+  static const uint32_t skip_len = getenv("INK_LK_SKIP_LEN") ? uint32_t(atoi(getenv("INK_LK_SKIP_LEN"))) : 6u;
+  static const double skip_rate = getenv("INK_LK_SKIP_RATE") ? atof(getenv("INK_LK_SKIP_RATE")) : 0.65;
+  const uint32_t avail = (lp.cp < hist.size()) ? uint32_t(hist.size() - lp.cp) : 0u;
+  lp.lk_only = (lp.cl >= skip_len && avail >= std::min<uint32_t>(4u, cmax) &&
+                lk.rate[opus_lookup::Lookup::bucket(lp.cl)] >= skip_rate);
+  return lp;
+}
+
+inline std::vector<uint32_t> lookup_merge(const opus_lookup::Lookup& lk, const std::vector<uint32_t>& hist,
+                                          LookupProp& lp, const std::vector<uint32_t>& d_toks,
+                                          const std::vector<float>& d_probs, uint32_t cmax, float draft_cut,
+                                          bool big_gpu, uint32_t active_lanes = 1) {
+  std::vector<uint32_t> out;
+  if (cmax == 0) return out;
+  if (!lookup_merge_enabled()) {
+    if (lp.lk_only) {
+      const uint32_t cap = std::min<uint32_t>(cmax, uint32_t(hist.size() - lp.cp));
+      out.reserve(cap);
+      for (uint32_t i = 0; i < cap; i++) out.push_back(hist[lp.cp + i]);
+      return out;
+    }
+    const uint32_t keep = std::min<uint32_t>(uint32_t(select_draft_k(d_probs, draft_cut, big_gpu, active_lanes)), cmax);
+    out.assign(d_toks.begin(), d_toks.begin() + std::min<size_t>(keep, d_toks.size()));
+    return out;
+  }
+
+  static const double p_scale = getenv("INK_DRAFT_PSCALE") ? atof(getenv("INK_DRAFT_PSCALE")) : 0.85;
+  const uint32_t K = uint32_t(std::min(d_toks.size(), d_probs.size()));
+  uint32_t cp = lp.cp, cl = lp.cl;
+  bool dr_ok = (K > 0 && !lp.lk_only);
+  std::vector<float> merged_p;
+  merged_p.reserve(cmax);
+  out.reserve(cmax);
+  lp.src.clear();
+  lp.clen.clear();
+
+  while (out.size() < cmax) {
+    const uint32_t i = uint32_t(out.size());
+    const bool hm = dr_ok && i < K;
+    const bool hl = (cp != opus_lookup::Lookup::NONE && cp < hist.size());
+    if (!hm && !hl) break;
+    const double pl = hl ? lk.rate[opus_lookup::Lookup::bucket(cl)] : 0.0;
+    const double pm = hm ? std::min(1.0, std::max(0.0, double(d_probs[i]) * p_scale)) : 0.0;
+    uint32_t t;
+    uint8_t s;
+    double pk;
+    if (hm && hl && d_toks[i] == hist[cp]) {
+      t = d_toks[i]; s = 2; pk = std::max(pm, pl);
+    } else if (hm && (!hl || pl <= pm)) {
+      t = d_toks[i]; s = 0; pk = pm;
+    } else {
+      t = hist[cp]; s = 1; pk = pl; dr_ok = false;
+    }
+    out.push_back(t);
+    merged_p.push_back(float(pk));
+    lp.src.push_back(s);
+    lp.clen.push_back(cl);
+    lp.tail.push_back(t);
+    if (hl && hist[cp] == t) { cp++; cl++; }
+    else cp = lk.find(hist, lp.tail, &cl);
+  }
+
+  if (out.empty()) return out;
+  const uint32_t keep = std::min<uint32_t>(
+      uint32_t(select_draft_k(merged_p, draft_cut, big_gpu, active_lanes, /*pre_calibrated=*/true,
+                              /*has_draft_cost=*/!lp.lk_only)),
+      uint32_t(out.size()));
+  out.resize(keep);
+  lp.src.resize(keep);
+  lp.clen.resize(keep);
+  return out;
+}
+
+inline void lookup_update(opus_lookup::Lookup& lk, const LookupProp& lp, uint32_t accepted) {
+  if (!lookup_merge_enabled() || lp.src.empty()) return;
+  const uint32_t n = uint32_t(lp.src.size());
+  for (uint32_t i = 0; i < n && i <= accepted; i++) {
+    if (lp.src[i] != 1u) continue;
+    double& r = lk.rate[opus_lookup::Lookup::bucket(lp.clen[i])];
+    r = 0.9 * r + 0.1 * (i < accepted ? 1.0 : 0.0);
+  }
 }
 
 constexpr uint32_t MAXM = 16;   // rows per decode / verify step (mm2)

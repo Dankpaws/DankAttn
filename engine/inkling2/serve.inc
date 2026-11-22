@@ -549,27 +549,19 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     if (n_finished >= Q || step_idx.empty()) break;
 
     const uint32_t budget = std::max(1u, ink2::MAXM / uint32_t(step_idx.size()));
+    const uint32_t cmax = budget > 1u ? (budget - 1u) : 0u;
     std::vector<std::vector<uint32_t>> lane_drafts(step_idx.size());
+    std::vector<ink2::LookupProp> lprops(step_idx.size());
     std::vector<ink2::Model::MtpDraftReq> dreqs;
     std::vector<size_t> dreq_map;
     for (size_t j = 0; j < step_idx.size(); j++) {
       FprLane& fl = fls[step_idx[j]];
       auto& h = lane_hist()[fl.lane];
-      if (spec && budget > 1u) {
-        if (use_lookup && h.size() >= 4) {
-          fl.lk->sync(h, false);
-          std::vector<uint32_t> tail;
-          const size_t tlen = std::min<size_t>(h.size(), 63);
-          tail.insert(tail.end(), h.end() - long(tlen), h.end());
-          tail.push_back(fl.b);
-          uint32_t mlen = 0;
-          const uint32_t mpos = fl.lk->find(h, tail, &mlen);
-          if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
-            const uint32_t cap_lk = std::min<uint32_t>(budget - 1u, uint32_t(h.size() - mpos));
-            for (uint32_t l = 0; l < cap_lk; l++) lane_drafts[j].push_back(h[mpos + l]);
-          }
-        }
-        if (lane_drafts[j].empty()) {
+      if (spec && cmax > 0u) {
+        lprops[j] = ink2::lookup_prepare(*fl.lk, h, fl.b, cmax, use_lookup);
+        if (lprops[j].lk_only) {
+          lane_drafts[j] = ink2::lookup_merge(*fl.lk, h, lprops[j], {}, {}, cmax, draft_cut, m.big_gpu, uint32_t(step_idx.size()));
+        } else {
           dreqs.push_back({fl.lane, fl.b});
           dreq_map.push_back(j);
         }
@@ -578,13 +570,12 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     if (!dreqs.empty()) {
       std::vector<std::vector<uint32_t>> d_out;
       std::vector<std::vector<float>> d_probs;
-      m.draft_lanes(dreqs, std::min(draft_k, budget - 1u), d_out, &d_probs);
+      m.draft_lanes(dreqs, std::min(draft_k, cmax), d_out, &d_probs);
       for (size_t di = 0; di < dreqs.size(); di++) {
-        auto& dr = d_out[di];
-        const auto& dp = d_probs[di];
-        const uint32_t keep = uint32_t(ink2::select_draft_k(dp, draft_cut, m.big_gpu, uint32_t(step_idx.size())));
-        dr.resize(std::min<uint32_t>(keep, budget - 1u));
-        lane_drafts[dreq_map[di]] = std::move(dr);
+        const size_t j = dreq_map[di];
+        FprLane& fl = fls[step_idx[j]];
+        lane_drafts[j] = ink2::lookup_merge(*fl.lk, lane_hist()[fl.lane], lprops[j], d_out[di], d_probs[di],
+                                            cmax, draft_cut, m.big_gpu, uint32_t(step_idx.size()));
       }
     }
     std::vector<std::pair<int, std::vector<uint32_t>>> batches;
@@ -604,6 +595,7 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
       const uint32_t mrows = uint32_t(v.size());
       uint32_t acc = 0;
       while (acc + 1u < mrows && out[r0 + acc] == v[acc + 1u]) acc++;
+      if (spec) ink2::lookup_update(*fl.lk, lprops[j], acc);
       bool stop = false;
       uint32_t emitted = 0;
       while (emitted < acc && !stop) {
@@ -951,27 +943,19 @@ int main(ink2::Model& m) {
       if (!step_idx.empty()) {
         // 4) Batched drafts across lanes, one joint verify
         const uint32_t budget = std::max(1u, ink2::MAXM / uint32_t(step_idx.size()));
+        const uint32_t cmax = budget > 1u ? (budget - 1u) : 0u;
         std::vector<std::vector<uint32_t>> lane_drafts(step_idx.size());
+        std::vector<ink2::LookupProp> lprops(step_idx.size());
         std::vector<ink2::Model::MtpDraftReq> dreqs;
         std::vector<size_t> dreq_map;
         for (size_t j = 0; j < step_idx.size(); j++) {
           Active& a = active[step_idx[j]];
           auto& h = lane_hist()[a.lane];
-          if (a.spec && budget > 1u) {
-            if (use_lookup && h.size() >= 4) {
-              a.lk->sync(h, false);
-              std::vector<uint32_t> tail;
-              const size_t tlen = std::min<size_t>(h.size(), 63);
-              tail.insert(tail.end(), h.end() - long(tlen), h.end());
-              tail.push_back(a.b);
-              uint32_t mlen = 0;
-              const uint32_t mpos = a.lk->find(h, tail, &mlen);
-              if (mpos != opus_lookup::Lookup::NONE && mlen >= 4) {
-                const uint32_t cap_lk = std::min<uint32_t>(budget - 1u, uint32_t(h.size() - mpos));
-                for (uint32_t k = 0; k < cap_lk; k++) lane_drafts[j].push_back(h[mpos + k]);
-              }
-            }
-            if (lane_drafts[j].empty()) {
+          if (a.spec && cmax > 0u) {
+            lprops[j] = ink2::lookup_prepare(*a.lk, h, a.b, cmax, use_lookup);
+            if (lprops[j].lk_only) {
+              lane_drafts[j] = ink2::lookup_merge(*a.lk, h, lprops[j], {}, {}, cmax, draft_cut, m.big_gpu, uint32_t(step_idx.size()));
+            } else {
               dreqs.push_back({a.lane, a.b});
               dreq_map.push_back(j);
             }
@@ -980,13 +964,12 @@ int main(ink2::Model& m) {
         if (!dreqs.empty()) {
           std::vector<std::vector<uint32_t>> d_out;
           std::vector<std::vector<float>> d_probs;
-          m.draft_lanes(dreqs, std::min(draft_k, budget - 1u), d_out, &d_probs);
+          m.draft_lanes(dreqs, std::min(draft_k, cmax), d_out, &d_probs);
           for (size_t di = 0; di < dreqs.size(); di++) {
-            auto& dr = d_out[di];
-            const auto& dp = d_probs[di];
-            const uint32_t keep = uint32_t(ink2::select_draft_k(dp, draft_cut, m.big_gpu, uint32_t(step_idx.size())));
-            dr.resize(std::min<uint32_t>(keep, budget - 1u));
-            lane_drafts[dreq_map[di]] = std::move(dr);
+            const size_t j = dreq_map[di];
+            Active& a = active[step_idx[j]];
+            lane_drafts[j] = ink2::lookup_merge(*a.lk, lane_hist()[a.lane], lprops[j], d_out[di], d_probs[di],
+                                                cmax, draft_cut, m.big_gpu, uint32_t(step_idx.size()));
           }
         }
         std::vector<std::pair<int, std::vector<uint32_t>>> batches;
@@ -1007,6 +990,7 @@ int main(ink2::Model& m) {
           const uint32_t mrows = uint32_t(v.size());
           uint32_t acc = 0;
           while (acc + 1u < mrows && out[r0 + acc] == v[acc + 1u]) acc++;
+          if (a.spec) ink2::lookup_update(*a.lk, lprops[j], acc);
           bool stop = false;
           uint32_t emitted = 0;  // accepted drafts emitted (the anchor v[0] went out in step 3)
           while (emitted < acc && !stop) stop = emit_tok(m, a, v[1u + emitted++]);
