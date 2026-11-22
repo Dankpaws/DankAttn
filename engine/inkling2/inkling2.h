@@ -17,7 +17,7 @@ constexpr uint32_t MTP_MAXB = MTP_MAXL * 8u; // 64 rows across 8 lanes x block_s
 constexpr uint32_t MP = 512;    // max rows per chunked prefill step (mmp / mmpg)
 constexpr uint32_t PF_COMPACT = 6144;  // max compact padded MoE rows for MP=512 (512*8 + 128*15 = 6016)
 constexpr uint32_t MAX_BLOCKS = 12;
-constexpr uint32_t ASPLITS = 24; // max attention key splits (fixed per layer -> bit-exact across M)
+constexpr uint32_t ASPLITS = 64; // max attention key splits (fixed per layer -> bit-exact across M)
 
 struct Lin {
   id<MTLBuffer> w = nil, s = nil;

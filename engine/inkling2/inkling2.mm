@@ -246,8 +246,14 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   {
     NSString* dname = [C.dev name];
     big_gpu = dname && ([dname containsString:@"Ultra"] || [dname containsString:@"Max"]);
-    nsp_local = big_gpu ? 12u : 8u;
-    nsp_global = big_gpu ? 24u : 8u;
+    // Decode attention key splits (one serial key chain per simdgroup, so more splits = shorter chains). M5 Ultra
+    // 2026-11-22, 12/24 -> 24/64: ctx 512 +0.05 ms, 8k -0.39, 30k -1.18 (13.55 -> 12.37 ms); 96/128 global splits
+    // lose to the longer reduce. Base M5 keeps 8/8 (not re-measured).
+    nsp_local = big_gpu ? 24u : 8u;
+    nsp_global = big_gpu ? 64u : 8u;
+    // INK_NSP_LOCAL / INK_NSP_GLOBAL: decode attention key splits per (row, kv head), 1..ASPLITS.
+    if (getenv("INK_NSP_LOCAL")) nsp_local = std::clamp<uint32_t>(uint32_t(atoi(getenv("INK_NSP_LOCAL"))), 1u, ASPLITS);
+    if (getenv("INK_NSP_GLOBAL")) nsp_global = std::clamp<uint32_t>(uint32_t(atoi(getenv("INK_NSP_GLOBAL"))), 1u, ASPLITS);
   }
 
   NSData* jd = [NSData dataWithContentsOfFile:@((dir + "/manifest.json").c_str())];
