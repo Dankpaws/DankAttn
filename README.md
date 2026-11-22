@@ -73,24 +73,33 @@ See [hy4/ARCHITECTURE_AND_PERF.md](hy4/ARCHITECTURE_AND_PERF.md) for per-op prof
 
 ## Benchmarks & Quickstart (Inkling-2-Mini, `pack-inkling2-mini-w8`)
 
-Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16), `kv8` on the 8 global layers, DSpark MTP (`K=7, cut=0.50`) + 3-gram lookup (`19.91 GB` mapped + `1.33 GB` GPU state at `cap=32k`; measured 2026-11-21 at `cf05d1f`):
+Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16; MMLU **86.23%** vs SGLang BF16-KV 85.96%), `kv8` on the 8 global layers, fan-out-aware adaptive DSpark MTP + 3-gram lookup, zero-copy Split-KV multi-lane serving (`:4x-fast` / `:8x-fast` / `:4x-select`), and persistent SSD prefix caching (`19.91 GB` mapped + `1.38 GB` GPU state at `cap=32k`, fits in **32 GB RAM** up to **128k context**):
 
 | Workload | M5 Ultra Mac Studio (96 GB) | Base M5 MacBook Pro (32 GB) |
 | :--- | :---: | :---: |
-| `vtest` (`M=5` vs `M=1`) | `0.000e+00` (BIT-EXACT) | `0.000e+00` (BIT-EXACT) |
-| Prefill 2,048 tok (`MP=512`) | **4,607.0 tok/s GPU** (0.44 s) | **729.7 tok/s GPU** (2.81 s) |
-| Prefill 8,192 tok (`MP=512`) | **4,335.3 tok/s GPU** (1.89 s) | **719.0 tok/s GPU** (11.39 s) |
-| Decode `M=1` (`ctx=512 / 2k / 8k`) | **82.3 / 79.2 / 76.7 tok/s GPU** | **25.8 / 24.8 / 24.5 tok/s GPU** |
-| Speculative (`code_prompt.bin`, 256 tok) | **204.9 tok/s wall** (256/256 exact) | **46.3 tok/s wall** (256/256 exact) |
+| `vtest` (`M=5` vs `M=1`) / `ctest` (SSD prefix) | `0.000e+00` (**BIT-EXACT**) | `0.000e+00` (**BIT-EXACT**) |
+| Prefill 2,048 / 8,192 / 32,768 tok (`MP=512`) | **4,588 / 4,288 / 3,371 tok/s GPU** | **730 / 719 tok/s GPU** (2k / 8k) |
+| Decode `M=1` (`ctx=512 / 2k / 8k`) | **93.3 / 90.6 / 89.4 tok/s GPU** (`90.6 / 88.2 / 86.9` wall) | **25.8 / 24.8 / 24.5 tok/s GPU** |
+| Speculative (`code_prompt.bin`, 256 tok) | **204.9+ tok/s wall** (256/256 exact) | **46.3 tok/s wall** (256/256 exact) |
+| Multi-lane (`jspec` 4 lanes / `lbench` 16 lanes) | **317.1 tok/s wall** (1024/1024 exact) / **501 tok/s GPU** | **65.8 tok/s wall** (4 lanes) |
+| Parallel Section Fill (`:4x-fast` / `:8x-fast`, live SSE) | **319.0 / 343.6 eff visible tok/s** (TTFT 1.55–2.15 s) | — |
+| SSD Prefix Cache restore (`ctest`, 8,000 tok) | **20.9 ms** (346 MB, `0.000e+00` exact) | — |
 
 ```sh
+# Build & verify
 sh inkling2/build_inkling2.sh
 ./build/dankattn-inkling2 "$INK_PACK" vtest
+./build/dankattn-inkling2 "$INK_PACK" ctest prompt_ids.bin 1500
 ./build/dankattn-inkling2 "$INK_PACK" pfbench 2048
 ./build/dankattn-inkling2 "$INK_PACK" spec 256 prompt_ids.bin
+
+# Start OpenAI-compatible server on :8342 (8 lanes, 128k L0 + 16k Split-KV side lanes, SSD prefix cache)
+INK_PACK=/path/to/pack-inkling2-mini-w8 INK_CAP=131072 INK_LANES=8 INK_SIDE_CAP=16384 \
+  sh server/inkling2_serve.sh start
+sh server/inkling2_serve.sh smoke
 ```
 
-See [inkling2/ARCHITECTURE_AND_PERF.md](inkling2/ARCHITECTURE_AND_PERF.md) for architecture details, MoE fan-out analysis, packing instructions, CLI flags, and environment variables.
+See [inkling2/ARCHITECTURE_AND_PERF.md](inkling2/ARCHITECTURE_AND_PERF.md) for architecture details, head-to-head benchmarks, MoE fan-out analysis, packing instructions, CLI flags, and environment variables.
 
 ## Architecture Highlights
 
@@ -114,8 +123,9 @@ engine/
     attn.metal          Flash-Next attention kernels
     ops.metal           Flash-Next GDN and MoE kernels
   inkling2/
-    inkling2.h, inkling2.mm  Inkling-2-Mini loader, step (decode/prefill), rollback, DSpark draft
-    main.mm             CLI driver (smoke, vtest, pfbench, bench, vbench, dprof, spec, gen)
+    inkling2.h, inkling2.mm  Inkling-2-Mini loader, step/step_lanes, Split-KV, rollback, DSpark, SSD prefix cache
+    serve.inc           Binary protocol (OPUS/OPCX), multi-lane scheduler, FPR modes, SSD prefix cache
+    main.mm             CLI driver (smoke, vtest, ctest, forktest, ltest, pfbench, bench, vbench2, spec, jspec, serve)
   hy4/
     config.h            All HY4_* environment variables and defaults
     hy4.h, hy4.mm       Hy4 model loader, step/step_lanes, draft/draft_lanes, prefix cache
@@ -124,6 +134,8 @@ engine/
     main.mm             CLI driver (bench, spec, vtest, ntest, ctest, jtest, pprof, dprof, serve)
 server/
   engine_frontend.py    Shared subprocess supervisor, binary framing, prefix splicer, HTTP helpers
+  inkling2_server.py    OpenAI-compatible FastAPI server for Inkling-2-Mini (tools, reasoning, :Nx-fast / :Nx-select)
+  inkling2_serve.sh     Start/stop/status/smoke wrapper for :8342
   hy4_server.py         OpenAI-compatible FastAPI server for Hy4
   dankattn_server.py    OpenAI-compatible FastAPI server for Flash-Next
 inkling2/

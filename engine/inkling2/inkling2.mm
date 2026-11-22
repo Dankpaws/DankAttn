@@ -783,6 +783,15 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   }
 
   reset();
+  // Compute 64-bit FNV-1a fingerprint of pack & KV layout for SSD prefix cache validation.
+  {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+    for (unsigned char c : dir) mix(c);
+    mix(mapped_bytes); mix(H); mix(nL); mix(num_passes); mix(window);
+    mix(use_kv8 ? 1u : 0u); mix(has_mtp ? 1u : 0u); mix(uint64_t(S.size()));
+    fingerprint = h;
+  }
   fprintf(stderr, "inkling2: loaded %s (%.2f GB mapped, %.2f GB GPU state, %u phys -> %u logical, %u passes, cap=%u, kv8=%d, dspark=%d)\n",
           dir.c_str(), mapped_bytes / 1e9, C.allocated / 1e9, nL, uint32_t(S.size()), num_passes, cap, int(use_kv8), int(has_mtp));
 }
@@ -3007,6 +3016,210 @@ void Model::draft_lanes(const std::vector<MtpDraftReq>& reqs, uint32_t max_draft
     }
   }
   if (gpu_ms) *gpu_ms = tot_ms;
+}
+
+namespace {
+struct InkPrefixHdr {
+  uint32_t magic;       // 0x504B4E49u ("INKP")
+  uint32_t version;     // 1
+  uint64_t fingerprint;
+  uint32_t pos;
+  uint32_t n_log;
+  uint32_t use_kv8;
+  uint32_t has_mtp;
+  uint32_t mtp_ctx_pos;
+  uint32_t window;
+};
+constexpr uint32_t kInkPrefixMagic = 0x504B4E49u;
+constexpr uint32_t kInkPrefixVer = 1u;
+
+bool write_all(FILE* f, const void* p, size_t n) {
+  return n == 0 || fwrite(p, 1, n, f) == n;
+}
+bool read_all(FILE* f, void* p, size_t n) {
+  return n == 0 || fread(p, 1, n, f) == n;
+}
+}  // namespace
+
+bool Model::prefix_tokens(const std::string& path, uint64_t fp, std::vector<uint32_t>& toks, size_t* bytes) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+  InkPrefixHdr hdr{};
+  bool ok = read_all(f, &hdr, sizeof(hdr)) && hdr.magic == kInkPrefixMagic &&
+            hdr.version == kInkPrefixVer && hdr.fingerprint == fp && hdr.pos > 0;
+  if (ok) {
+    toks.resize(hdr.pos);
+    ok = read_all(f, toks.data(), size_t(hdr.pos) * sizeof(uint32_t));
+  }
+  if (ok && bytes) {
+    struct stat st{};
+    *bytes = (fstat(fileno(f), &st) == 0) ? size_t(st.st_size) : 0;
+  }
+  fclose(f);
+  if (!ok) toks.clear();
+  return ok;
+}
+
+bool Model::save_prefix(const std::string& path, const std::vector<uint32_t>& history,
+                        double* ms, size_t* out_bytes) const {
+  if (pos == 0 || fork_pos != 0 || history.size() < pos) return false;
+  const double t0 = CFAbsoluteTimeGetCurrent();
+  const std::string tmp = path + ".tmp";
+  FILE* f = fopen(tmp.c_str(), "wb");
+  if (!f) return false;
+
+  InkPrefixHdr hdr{kInkPrefixMagic, kInkPrefixVer, fingerprint, pos, uint32_t(S.size()),
+                   use_kv8 ? 1u : 0u, has_mtp ? 1u : 0u, mtp_ctx_pos, window};
+  bool ok = write_all(f, &hdr, sizeof(hdr)) &&
+            write_all(f, history.data(), size_t(pos) * sizeof(uint32_t));
+
+  const size_t c_kv = size_t(nkv) * hd;
+  const size_t kv_conv_bytes = 3u * c_kv * sizeof(float);
+  const size_t h_conv_bytes = 3u * size_t(H) * sizeof(float);
+  const size_t kv_row_bf16 = c_kv * sizeof(uint16_t);
+  const size_t kv_row_i8 = c_kv * sizeof(int8_t);
+  const size_t kv_row_sc = size_t(nkv) * sizeof(uint16_t);
+
+  auto write_ring = [&](id<MTLBuffer> buf, uint32_t P, uint32_t rcap, size_t row_bytes) -> bool {
+    const uint32_t n = std::min(P, window);
+    if (n == 0) return true;
+    const uint32_t start = (P - n) % rcap;
+    const uint32_t first = std::min(n, rcap - start);
+    const uint8_t* p = (const uint8_t*)[buf contents];
+    if (!write_all(f, p + size_t(start) * row_bytes, size_t(first) * row_bytes)) return false;
+    if (n > first && !write_all(f, p, size_t(n - first) * row_bytes)) return false;
+    return true;
+  };
+
+  for (size_t i = 0; ok && i < S.size(); i++) {
+    const auto& st = S[i];
+    ok = write_all(f, [st.k_conv contents], kv_conv_bytes) &&
+         write_all(f, [st.v_conv contents], kv_conv_bytes) &&
+         write_all(f, [st.attn_conv contents], h_conv_bytes) &&
+         write_all(f, [st.mlp_conv contents], h_conv_bytes);
+    if (!ok) break;
+    if (L[st.phys_idx].is_local) {
+      ok = write_ring(st.k_cache, pos, st.cap, kv_row_bf16) &&
+           write_ring(st.v_cache, pos, st.cap, kv_row_bf16);
+    } else if (st.kv8) {
+      ok = write_all(f, [st.k_i8 contents], size_t(pos) * kv_row_i8) &&
+           write_all(f, [st.k_sc contents], size_t(pos) * kv_row_sc) &&
+           write_all(f, [st.v_i8 contents], size_t(pos) * kv_row_i8) &&
+           write_all(f, [st.v_sc contents], size_t(pos) * kv_row_sc);
+    } else {
+      ok = write_all(f, [st.k_cache contents], size_t(pos) * kv_row_bf16) &&
+           write_all(f, [st.v_cache contents], size_t(pos) * kv_row_bf16);
+    }
+  }
+
+  if (ok && has_mtp) {
+    ok = write_all(f, [b_mtp_f_rnn contents], size_t(H) * sizeof(float));
+    for (size_t l = 0; ok && l < MtpL.size(); l++) {
+      const auto& ml = MtpL[l];
+      if (ml.is_local) {
+        ok = write_ring(ml.k_cache, mtp_ctx_pos, ml.cap, kv_row_bf16) &&
+             write_ring(ml.v_cache, mtp_ctx_pos, ml.cap, kv_row_bf16);
+      } else {
+        ok = write_all(f, [ml.k_cache contents], size_t(mtp_ctx_pos) * kv_row_bf16) &&
+             write_all(f, [ml.v_cache contents], size_t(mtp_ctx_pos) * kv_row_bf16);
+      }
+    }
+  }
+
+  if (ok) ok = (fflush(f) == 0);
+  size_t sz = 0;
+  if (ok) {
+    struct stat st{};
+    if (fstat(fileno(f), &st) == 0) sz = size_t(st.st_size);
+  }
+  fclose(f);
+  if (ok && rename(tmp.c_str(), path.c_str()) != 0) ok = false;
+  if (!ok) unlink(tmp.c_str());
+  if (ms) *ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+  if (out_bytes) *out_bytes = ok ? sz : 0;
+  return ok;
+}
+
+uint32_t Model::load_prefix(const std::string& path, std::vector<uint32_t>* out_toks, double* ms) {
+  const double t0 = CFAbsoluteTimeGetCurrent();
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return 0;
+  InkPrefixHdr hdr{};
+  bool ok = read_all(f, &hdr, sizeof(hdr)) && hdr.magic == kInkPrefixMagic &&
+            hdr.version == kInkPrefixVer && hdr.fingerprint == fingerprint &&
+            hdr.n_log == S.size() && hdr.pos > 0 && hdr.pos <= cap &&
+            hdr.use_kv8 == (use_kv8 ? 1u : 0u) && hdr.has_mtp == (has_mtp ? 1u : 0u) &&
+            hdr.window == window;
+  std::vector<uint32_t> toks;
+  if (ok) {
+    toks.resize(hdr.pos);
+    ok = read_all(f, toks.data(), size_t(hdr.pos) * sizeof(uint32_t));
+  }
+
+  const size_t c_kv = size_t(nkv) * hd;
+  const size_t kv_conv_bytes = 3u * c_kv * sizeof(float);
+  const size_t h_conv_bytes = 3u * size_t(H) * sizeof(float);
+  const size_t kv_row_bf16 = c_kv * sizeof(uint16_t);
+  const size_t kv_row_i8 = c_kv * sizeof(int8_t);
+  const size_t kv_row_sc = size_t(nkv) * sizeof(uint16_t);
+
+  auto read_ring = [&](id<MTLBuffer> buf, uint32_t P, uint32_t rcap, size_t row_bytes) -> bool {
+    const uint32_t n = std::min(P, window);
+    if (n == 0) return true;
+    const uint32_t start = (P - n) % rcap;
+    const uint32_t first = std::min(n, rcap - start);
+    uint8_t* p = (uint8_t*)[buf contents];
+    if (!read_all(f, p + size_t(start) * row_bytes, size_t(first) * row_bytes)) return false;
+    if (n > first && !read_all(f, p, size_t(n - first) * row_bytes)) return false;
+    return true;
+  };
+
+  for (size_t i = 0; ok && i < S.size(); i++) {
+    auto& st = S[i];
+    ok = read_all(f, [st.k_conv contents], kv_conv_bytes) &&
+         read_all(f, [st.v_conv contents], kv_conv_bytes) &&
+         read_all(f, [st.attn_conv contents], h_conv_bytes) &&
+         read_all(f, [st.mlp_conv contents], h_conv_bytes);
+    if (!ok) break;
+    if (L[st.phys_idx].is_local) {
+      ok = read_ring(st.k_cache, hdr.pos, st.cap, kv_row_bf16) &&
+           read_ring(st.v_cache, hdr.pos, st.cap, kv_row_bf16);
+    } else if (st.kv8) {
+      ok = read_all(f, [st.k_i8 contents], size_t(hdr.pos) * kv_row_i8) &&
+           read_all(f, [st.k_sc contents], size_t(hdr.pos) * kv_row_sc) &&
+           read_all(f, [st.v_i8 contents], size_t(hdr.pos) * kv_row_i8) &&
+           read_all(f, [st.v_sc contents], size_t(hdr.pos) * kv_row_sc);
+    } else {
+      ok = read_all(f, [st.k_cache contents], size_t(hdr.pos) * kv_row_bf16) &&
+           read_all(f, [st.v_cache contents], size_t(hdr.pos) * kv_row_bf16);
+    }
+  }
+
+  if (ok && has_mtp) {
+    ok = read_all(f, [b_mtp_f_rnn contents], size_t(H) * sizeof(float));
+    for (size_t l = 0; ok && l < MtpL.size(); l++) {
+      auto& ml = MtpL[l];
+      if (ml.is_local) {
+        ok = read_ring(ml.k_cache, hdr.mtp_ctx_pos, ml.cap, kv_row_bf16) &&
+             read_ring(ml.v_cache, hdr.mtp_ctx_pos, ml.cap, kv_row_bf16);
+      } else {
+        ok = read_all(f, [ml.k_cache contents], size_t(hdr.mtp_ctx_pos) * kv_row_bf16) &&
+             read_all(f, [ml.v_cache contents], size_t(hdr.mtp_ctx_pos) * kv_row_bf16);
+      }
+    }
+  }
+  fclose(f);
+  if (!ok) {
+    reset();
+    return 0;
+  }
+  pos = hdr.pos;
+  fork_pos = 0;
+  fork_src = -1;
+  mtp_ctx_pos = hdr.mtp_ctx_pos;
+  if (out_toks) *out_toks = std::move(toks);
+  if (ms) *ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+  return pos;
 }
 
 }  // namespace ink2

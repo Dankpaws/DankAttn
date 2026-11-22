@@ -201,6 +201,7 @@ sh inkling2/build_inkling2.sh
 ./build/dankattn-inkling2 "$PACK" rdump ids.bin 6000 8 out.bin  # chunked prefill of 6000, then one M=8 step: all rows' logits
 ./build/dankattn-inkling2 "$PACK" nll ids.bin 8000              # teacher-forced mean NLL through the decode/verify path
 ./build/dankattn-inkling2 "$PACK" vbench2 ids.bin 2048 8 32     # verify-step GPU ms on fixed real-text rows (rolled back)
+./build/dankattn-inkling2 "$PACK" ctest ids.bin 1500            # SSD prefix cache save -> reset -> load bit-exact check
 ```
 
 ### Environment Variables
@@ -211,7 +212,10 @@ sh inkling2/build_inkling2.sh
 | `INK_PASSES` | `3` | Number of core loop passes (`1..3`, default from manifest) |
 | `INK_KV8` | `1` | `1`: int8 quantized global KV cache (`kv8`); `0`: BF16 global KV |
 | `INK_DRAFT_K` | `7` | Max DSpark draft tokens per round (`1..7`, verify `M = 1 + K`) |
-| `INK_DRAFT_CUT` | `0.50` | Early-cut DSpark drafts when `p_max < INK_DRAFT_CUT` (`0.0` disables) |
+| `INK_DRAFT_CUT` | `0.50` | Legacy per-token DSpark cutoff when `INK_DRAFT_ADAPT=0` (`0.0` disables) |
+| `INK_DRAFT_ADAPT` | `1` | `1`: fan-out-aware expected-tok/ms draft length selector (`select_draft_k`); `0`: legacy `INK_DRAFT_CUT` |
+| `INK_PCACHE` / `INK_PCACHE_GB` / `INK_PCACHE_FREE_GB` | `<tree>/pcache_ink` / `20` / `15` | `serve`: persistent SSD prefix cache dir (`0` disables), LRU GB budget, and free-disk reserve GB |
+| `INK_BATCH_MSG` / `INK_STREAM_FUSE` / `INK_FUSE_OCONV` | `1` / `15` / `1` | Decode phase fusions (`0` disables each for A/B; all bit-identical) |
 | `INK_LOOKUP` | `1` | `1`: enable 3-gram context-lookup drafting (`engine/lookup.h`, up to `M=16`) |
 | `INK_TEMP` / `INK_TOP_P` / `INK_TOP_K` / `INK_MIN_P` / `INK_SEED` | greedy | CLI sampling for every lane (lane `k` uses seed + `k`) |
 | `INK_LANES` | `4` | `serve`: lanes (independent sequences) at `INK_CAP` each |
@@ -259,6 +263,5 @@ sh inkling2/build_inkling2.sh
 - Base M5 on macOS 27.0 miscompiled (or otherwise mis-executed) a logically neutral edit in `ink_attn_pf_mma`. Re-check with `lgdump` Studio-vs-MBP bit equality after any attention-kernel change or OS update; `pfcheck`'s max diff alone is too noisy to catch it.
 
 ### Planned Next Steps (Not Yet Started)
-- **Prefix cache that survives engine restarts** (SSD prefix cache, like Hy4).
 - **MoE expert fan-out at `M=8` verify** (MBP: `moe_gu` + `moe_dn` = 63% of verify time) is the main lever for MBP speculation.
 - **Prefill attention** (29% at `M=512` on the Studio) and **MoE gate/up** (26%) are the remaining large prefill ops.

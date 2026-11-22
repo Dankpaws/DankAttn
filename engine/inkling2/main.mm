@@ -889,6 +889,62 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (cmd == "ctest") {
+      // ctest <ids.bin> [n_pref=1500]: verify SSD prefix save -> full reset -> load is 100% bit-exact (tokens, logits, DSpark).
+      if (argc < 4) mtl::die("ctest <ids.bin> [n_pref=1500]");
+      auto all = read_ids_bin(argv[3]);
+      const uint32_t n_pref = (argc >= 5) ? uint32_t(atoi(argv[4])) : 1500u;
+      std::vector<uint32_t> pref(n_pref);
+      for (uint32_t i = 0; i < n_pref; i++) pref[i] = all[i % all.size()];
+
+      // 1. Reference: prefill n_pref, commit DSpark, save prefix, then decode 8 tokens + logits + draft.
+      uint32_t tok_ref = 0;
+      for (uint32_t i = 0; i < n_pref; i += ink2::MP) {
+        const uint32_t c = std::min(ink2::MP, n_pref - i);
+        std::vector<uint32_t> ch(pref.begin() + i, pref.begin() + i + c);
+        tok_ref = M.step(ch).back();
+        if (M.has_mtp) M.mtp_commit(c);
+      }
+      const std::string path = "/tmp/ink_ctest.inkp";
+      double sms = 0, lms = 0;
+      size_t bytes = 0;
+      if (!M.save_prefix(path, pref, &sms, &bytes)) mtl::die("ctest: save_prefix failed");
+      std::vector<uint32_t> ref_draft;
+      if (M.has_mtp) ref_draft = M.draft(tok_ref, 4u);
+      std::vector<uint32_t> ref_toks;
+      std::vector<float> ref_lg;
+      uint32_t cur = tok_ref;
+      for (int i = 0; i < 8; i++) {
+        cur = M.step({cur}, nullptr, i == 0 ? &ref_lg : nullptr).back();
+        ref_toks.push_back(cur);
+      }
+
+      // 2. Full reset + restore from SSD + compare tokens, logits, and DSpark draft.
+      M.reset();
+      std::vector<uint32_t> loaded_toks;
+      const uint32_t got = M.load_prefix(path, &loaded_toks, &lms);
+      unlink(path.c_str());
+      if (got != n_pref || loaded_toks != pref) mtl::die("ctest: load_prefix mismatch");
+      std::vector<uint32_t> got_draft;
+      if (M.has_mtp) got_draft = M.draft(tok_ref, 4u);
+      std::vector<uint32_t> got_toks;
+      std::vector<float> got_lg;
+      cur = tok_ref;
+      for (int i = 0; i < 8; i++) {
+        cur = M.step({cur}, nullptr, i == 0 ? &got_lg : nullptr).back();
+        got_toks.push_back(cur);
+      }
+      float max_diff = 0.0f;
+      for (size_t i = 0; i < ref_lg.size(); i++) max_diff = std::max(max_diff, std::fabs(ref_lg[i] - got_lg[i]));
+      int bad_tok = 0, bad_dr = 0;
+      for (size_t i = 0; i < ref_toks.size(); i++) if (ref_toks[i] != got_toks[i]) bad_tok++;
+      for (size_t i = 0; i < ref_draft.size(); i++) if (ref_draft[i] != got_draft[i]) bad_dr++;
+      printf("ctest n_pref=%u (%.1f MB): save %.1f ms, load %.1f ms | max_logit_diff=%.3e bad_tok=%d bad_draft=%d (%s)\n",
+             n_pref, bytes / 1e6, sms, lms, max_diff, bad_tok, bad_dr,
+             (max_diff == 0.0f && bad_tok == 0 && bad_dr == 0) ? "BIT-EXACT" : "FAIL");
+      return (max_diff == 0.0f && bad_tok == 0 && bad_dr == 0) ? 0 : 1;
+    }
+
     mtl::die(("unknown command: " + cmd).c_str());
   }
 }

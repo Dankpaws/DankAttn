@@ -169,6 +169,17 @@ _FPR_ALIAS_RE = re.compile(r":(\d+)x-(select|genselect|synth|fast)$")
 _BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
 
 
+_FAST_ECHO_RE = re.compile(
+    r"^\s*(?:(?:Write\s+ONLY\s+Section\s+\d+[^\n]*|Start\s+directly\s+with[^\n]*|Do\s+not\s+write\s+any\s+other\s+sections\.?|"
+    r"Here\s+(?:is|are)\s+Section\s+\d+[^\n]*|Full\s+response\s+outline[^\n]*)\n+)+",
+    re.I,
+)
+
+
+def _strip_fast_echo(txt: str) -> str:
+    return _FAST_ECHO_RE.sub("", txt).lstrip("\n")
+
+
 def parse_fpr_opts(body):
     """Parse optional Fork-Prune-Resolve / Parallel-Fill settings from model alias (:4x-select|:4x-genselect|:4x-synth|:4x-fast) or extra_body."""
     model_name = body.get("model") or args.model_id
@@ -296,12 +307,13 @@ async def chat(request: Request):
     resp_model = fpr["model"] if fpr else args.model_id
 
     # Lever 2: Parallel Section Fill (:4x-fast / :8x-fast) — fast JSON outline -> K parallel forked section fills -> stitch!
-    if fpr and fpr["mode"] == "fast" and not body.get("tools"):
+    if fpr and fpr["mode"] == "fast" and not body.get("tools") and max_new >= 512:
         t_fast0 = time.perf_counter()
         n_sec = fpr["lanes"]
         outline_suf = (
             f"<|end_message|><|message_user|><|content_text|>"
-            f"Split the response above into {n_sec} independent, non-overlapping sections (or 1 if very short). "
+            f"Split the response above into {n_sec} independent, non-overlapping sections. "
+            f"If the request is a greeting, simple question, or short/single-paragraph answer, return ONLY 1 section. "
             f"Keep each title <=5 words and each spec <=10 words. "
             f"Reply ONLY with compact JSON: {{\"sections\":[{{\"title\":\"...\",\"spec\":\"...\"}}]}}."
             f"<|end_message|><|message_model|><|content_text|>{{\"sections\":["
@@ -384,6 +396,20 @@ async def chat(request: Request):
                     vis_toks = 0
                     sec_idx = -1
                     buf_toks, read_pos, pref_pos = [], 0, 0
+                    sec_lead_done = False
+
+                    def flush_sec_tail():
+                        nonlocal sec_lead_done
+                        if not buf_toks[read_pos:]:
+                            return None
+                        if not sec_lead_done:
+                            sec_lead_done = True
+                            cleaned = _strip_fast_echo(tok.decode(buf_toks, skip_special_tokens=True))
+                            return ch({"content": cleaned}) if cleaned else None
+                        tail = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
+                        prev = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
+                        return ch({"content": tail[len(prev):]}) if len(tail) > len(prev) else None
+
                     try:
                         yield ch({"role": "assistant", "content": ""})
                         while True:
@@ -393,11 +419,9 @@ async def chat(request: Request):
                                     yield "data: " + json.dumps({"error": api_error(it["error"])[1]}, ensure_ascii=False) + "\n\n"
                                     done_f = True
                                     break
-                                if buf_toks[read_pos:]:
-                                    tail = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
-                                    prev = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
-                                    if len(tail) > len(prev):
-                                        yield ch({"content": tail[len(prev):]})
+                                msg = flush_sec_tail()
+                                if msg:
+                                    yield msg
                                 fill_ms = (time.perf_counter() - t_fill0) * 1000.0
                                 wall_ms = (time.perf_counter() - t_fast0) * 1000.0
                                 usage = {
@@ -417,24 +441,34 @@ async def chat(request: Request):
                                 done_f = True
                                 break
                             if isinstance(it, tuple) and it[0] == "cand_sep":
-                                if sec_idx >= 0 and buf_toks[read_pos:]:
-                                    tail = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
-                                    prev = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
-                                    if len(tail) > len(prev):
-                                        yield ch({"content": tail[len(prev):]})
+                                if sec_idx >= 0:
+                                    msg = flush_sec_tail()
+                                    if msg:
+                                        yield msg
                                 sec_idx += 1
                                 if sec_idx > 0:
                                     yield ch({"content": "\n\n"})
                                 buf_toks, read_pos, pref_pos = [], 0, 0
+                                sec_lead_done = False
                             elif isinstance(it, int) and it not in (END_MSG, EOS):
                                 vis_toks += 1
                                 buf_toks.append(it)
-                                before = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
-                                text = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
-                                if not text.endswith("\ufffd") and len(text) > len(before):
-                                    read_pos = len(buf_toks)
-                                    pref_pos = max(0, read_pos - 6)
-                                    yield ch({"content": text[len(before):]})
+                                if not sec_lead_done:
+                                    lead = tok.decode(buf_toks, skip_special_tokens=True)
+                                    if not lead.endswith("\ufffd") and ("\n" in lead or len(lead) >= 96):
+                                        cleaned = _strip_fast_echo(lead)
+                                        sec_lead_done = True
+                                        read_pos = len(buf_toks)
+                                        pref_pos = max(0, read_pos - 6)
+                                        if cleaned:
+                                            yield ch({"content": cleaned})
+                                else:
+                                    before = tok.decode(buf_toks[pref_pos:read_pos], skip_special_tokens=True)
+                                    text = tok.decode(buf_toks[pref_pos:], skip_special_tokens=True)
+                                    if not text.endswith("\ufffd") and len(text) > len(before):
+                                        read_pos = len(buf_toks)
+                                        pref_pos = max(0, read_pos - 6)
+                                        yield ch({"content": text[len(before):]})
                     finally:
                         if not done_f:
                             eng.cancel(feid)
@@ -455,7 +489,7 @@ async def chat(request: Request):
             for c in cands:
                 ctoks = [t for t in c["toks"] if t not in (END_MSG, EOS)]
                 vis_toks += len(ctoks)
-                txt = tok.decode(ctoks, skip_special_tokens=True).strip()
+                txt = _strip_fast_echo(tok.decode(ctoks, skip_special_tokens=True)).strip()
                 if txt:
                     parts.append(txt)
             final_text = "\n\n".join(parts)

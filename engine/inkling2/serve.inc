@@ -18,11 +18,152 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <dirent.h>
 #include <memory>
 #include <mutex>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 
 namespace iserve {
+
+// Persistent SSD prefix cache for Lane 0 (mirrors Hy4's PrefixCache: atomic .tmp writes, pack fingerprint, LRU + free-disk guard).
+// Env: INK_PCACHE=<dir> (default <tree>/pcache_ink, 0 = off), INK_PCACHE_GB (default 20), INK_PCACHE_FREE_GB (default 15).
+struct PrefixCache {
+  static constexpr uint32_t PC_MIN = 2048, PC_GAIN = 1024;
+  struct Entry { std::string path; std::vector<uint32_t> toks; size_t bytes = 0; uint64_t used = 0; };
+  std::string dir;
+  size_t budget = 0, reserve = 0;
+  bool on = false;
+  uint64_t clock = 0;
+  std::vector<Entry> ents;
+
+  static uint32_t common(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, size_t n) {
+    uint32_t c = 0;
+    const size_t lim = std::min({a.size(), b.size(), n});
+    while (c < lim && a[c] == b[c]) c++;
+    return c;
+  }
+
+  void init(const ink2::Model& m, const std::string& def) {
+    const char* env_d = getenv("INK_PCACHE");
+    dir = env_d ? std::string(env_d) : def;
+    on = !dir.empty() && dir != "0";
+    const double gb = getenv("INK_PCACHE_GB") ? atof(getenv("INK_PCACHE_GB")) : 20.0;
+    const double fgb = getenv("INK_PCACHE_FREE_GB") ? atof(getenv("INK_PCACHE_FREE_GB")) : 15.0;
+    budget = size_t(std::max(0.0, gb) * 1e9);
+    reserve = size_t(std::max(0.0, fgb) * 1e9);
+    if (!on) return;
+    mkdir(dir.c_str(), 0755);
+    DIR* d = opendir(dir.c_str());
+    if (!d) { on = false; fprintf(stderr, "inkling2: pcache: cannot open %s, off\n", dir.c_str()); return; }
+    std::vector<std::pair<double, Entry>> found;
+    while (dirent* de = readdir(d)) {
+      const std::string n = de->d_name;
+      if (n.size() < 6 || n.substr(n.size() - 5) != ".inkp") {
+        if (n.size() > 4 && n.substr(n.size() - 4) == ".tmp") unlink((dir + "/" + n).c_str());
+        continue;
+      }
+      Entry en;
+      en.path = dir + "/" + n;
+      struct stat st{};
+      if (!ink2::Model::prefix_tokens(en.path, m.fingerprint, en.toks, &en.bytes) || stat(en.path.c_str(), &st) != 0) {
+        unlink(en.path.c_str());
+        continue;
+      }
+      found.push_back({double(st.st_mtimespec.tv_sec) + st.st_mtimespec.tv_nsec * 1e-9, std::move(en)});
+    }
+    closedir(d);
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    size_t tot = 0;
+    for (auto& [t, en] : found) { en.used = ++clock; tot += en.bytes; ents.push_back(std::move(en)); }
+    fprintf(stderr, "inkling2: pcache %s: %zu files, %.2f GB, budget %.0f GB\n", dir.c_str(), ents.size(), tot / 1e9, budget / 1e9);
+  }
+
+  // Find longest exact-prefix file on disk (ids.size() > file.pos && prefix matches all file.pos tokens).
+  int best(const std::vector<uint32_t>& ids, uint32_t* keep) const {
+    int bi = -1;
+    *keep = 0;
+    if (!on || ids.size() <= 1) return -1;
+    for (int i = 0; i < int(ents.size()); i++) {
+      const uint32_t p = uint32_t(ents[i].toks.size());
+      if (p < ids.size() && p > *keep && common(ents[i].toks, ids, p) == p) {
+        *keep = p;
+        bi = i;
+      }
+    }
+    return bi;
+  }
+
+  bool save(ink2::Model& m, const std::vector<uint32_t>& hist, const std::string& protect = "") {
+    if (!on || m.pos < PC_MIN || m.fork_pos != 0 || hist.size() < m.pos) return false;
+    for (auto& e : ents) {
+      if (e.toks.size() == m.pos && common(e.toks, hist, m.pos) == m.pos) {
+        e.used = ++clock;
+        return false;
+      }
+    }
+    const size_t need = size_t(m.pos) * 22000u + (size_t(190) << 20);
+    auto total = [&] { size_t t = 0; for (const auto& e : ents) t += e.bytes; return t; };
+    auto free_disk = [&]() -> size_t { struct statfs f{}; return statfs(dir.c_str(), &f) == 0 ? size_t(f.f_bavail) * f.f_bsize : 0; };
+    auto drop_oldest = [&] {
+      long o = -1;
+      for (size_t i = 0; i < ents.size(); i++)
+        if (ents[i].path != protect && (o < 0 || ents[i].used < ents[size_t(o)].used)) o = long(i);
+      if (o < 0) return false;
+      unlink(ents[size_t(o)].path.c_str());
+      ents.erase(ents.begin() + o);
+      return true;
+    };
+    while ((total() + need > budget || free_disk() < reserve + need) && drop_oldest()) {}
+    if (total() + need > budget || free_disk() < reserve + need) {
+      fprintf(stderr, "inkling2: pcache: no room for %u tokens (%.1f GB free, reserve %.0f GB)\n",
+              m.pos, free_disk() / 1e9, reserve / 1e9);
+      return false;
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < m.pos; i++) { h ^= hist[i]; h *= 1099511628211ull; }
+    char nm[64];
+    snprintf(nm, sizeof nm, "/%016llx-%u.inkp", (unsigned long long)h, m.pos);
+    Entry en;
+    en.path = dir + nm;
+    double ms = 0;
+    if (!m.save_prefix(en.path, hist, &ms, &en.bytes)) {
+      fprintf(stderr, "inkling2: pcache: save of %u tokens failed\n", m.pos);
+      return false;
+    }
+    en.toks.assign(hist.begin(), hist.begin() + m.pos);
+    en.used = ++clock;
+    for (size_t i = 0; i < ents.size();) {
+      if (ents[i].path != en.path && ents[i].toks.size() < en.toks.size() &&
+          common(ents[i].toks, en.toks, ents[i].toks.size()) == ents[i].toks.size()) {
+        unlink(ents[i].path.c_str());
+        ents.erase(ents.begin() + long(i));
+      } else i++;
+    }
+    ents.push_back(std::move(en));
+    fprintf(stderr, "inkling2: pcache: saved %u tokens (%.2f GB) in %.0f ms (%zu files, %.2f GB)\n",
+            m.pos, ents.back().bytes / 1e9, ms, ents.size(), total() / 1e9);
+    return true;
+  }
+
+  uint32_t restore(ink2::Model& m, int idx, std::vector<uint32_t>& hist, uint32_t rid, uint32_t c0) {
+    if (idx < 0 || idx >= int(ents.size())) return 0;
+    double ms = 0;
+    std::vector<uint32_t> toks;
+    const uint32_t got = m.load_prefix(ents[idx].path, &toks, &ms);
+    if (got) {
+      ents[idx].used = ++clock;
+      hist = std::move(toks);
+    }
+    fprintf(stderr, "inkling2: rid %u pcache: %s %u tokens in %.0f ms (slot kept %u)\n",
+            rid, got ? "restored" : "restore failed", got, ms, c0);
+    return got;
+  }
+};
+
+static PrefixCache& pcache() { static PrefixCache p; return p; }
 
 constexpr uint32_t END = 0xFFFFFFFFu, ERR = 0xFFFFFFFEu, READY = 0xFFFFFFFDu, CAND_SEP = 0xFFFFFFFCu;
 
@@ -662,6 +803,18 @@ static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vec
     }
     m.use_lane(ln);
     auto& h = lane_hist()[ln];
+    if (ln == 0 && pcache().on) {
+      uint32_t dkeep = 0;
+      const int di = pcache().best(q->ids, &dkeep);
+      const bool want_disk = (di >= 0 && dkeep > reuse + PrefixCache::PC_GAIN);
+      if (reuse == 0 || want_disk) {
+        pcache().save(m, h, want_disk ? pcache().ents[di].path : "");
+      }
+      if (want_disk) {
+        const uint32_t got = pcache().restore(m, di, h, q->rid, reuse);
+        if (got) { reuse = got; rw = false; }
+      }
+    }
     if (reuse == 0) {
       m.reset();
       h.clear();
@@ -718,6 +871,7 @@ int main(ink2::Model& m) {
   const float draft_cut = getenv("INK_DRAFT_CUT") ? float(atof(getenv("INK_DRAFT_CUT"))) : 0.50f;
   const bool use_lookup = getenv("INK_LOOKUP") ? (atoi(getenv("INK_LOOKUP")) != 0) : true;
   const uint32_t pf_dec_chunk = getenv("INK_PF_DEC_CHUNK") ? uint32_t(atoi(getenv("INK_PF_DEC_CHUNK"))) : 256u;
+  pcache().init(m, mtl::tree_root() + "/pcache_ink");
   fprintf(stderr, "inkling2: serving %u lanes (L0=%u, side=%u, rewind slack %u), GPU state %.2f GB, DSpark %s\n", n_lanes,
           m.cap, side_cap ? side_cap : m.cap, m.rewind_slack(), m.C.allocated / 1e9, m.has_mtp ? "on" : "off");
   std::thread rt(reader);
@@ -879,6 +1033,8 @@ int main(ink2::Model& m) {
       }
     }
   }
+  m.use_lane(0);
+  pcache().save(m, lane_hist()[0]);
   rt.join();
   return 0;
 }

@@ -130,6 +130,7 @@ struct Model {
   std::vector<id<MTLBuffer>> files;
   std::vector<id<MTLBuffer>> mtp_files;
   size_t mapped_bytes = 0;
+  uint64_t fingerprint = 0;  // pack/layout fingerprint for SSD prefix cache validation
 
   // Weights
   Raw embed, embed_norm, norm, ar_out_q, loop_msg_q;
@@ -183,6 +184,11 @@ struct Model {
   void save_conv(std::vector<uint8_t>& out) const;
   void rewind(uint32_t c, const std::vector<uint8_t>& conv);
   uint32_t rewind_slack() const { return MP + ring_extra; }
+  // Persistent SSD prefix cache for the active lane (exact KV + sconv + DSpark state, atomic write via .tmp).
+  bool save_prefix(const std::string& path, const std::vector<uint32_t>& history,
+                   double* ms = nullptr, size_t* out_bytes = nullptr) const;
+  uint32_t load_prefix(const std::string& path, std::vector<uint32_t>* out_toks = nullptr, double* ms = nullptr);
+  static bool prefix_tokens(const std::string& path, uint64_t fp, std::vector<uint32_t>& toks, size_t* bytes = nullptr);
   struct LaneRef {
     std::vector<LogicalState>* S;
     std::vector<LogicalState>* pref_S;
