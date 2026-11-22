@@ -61,7 +61,7 @@ struct KvConvArgs {
   float qk_clip, eps;
 };
 struct AttnArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, is_local, n_splits, kv8; };
-struct AttnPfArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window; };
+struct AttnPfArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, fork_pos; };
 struct AttnDecArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, n_splits, fork_pos; };
 struct PostConvArgs { uint32_t M, H, ks, is_boundary, is_mlp, b_slot, b_stride; };
 struct AccumConvArgs { uint32_t m, H, ks, r0, ystride; };
@@ -657,6 +657,8 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_attn_pf_local = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}, {"ATT_FAST", pf_fast}});
   p_attn_pf_global_bf16 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}, {"ATT_FAST", pf_fast}});
   p_attn_pf_global_kv8 = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}, {"ATT_FAST", pf_fast}});
+  p_attn_pf_global_bf16_fork = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}, {"ATT_FAST", pf_fast}, {"ATT_FORK", "1"}});
+  p_attn_pf_global_kv8_fork = C.pipe(attn_src, "ink_attn_pf_mma", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}, {"ATT_FAST", pf_fast}, {"ATT_FORK", "1"}});
   p_attn_dec_local = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "1"}, {"ATT_KV8", "0"}});
   p_attn_dec_global_bf16 = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "0"}});
   p_attn_dec_global_kv8 = C.pipe(attn_src, "ink_attn_split_gqa", {{"ATT_LOCAL", "0"}, {"ATT_KV8", "1"}});
@@ -978,6 +980,70 @@ void Model::fork_lane(int src, int dst) {
   [cb commit];
   [cb waitUntilCompleted];
   if (cb.error) mtl::die("GPU fork_lane error", cb.error);
+}
+
+void Model::fork_lane_at(int src, int dst, uint32_t P, const std::vector<uint8_t>& conv) {
+  if (src < 0 || src >= int(lanes_.size()) || dst < 0 || dst >= int(lanes_.size()) || src == dst)
+    mtl::die("fork_lane_at: invalid lane");
+  auto& src_S = (src == active_lane) ? S : lanes_[src].S;
+  auto& dst_S = (dst == active_lane) ? S : lanes_[dst].S;
+  const uint32_t src_pos = (src == active_lane) ? pos : lanes_[src].pos;
+  const int src_fsrc = (src == active_lane) ? fork_src : lanes_[src].fork_src;
+  if (src_fsrc >= 0) mtl::die("fork_lane_at: cannot fork from an already-forked lane");
+  if (P > src_pos || src_pos - P > rewind_slack()) mtl::die("fork_lane_at: P beyond rewind slack");
+  (dst == active_lane ? pos : lanes_[dst].pos) = P;
+  (dst == active_lane ? fork_pos : lanes_[dst].fork_pos) = P;
+  (dst == active_lane ? fork_src : lanes_[dst].fork_src) = (P > 0u) ? src : -1;
+
+  size_t off = 0;
+  for (size_t i = 0; i < dst_S.size(); i++) {
+    auto& ds = dst_S[i];
+    for (id<MTLBuffer> b : {ds.k_conv, ds.v_conv, ds.attn_conv, ds.mlp_conv}) {
+      if (off + [b length] > conv.size()) mtl::die("fork_lane_at: conv snapshot size mismatch");
+      memcpy([b contents], conv.data() + off, [b length]);
+      off += [b length];
+    }
+  }
+
+  id<MTLCommandBuffer> cb = [C.q commandBuffer];
+  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+  const size_t kv_row_bf16 = size_t(nkv) * hd * sizeof(uint16_t);
+  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap) {
+    if (len == 0u) return;
+    const uint32_t t0 = (len > window) ? (len - window) : 0u;
+    const uint32_t n = len - t0;
+    const uint32_t s0 = t0 % rcap;
+    const uint32_t first = std::min(n, rcap - s0);
+    [blit copyFromBuffer:sb sourceOffset:size_t(s0) * kv_row_bf16
+                toBuffer:db destinationOffset:size_t(s0) * kv_row_bf16
+                    size:size_t(first) * kv_row_bf16];
+    if (n > first) {
+      [blit copyFromBuffer:sb sourceOffset:0 toBuffer:db destinationOffset:0
+                      size:size_t(n - first) * kv_row_bf16];
+    }
+  };
+  for (size_t i = 0; i < src_S.size(); i++) {
+    if (!L[src_S[i].phys_idx].is_local) continue;
+    blit_ring(src_S[i].k_cache, dst_S[i].k_cache, P, src_S[i].cap);
+    blit_ring(src_S[i].v_cache, dst_S[i].v_cache, P, src_S[i].cap);
+  }
+  if (has_mtp) {
+    (dst == active_lane ? mtp_ctx_pos : lanes_[dst].mtp_ctx_pos) = P;
+    for (size_t l = 0; l < MtpL.size(); l++) {
+      if (!MtpL[l].is_local) continue;
+      id<MTLBuffer> sk = (src == active_lane) ? MtpL[l].k_cache : lanes_[src].mtp_k[l];
+      id<MTLBuffer> sv = (src == active_lane) ? MtpL[l].v_cache : lanes_[src].mtp_v[l];
+      id<MTLBuffer> dk = (dst == active_lane) ? MtpL[l].k_cache : lanes_[dst].mtp_k[l];
+      id<MTLBuffer> dv = (dst == active_lane) ? MtpL[l].v_cache : lanes_[dst].mtp_v[l];
+      const uint32_t rcap = (src == active_lane) ? MtpL[l].cap : lanes_[src].mtp_cap[l];
+      blit_ring(sk, dk, P, rcap);
+      blit_ring(sv, dv, P, rcap);
+    }
+  }
+  [blit endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  if (cb.error) mtl::die("GPU fork_lane_at error", cb.error);
 }
 
 void Model::promote_lane(int src, int dst) {
@@ -1598,9 +1664,13 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       if (_r > 0u) barrier();
     // G. Attention: Metal 4 matmul2d FlashAttention for prefill (pf), split-K GQA for decode/verify
     if (pf) {
-      AttnPfArgs pfa{M, nh, nkv, hd, rel_extent, pos, st.cap, window};
+      const auto* pl = (!ly.is_local && lanes[0].pref_S) ? &(*lanes[0].pref_S)[log_idx] : nullptr;
+      const uint32_t fpos = pl ? lanes[0].fork_pos : 0u;
+      AttnPfArgs pfa{M, nh, nkv, hd, rel_extent, pos, st.cap, window, fpos};
       id<MTLComputePipelineState> p_pf = ly.is_local ? p_attn_pf_local
-                                                     : (st.kv8 ? p_attn_pf_global_kv8 : p_attn_pf_global_bf16);
+                                                     : (fpos > 0u
+                                                            ? (st.kv8 ? p_attn_pf_global_kv8_fork : p_attn_pf_global_bf16_fork)
+                                                            : (st.kv8 ? p_attn_pf_global_kv8 : p_attn_pf_global_bf16));
       [enc setComputePipelineState:p_pf];
       [enc setBuffer:b_Q offset:0 atIndex:0];
       [enc setBuffer:(st.k_cache ? st.k_cache : b_dummy) offset:0 atIndex:1];
@@ -1614,6 +1684,14 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       [enc setBuffer:(st.v_i8 ? st.v_i8 : b_dummy) offset:0 atIndex:9];
       [enc setBuffer:(st.v_sc ? st.v_sc : b_dummy) offset:0 atIndex:10];
       [enc setBytes:&pfa length:sizeof(pfa) atIndex:11];
+      if (fpos > 0u) {
+        [enc setBuffer:(pl->k_cache ? pl->k_cache : b_dummy) offset:0 atIndex:12];
+        [enc setBuffer:(pl->v_cache ? pl->v_cache : b_dummy) offset:0 atIndex:13];
+        [enc setBuffer:(pl->k_i8 ? pl->k_i8 : b_dummy) offset:0 atIndex:14];
+        [enc setBuffer:(pl->k_sc ? pl->k_sc : b_dummy) offset:0 atIndex:15];
+        [enc setBuffer:(pl->v_i8 ? pl->v_i8 : b_dummy) offset:0 atIndex:16];
+        [enc setBuffer:(pl->v_sc ? pl->v_sc : b_dummy) offset:0 atIndex:17];
+      }
       [enc dispatchThreadgroups:MTLSizeMake((M + 15u) / 16u, nh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       barrier();
       flush_prof("attn");

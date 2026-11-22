@@ -310,7 +310,13 @@ static bool emit_tok(ink2::Model& m, Active& a, uint32_t t) {
   a.n++;
   if (a.thinking) { if (t == a.q->think_end) a.thinking = false; else a.nthink++; }
   if (a.is_stop(m, t)) return true;
-  if (a.n >= a.q->max_new || m.lane_pos(a.lane) + ink2::MAXM + 1 >= m.cap) { a.length = true; return true; }
+  const uint32_t lpos = m.lane_pos(a.lane);
+  const uint32_t fpos = m.lane_fork_pos(a.lane);
+  const uint32_t used = (lpos >= fpos) ? (lpos - fpos) : lpos;
+  if (a.n >= a.q->max_new || lpos + ink2::MAXM + 1 >= m.cap || used + ink2::MAXM + 1 >= m.lane_global_cap(a.lane)) {
+    a.length = true;
+    return true;
+  }
   return a.q->cancel.load();
 }
 
@@ -332,33 +338,102 @@ static void finish_active(Active& a, std::vector<bool>& busy) {
   live.erase(a.q->rid);
 }
 
+// Highest fork_pos among currently active side lanes reading Lane 0's global KV.
+// Lane 0 must not reset or rewind below this floor while any such side lane is busy.
+static uint32_t active_fork_floor(const ink2::Model& m, const std::vector<bool>& busy) {
+  uint32_t fl = 0;
+  for (int i = 1; i < int(busy.size()); i++) {
+    if (busy[i] && m.lane_fork_src(i) == 0) fl = std::max(fl, m.lane_fork_pos(i));
+  }
+  return fl;
+}
+
+// Clear any idle side lane whose forked prefix in Lane 0 is about to be overwritten.
+static void invalidate_stale_forks(ink2::Model& m, const std::vector<bool>& busy, uint32_t new_pos0) {
+  auto& H = lane_hist();
+  auto& CK = lane_ckpt();
+  for (int i = 1; i < int(busy.size()); i++) {
+    if (!busy[i] && m.lane_fork_src(i) == 0 && m.lane_fork_pos(i) > new_pos0) {
+      m.clear_lane_fork(i);
+      H[i].clear();
+      CK[i] = {};
+    }
+  }
+}
+
 // Longest free-lane reuse: a lane whose processed tokens are a strict prefix of ids. Ties and no reuse prefer
 // the lane with the least to lose (shortest history), so a long conversation stays resumable.
+// When Lane 0 holds a matching prefix (live h0 or rewindable ck0) and is busy (or a side lane gives strictly
+// better reuse), an idle side lane can Split-KV fork from Lane 0 if the suffix fits its side cap.
+// fork_mode: 0 = direct, 1 = fork_lane(0, ln) at h0.size(), 2 = fork_lane_at(0, ln, ck0.pos, ck0.conv).
 static int pick_lane(const ink2::Model& m, const std::vector<uint32_t>& ids, const std::vector<bool>& busy,
-                     uint32_t* reuse, bool* rewind) {
+                     uint32_t* reuse, bool* rewind, int* fork_mode) {
   int best = -1;
   uint32_t bc = 0;
   size_t bl = 0;
   bool brw = false;
+  int bfm = 0;
   auto& H = lane_hist();
+  auto& CK = lane_ckpt();
+  const uint32_t floor0 = active_fork_floor(m, busy);
+
   for (int i = 0; i < int(busy.size()); i++) {
     if (busy[i]) continue;
-    if (ids.size() + ink2::MAXM + 1u >= m.lane_global_cap(i)) continue;
     const auto& h = H[i];
-    const auto& ck = lane_ckpt()[i];
+    const auto& ck = CK[i];
+    const uint32_t fpos = (m.lane_fork_src(i) == 0) ? m.lane_fork_pos(i) : 0u;
     uint32_t c = 0;
     bool rw = false;
     if (!h.empty() && h.size() < ids.size() && std::equal(h.begin(), h.end(), ids.begin())) {
       c = uint32_t(h.size());
-    } else if (ck.pos > 0 && ck.pos < ids.size() && ck.pos <= h.size() && h.size() - ck.pos <= m.rewind_slack() &&
+    } else if (ck.pos > 0 && ck.pos >= fpos && ck.pos < ids.size() && ck.pos <= h.size() &&
+               h.size() - ck.pos <= m.rewind_slack() &&
                std::equal(h.begin(), h.begin() + ck.pos, ids.begin())) {
       c = ck.pos;
       rw = true;
     }
-    if (best < 0 || c > bc || (c == bc && h.size() < bl)) { best = i; bc = c; bl = h.size(); brw = rw; }
+    if (i == 0 && floor0 > 0 && c < floor0) continue;  // protect active forked side lanes
+    const uint32_t eff_used = (c > 0 && fpos > 0) ? uint32_t(ids.size() - fpos) : uint32_t(ids.size());
+    if (eff_used + ink2::MAXM + 1u >= m.lane_global_cap(i)) continue;
+    if (best < 0 || c > bc || (c == bc && h.size() < bl)) {
+      best = i; bc = c; bl = h.size(); brw = rw; bfm = 0;
+    }
   }
+
+  // Split-KV fork from Lane 0 -> an idle side lane (works even while Lane 0 is busy decoding!)
+  static const bool allow_splitkv = !(getenv("INK_SPLITKV_SERVE") && atoi(getenv("INK_SPLITKV_SERVE")) == 0);
+  if (allow_splitkv && busy.size() > 1 && ids.size() + ink2::MAXM + 1u < m.cap) {
+    const auto& h0 = H[0];
+    const auto& ck0 = CK[0];
+    uint32_t fc = 0;
+    int fm = 0;
+    if (h0.size() >= 64u && h0.size() < ids.size() && std::equal(h0.begin(), h0.end(), ids.begin())) {
+      fc = uint32_t(h0.size());
+      fm = 1;
+    } else if (ck0.pos >= 64u && ck0.pos < ids.size() && ck0.pos <= h0.size() &&
+               h0.size() - ck0.pos <= m.rewind_slack() &&
+               std::equal(h0.begin(), h0.begin() + ck0.pos, ids.begin())) {
+      fc = ck0.pos;
+      fm = 2;
+    }
+    if (fc > 0 && (best < 0 || fc > bc)) {
+      const uint32_t suffix_len = uint32_t(ids.size() - fc);
+      int fk = -1;
+      size_t fkl = 0;
+      for (int i = 1; i < int(busy.size()); i++) {
+        if (busy[i]) continue;
+        if (suffix_len + ink2::MAXM + 1u >= m.lane_global_cap(i)) continue;
+        if (fk < 0 || H[i].size() < fkl) { fk = i; fkl = H[i].size(); }
+      }
+      if (fk >= 0) {
+        best = fk; bc = fc; brw = false; bfm = fm;
+      }
+    }
+  }
+
   *reuse = bc;
   *rewind = brw;
+  *fork_mode = bfm;
   return best;
 }
 
@@ -386,6 +461,18 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
              std::equal(h0.begin(), h0.begin() + ck0.pos, q->ids.begin())) {
     reuse = ck0.pos;
     rw = true;
+  }
+  if (pcache().on) {
+    uint32_t dkeep = 0;
+    const int di = pcache().best(q->ids, &dkeep);
+    const bool want_disk = (di >= 0 && dkeep > reuse + PrefixCache::PC_GAIN);
+    if (reuse == 0 || want_disk) {
+      pcache().save(m, h0, want_disk ? pcache().ents[di].path : "");
+    }
+    if (want_disk) {
+      const uint32_t got = pcache().restore(m, di, h0, q->rid, reuse);
+      if (got) { reuse = got; rw = false; }
+    }
   }
   if (reuse == 0) { m.reset(); h0.clear(); }
   else if (rw) { m.rewind(reuse, ck0.conv); h0.resize(reuse); }
@@ -740,7 +827,11 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     lane_hist()[0] = q->ids;
   }
 
-  for (uint32_t k = 1; k < K; k++) lane_hist()[k].clear();
+  for (uint32_t k = 1; k < n_lanes; k++) {
+    m.clear_lane_fork(int(k));
+    lane_hist()[k].clear();
+    lane_ckpt()[k] = {};
+  }
   const float wall = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count() * 1e3f;
   put(q->rid, END);
   uint32_t s6[6] = {reuse, uint32_t(q->ids.size()), n_emit, tot_rounds, tot_acc, out_len ? 1u : 0u};
@@ -787,32 +878,54 @@ static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vec
     }
     uint32_t reuse = 0;
     bool rw = false;
-    const int ln = pick_lane(m, q->ids, busy, &reuse, &rw);
+    int fork_mode = 0;
+    const int ln = pick_lane(m, q->ids, busy, &reuse, &rw, &fork_mode);
     if (ln < 0) {
       std::lock_guard<std::mutex> g(mu);
       inbox.push_front(q);
       return;
     }
-    m.use_lane(ln);
     auto& h = lane_hist()[ln];
-    if (ln == 0 && pcache().on) {
-      uint32_t dkeep = 0;
-      const int di = pcache().best(q->ids, &dkeep);
-      const bool want_disk = (di >= 0 && dkeep > reuse + PrefixCache::PC_GAIN);
-      if (reuse == 0 || want_disk) {
-        pcache().save(m, h, want_disk ? pcache().ents[di].path : "");
+    if (fork_mode > 0) {
+      const auto& h0 = lane_hist()[0];
+      if (fork_mode == 1) {
+        m.fork_lane(0, ln);
+        h = h0;
+      } else {
+        m.fork_lane_at(0, ln, reuse, lane_ckpt()[0].conv);
+        h.assign(h0.begin(), h0.begin() + reuse);
       }
-      if (want_disk) {
-        const uint32_t got = pcache().restore(m, di, h, q->rid, reuse);
-        if (got) { reuse = got; rw = false; }
+      lane_ckpt()[ln] = {};
+      m.use_lane(ln);
+      fprintf(stderr, "inkling2: rid %u lane %d split-kv forked from L0 @ %u (mode=%d, suffix=%zu)\n",
+              q->rid, ln, reuse, fork_mode, q->ids.size() - reuse);
+    } else {
+      m.use_lane(ln);
+      if (ln == 0 && pcache().on && active_fork_floor(m, busy) == 0u) {
+        uint32_t dkeep = 0;
+        const int di = pcache().best(q->ids, &dkeep);
+        const bool want_disk = (di >= 0 && dkeep > reuse + PrefixCache::PC_GAIN);
+        if (reuse == 0 || want_disk) {
+          pcache().save(m, h, want_disk ? pcache().ents[di].path : "");
+        }
+        if (want_disk) {
+          const uint32_t got = pcache().restore(m, di, h, q->rid, reuse);
+          if (got) {
+            invalidate_stale_forks(m, busy, 0u);
+            reuse = got;
+            rw = false;
+          }
+        }
       }
-    }
-    if (reuse == 0) {
-      m.reset();
-      h.clear();
-    } else if (rw) {
-      m.rewind(reuse, lane_ckpt()[ln].conv);
-      h.resize(reuse);
+      if (reuse == 0) {
+        if (ln == 0) invalidate_stale_forks(m, busy, 0u);
+        m.reset();
+        h.clear();
+      } else if (rw) {
+        if (ln == 0) invalidate_stale_forks(m, busy, reuse);
+        m.rewind(reuse, lane_ckpt()[ln].conv);
+        h.resize(reuse);
+      }
     }
     ink2::Model::Samp sp;
     sp.temp = q->temp > 0 ? q->temp : 0.0f;

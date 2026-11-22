@@ -295,9 +295,17 @@ struct Model {
   void use_lane(int k);
   // Zero-copy Split-KV fork on global layers + fast local SWA/sconv/MTP copy from src -> dst at src's current pos.
   void fork_lane(int src, int dst);
+  // Zero-copy Split-KV fork at an earlier checkpoint position P <= src.pos (within rewind_slack()), using saved sconv.
+  void fork_lane_at(int src, int dst, uint32_t P, const std::vector<uint8_t>& conv);
   // Promote a forked lane `src` (forked from `dst`) into standalone `dst` by copying its generated suffix [fork_pos..pos).
   void promote_lane(int src, int dst);
   uint32_t lane_pos(int k) const { return k == active_lane ? pos : lanes_[k].pos; }
+  uint32_t lane_fork_pos(int k) const { return k == active_lane ? fork_pos : lanes_[k].fork_pos; }
+  int lane_fork_src(int k) const { return k == active_lane ? fork_src : lanes_[k].fork_src; }
+  void clear_lane_fork(int k) {
+    if (k == active_lane) { fork_pos = 0; fork_src = -1; pos = 0; mtp_ctx_pos = 0; }
+    else { lanes_[k].fork_pos = 0; lanes_[k].fork_src = -1; lanes_[k].pos = 0; lanes_[k].mtp_ctx_pos = 0; }
+  }
   uint32_t lane_global_cap(int k) const;
   // Rewind support for the active lane: the sconv states at a position (saved right after a prefill) plus the
   // KV rings still holding the window before it. rewind(c) needs pos - c <= rewind_slack().
@@ -336,6 +344,7 @@ struct Model {
   id<MTLComputePipelineState> p_mg_down_mma, p_mg_apply_mma;
   id<MTLComputePipelineState> p_q_rel, p_q_rel_prep, p_q_rel_mma, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
+  id<MTLComputePipelineState> p_attn_pf_global_bf16_fork, p_attn_pf_global_kv8_fork;
   id<MTLComputePipelineState> p_attn_dec_local, p_attn_dec_global_bf16, p_attn_dec_global_kv8;
   id<MTLComputePipelineState> p_scores, p_scores_mma, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;

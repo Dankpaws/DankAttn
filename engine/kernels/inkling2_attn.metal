@@ -24,9 +24,12 @@ static inline uint frag_off(uint m, uint k, uint K) {
 #ifndef ATT_FAST
 #define ATT_FAST 1
 #endif
+#ifndef ATT_FORK
+#define ATT_FORK 0
+#endif
 
 struct AttnPfArgs {
-  uint M, nh, nkv, hd, rel_extent, pos0, cap, window;
+  uint M, nh, nkv, hd, rel_extent, pos0, cap, window, fork_pos;
 };
 
 // Grid: (ceil(M / 16), nh, 1), TG: 128 threads (4 simdgroups x 32 lanes).
@@ -42,6 +45,14 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
                             device const char* V_i8 [[buffer(9)]],
                             device const half* V_sc [[buffer(10)]],
                             constant AttnPfArgs& a [[buffer(11)]],
+#if ATT_FORK
+                            device const bfloat* pref_K_cache [[buffer(12)]],
+                            device const bfloat* pref_V_cache [[buffer(13)]],
+                            device const char* pref_K_i8 [[buffer(14)]],
+                            device const half* pref_K_sc [[buffer(15)]],
+                            device const char* pref_V_i8 [[buffer(16)]],
+                            device const half* pref_V_sc [[buffer(17)]],
+#endif
                             uint2 tg [[threadgroup_position_in_grid]],
                             ushort tid [[thread_index_in_threadgroup]],
                             ushort sg [[simdgroup_index_in_threadgroup]],
@@ -101,15 +112,44 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
 #if ATT_KV8
   device const char* K8 = K_i8 + kvh * HD;
   device const char* V8 = V_i8 + kvh * HD;
+#if ATT_FORK
+  device const char* pK8 = pref_K_i8 + kvh * HD;
+  device const char* pV8 = pref_V_i8 + kvh * HD;
+#endif
 #else
   device const bfloat* Kh = K_cache + kvh * HD;
   device const bfloat* Vh = V_cache + kvh * HD;
+#if ATT_FORK
+  device const bfloat* pKh = pref_K_cache + kvh * HD;
+  device const bfloat* pVh = pref_V_cache + kvh * HD;
+#endif
 #endif
 
   uint slot0 = t_start % a.cap;
   for (uint j0 = t_start; j0 < t_end; j0 += 32u) {
     // 1. Load K tile [32 keys, 32 dims] into wb and compute S partial = Q @ K^T
     for (int i = 0; i < 16; i++) cs[i] = 0.0f;
+#if ATT_FORK
+    for (int qq = 0; qq < 4; qq++) {
+      const uint t = j0 + m0 + 8u * uint(qq);
+      const bool valid = (t < t_end);
+      const bool in_p = (t < a.fork_pos);
+      const uint sl = in_p ? t : (t - a.fork_pos);
+      for (int hh = 0; hh < 2; hh++) {
+#if ATT_KV8
+        uint w = 0u;
+        if (valid) w = *(device const uint*)((in_p ? pK8 : K8) + size_t(sl) * tstride + d_sg + n0 + 16 * hh);
+        const char4 c4 = as_type<char4>(w);
+        for (int e = 0; e < 4; e++) wb[hh * 16 + qq * 4 + e] = bfloat(float(c4[e]));
+#else
+        uint2 w = uint2(0u);
+        if (valid) w = *(device const uint2*)((in_p ? pKh : Kh) + size_t(sl) * tstride + d_sg + n0 + 16 * hh);
+        const bfloat4 b4 = as_type<bfloat4>(w);
+        for (int e = 0; e < 4; e++) wb[hh * 16 + qq * 4 + e] = b4[e];
+#endif
+      }
+    }
+#else
     uint tk[4];
     for (int qq = 0; qq < 4; qq++) {
       const uint off = m0 + 8u * uint(qq);
@@ -142,6 +182,7 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
       }
     }
 #endif
+#endif
     op.run(qh, wb, cs);
 
     // Sync before overwriting Sp and Vt from the previous tile
@@ -152,6 +193,24 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
     const uint d4 = uint(l) * 4u;
     for (uint kk = uint(sg); kk < 32u; kk += 4u) {
       if (j0 + kk < t_end) {
+#if ATT_FORK
+        const uint t = j0 + kk;
+        const bool in_p = (t < a.fork_pos);
+        const uint sl = in_p ? t : (t - a.fork_pos);
+#if ATT_KV8
+        const char4 v4 = *(device const char4*)((in_p ? pV8 : V8) + size_t(sl) * tstride + d4);
+        Vt[kk][d4 + 0u] = bfloat(float(v4.x));
+        Vt[kk][d4 + 1u] = bfloat(float(v4.y));
+        Vt[kk][d4 + 2u] = bfloat(float(v4.z));
+        Vt[kk][d4 + 3u] = bfloat(float(v4.w));
+#else
+        const bfloat4 v4 = *(device const bfloat4*)((in_p ? pVh : Vh) + size_t(sl) * tstride + d4);
+        Vt[kk][d4 + 0u] = v4.x;
+        Vt[kk][d4 + 1u] = v4.y;
+        Vt[kk][d4 + 2u] = v4.z;
+        Vt[kk][d4 + 3u] = v4.w;
+#endif
+#else
         uint sl = slot0 + kk;
         if (sl >= a.cap) sl -= a.cap;
 #if ATT_KV8
@@ -166,6 +225,7 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
         Vt[kk][d4 + 1u] = v4.y;
         Vt[kk][d4 + 2u] = v4.z;
         Vt[kk][d4 + 3u] = v4.w;
+#endif
 #endif
       } else {
         Vt[kk][d4 + 0u] = bfloat(0.0f);
@@ -183,11 +243,20 @@ kernel void ink_attn_pf_mma(device const float* Q [[buffer(0)]],          // [M,
       for (int e = 0; e < 4; e++) {
         const uint off = n0 + uint(e) + 16u * uint(hh);
         if (j0 + off < t_end) {
+#if ATT_FORK
+          const uint t = j0 + off;
+          const bool in_p = (t < a.fork_pos);
+          const uint sl = in_p ? t : (t - a.fork_pos);
+          const size_t soff = size_t(sl) * a.nkv + kvh;
+          ksc[hh * 4 + e] = float((in_p ? pref_K_sc : K_sc)[soff]);
+          vsc[hh * 4 + e] = float((in_p ? pref_V_sc : V_sc)[soff]);
+#else
           uint sl = slot0 + off;
           if (sl >= a.cap) sl -= a.cap;
           const size_t soff = size_t(sl) * a.nkv + kvh;
           ksc[hh * 4 + e] = float(K_sc[soff]);
           vsc[hh * 4 + e] = float(V_sc[soff]);
+#endif
         } else {
           ksc[hh * 4 + e] = 0.0f;
           vsc[hh * 4 + e] = 0.0f;
