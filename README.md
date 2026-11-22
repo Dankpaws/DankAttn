@@ -14,7 +14,7 @@ Everything runs directly on Apple Silicon Metal without PyTorch, MLX, or llama.c
 
 ## Requirements
 
-- **Hardware**: Apple Silicon with Metal 4 / `MetalPerformancePrimitives` (`mpp::tensor_ops` cooperative `matmul2d`). Developed and benchmarked on an M5 Ultra. Other Apple Silicon chips with Metal 4 support should work but have not been benchmarked here.
+- **Hardware**: Apple Silicon with Metal 4 / `MetalPerformancePrimitives` (`mpp::tensor_ops` cooperative `matmul2d`). Developed and benchmarked on an **M5 Ultra Mac Studio (96 GB)** and **Base M5 MacBook Pro (32 GB)**. Other Apple Silicon chips with Metal 4 support should work.
 - **OS & toolchain**: macOS with Metal 4.0 support and Xcode Command Line Tools (`clang++` with C++20 and Objective-C++ ARC).
 - **Memory**:
   - For **Inkling-2-Mini (`pack-inkling2-mini-w8`)**: ~19.91 GB mapped weights (including DSpark overlay) plus ~1.33 GB GPU state at `cap=32k` (~3.37 GB at `cap=128k`), fitting comfortably on a **32 GB MacBook Pro**.
@@ -73,28 +73,36 @@ See [hy4/ARCHITECTURE_AND_PERF.md](hy4/ARCHITECTURE_AND_PERF.md) for per-op prof
 
 ## Benchmarks & Quickstart (Inkling-2-Mini, `pack-inkling2-mini-w8`)
 
-Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16; MMLU **86.23%** vs SGLang BF16-KV 85.96%), `kv8` on the 8 global layers, fan-out-aware adaptive DSpark MTP + 3-gram lookup, zero-copy Split-KV multi-lane serving (`:4x-fast` / `:8x-fast` / `:4x-select`), and persistent SSD prefix caching (`19.91 GB` mapped + `1.38 GB` GPU state at `cap=32k`, fits in **32 GB RAM** up to **128k context**):
+![DankAttn Inkling-2-Mini M5 Ultra Overview](assets/dankattn-inkling2-overview.png)
+
+![DankAttn Inkling-2-Mini Base M5 MacBook Pro Overview](assets/dankattn-inkling2-mbp.png)
+
+Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16; MMLU **86.23%** vs SGLang BF16-KV 85.96%), `kv8` on the 8 global layers, fan-out-aware adaptive DSpark MTP + 3-gram lookup, zero-copy Split-KV multi-lane serving (`:4x-fast` / `:8x-fast` / `:4x-select`), and persistent SSD prefix caching (`19.91 GB` mapped + `1.38 GB` GPU state at `cap=32k`, fits in **32 GB RAM** up to **128k context**).
+
+Pre-packed weights are available on Hugging Face: [`Dankpaws/Inkling-2-Mini-DankAttn-w8`](https://huggingface.co/Dankpaws/Inkling-2-Mini-DankAttn-w8).
 
 | Workload | M5 Ultra Mac Studio (96 GB) | Base M5 MacBook Pro (32 GB) |
 | :--- | :---: | :---: |
 | `vtest` (`M=5` vs `M=1`) / `ctest` (SSD prefix) | `0.000e+00` (**BIT-EXACT**) | `0.000e+00` (**BIT-EXACT**) |
 | Prefill 2,048 / 8,192 / 32,768 tok (`MP=512`) | **4,588 / 4,288 / 3,371 tok/s GPU** | **730 / 719 tok/s GPU** (2k / 8k) |
 | Decode `M=1` (`ctx=512 / 2k / 8k`) | **93.3 / 90.6 / 89.4 tok/s GPU** (`90.6 / 88.2 / 86.9` wall) | **25.8 / 24.8 / 24.5 tok/s GPU** |
-| Speculative (`code_prompt.bin`, 256 tok) | **212.3 tok/s wall** (256/256 exact) | **46.3 tok/s wall** (256/256 exact) |
+| Speculative (`code_prompt.bin`, 256 tok) | **212.3 tok/s wall** (256/256 exact) | **43.6 tok/s wall** warm / **46.3** cold (256/256 exact) |
 | Multi-lane (`jspec` 4 lanes / `lbench` 16 lanes) | **317.1 tok/s wall** (1024/1024 exact) / **501 tok/s GPU** | **65.8 tok/s wall** (4 lanes) |
 | Parallel Section Fill (`:4x-fast` / `:8x-fast`, live SSE) | **319.0 / 343.6 eff visible tok/s** (TTFT 1.55–2.15 s) | — |
 | SSD Prefix Cache restore (`ctest`, 1.5k / 8k tok) | **12.8 ms / 20.9 ms** (211 / 346 MB, `0.000e+00` exact) | **23.0 ms** (1.5k, `0.000e+00` exact) |
 
 ```sh
-# Build & verify
-sh inkling2/build_inkling2.sh
-./build/dankattn-inkling2 "$INK_PACK" vtest
-./build/dankattn-inkling2 "$INK_PACK" ctest prompt_ids.bin 1500
-./build/dankattn-inkling2 "$INK_PACK" pfbench 2048
-./build/dankattn-inkling2 "$INK_PACK" spec 256 prompt_ids.bin
+# 1. Download pre-packed weights (~19 GB)
+hf download Dankpaws/Inkling-2-Mini-DankAttn-w8 --local-dir ./pack-inkling2-mini-w8
 
-# Start OpenAI-compatible server on :8342 (8 lanes, 128k L0 + 16k Split-KV side lanes, SSD prefix cache)
-INK_PACK=/path/to/pack-inkling2-mini-w8 INK_CAP=131072 INK_LANES=8 INK_SIDE_CAP=16384 \
+# 2. Build & verify
+sh inkling2/build_inkling2.sh
+./build/dankattn-inkling2 ./pack-inkling2-mini-w8 vtest
+./build/dankattn-inkling2 ./pack-inkling2-mini-w8 pfbench 2048
+
+# 3. Start OpenAI-compatible server on :8342 (8 lanes, 128k L0 + 16k Split-KV side lanes, SSD prefix cache)
+#    On 32 GB Macs, use INK_CAP=32768 or 131072 with INK_LANES=1
+INK_PACK=./pack-inkling2-mini-w8 INK_CAP=131072 INK_LANES=8 INK_SIDE_CAP=16384 \
   sh server/inkling2_serve.sh start
 sh server/inkling2_serve.sh smoke
 ```
