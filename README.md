@@ -109,6 +109,14 @@ sh server/inkling2_serve.sh smoke
 
 See [inkling2/ARCHITECTURE_AND_PERF.md](inkling2/ARCHITECTURE_AND_PERF.md) for architecture details, head-to-head benchmarks, MoE fan-out analysis, packing instructions, CLI flags, and environment variables.
 
+## Updating
+
+```sh
+sh update.sh
+```
+
+`update.sh` runs `git pull --ff-only` and rebuilds whichever engine binaries you already have in `build/` (takes ~4 seconds on Apple Silicon; pass `inkling2`, `hy4`, or `all` to choose explicitly). Existing model packs stay compatible across updates unless a GitHub Release notes otherwise — just restart your running server after updating.
+
 ## Architecture Highlights
 
 - **Register-direct quantized matmuls (`engine/kernels/mm2.metal`)**: W4, W6, and W8 weights unpacked directly into `mpp::tensor_ops::matmul2d` cooperative tensors with two-level split-K (`mm2`), shared-weight prefill (`mmp`), and indirect-dispatch grouped MoE prefill (`mmpg`) with fused SwiGLU epilogues (`EPI=3`).
