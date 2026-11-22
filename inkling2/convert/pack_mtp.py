@@ -8,7 +8,7 @@ Precomputes:
                         fold_b = lm_head @ hidden_out.bias   [V_pad] f32 (~800 KB)
 
 Usage:
-  python3 inkling2/convert/pack_mtp.py /home/dank/models/Inkling-2-Mini /home/dank/models/pack-inkling2-mini-w8
+  python3 inkling2/convert/pack_mtp.py /path/to/Inkling-2-Mini /path/to/pack-inkling2-mini-w8
 """
 import argparse
 import json

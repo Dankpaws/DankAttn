@@ -1,6 +1,6 @@
 """Inkling-2-Mini native NVFP4/MXFP8/BF16 checkpoint -> DankAttn inkling2 pack.
 
-  python3 inkling2/convert/pack_inkling2.py /home/dank/models/Inkling-2-Mini /path/to/pack-inkling2-w8
+  python3 inkling2/convert/pack_inkling2.py /path/to/Inkling-2-Mini /path/to/pack-inkling2-mini-w8
 
 Preserves MoE experts losslessly in their native trained formats:
   - Layers 0..19:  NVFP4 (E2M1, WBITS=40, GS=16, f16 combined scales)

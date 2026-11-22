@@ -8,9 +8,9 @@ measure exact KL divergence and top-1 agreement across the 3-pass looped core be
 packing or running on Metal.
 
 Usage:
-  python3 inkling2_golden.py /home/dank/models/Inkling-2-Mini --prompt "The capital of France is"
-  python3 inkling2_golden.py /home/dank/models/Inkling-2-Mini --ids ids.bin --out golden.npz --dump
-  python3 inkling2_golden.py /home/dank/models/Inkling-2-Mini --prompt "..." --w8-mode core_bf16
+  python3 inkling2_golden.py /path/to/Inkling-2-Mini --prompt "The capital of France is"
+  python3 inkling2_golden.py /path/to/Inkling-2-Mini --ids ids.bin --out golden.npz --dump
+  python3 inkling2_golden.py /path/to/Inkling-2-Mini --prompt "..." --w8-mode core_bf16
 """
 import argparse
 import json
