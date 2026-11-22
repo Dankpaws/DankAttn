@@ -127,6 +127,8 @@ Goal: close the gap to ddalcu's unreleased mlx-serve Inkling build (card: 118 to
 
 Quality: MMLU 1,140 86.23% vs 86.14% before (McNemar z = +0.13; 85.96% SGLang base). Teacher-forced NLL (`nll`, 16-row decode steps, two 8k-token texts) 1.88589 / 2.17662 nats vs 1.88344 / 2.17753; any summation reorder moves it by up to ~0.003 nats in either direction (adding noise to logits raises expected NLL), so these are within that floor. `jspec` acceptance rose 2.09 → 2.19 tok/lane-round on the A/B prompt.
 
+**Verify (M = 8) check.** Split choices compared with `spec 256` look 3% apart, but that is content: changed numerics change the drafts, so the verified rows and their expert fan-out differ. On fixed real-text rows (`vbench2`, ctx 2048, rolled back each step) every MoE/o_proj split variant lands within 20.41–20.61 ms per M = 8 step (default 20.55; old sgs heuristic 20.60) while M = 1 keeps the table's lead (11.50 vs 12.10 ms), so the table stands for both. An 8-row verify routes ~45 distinct experts per layer, ~200 MB of NVFP4 weights per visit, ~7.4 ms per step at peak bandwidth for the experts alone: verify is fan-out bound.
+
 **Remaining gap** to ~118 tok/s plain (8.5 ms): the NVFP4 MoE matmuls (~3 ms/token, unpack-bound; a dedicated M = 1 GEMV would break the M = 1 vs verify bit-exactness speculation relies on), the msg-gate/attn_res blocks (~2 ms, chains of small single-threadgroup kernels), and attention (~1 ms at short context). ddalcu's build is not public, so whether it keeps decode/verify exactness is unknown.
 
 A/B tooling: `rdump` (all-row logits of one M-row step), `nll`, `Model::step_all`; harness scripts `check.sh` / `cmp.sh` / `kl.py` / `dupprof.sh` / `sweep.sh` live in the Mac's `~/dankattn-inkling2-dev` (not in the repo).
@@ -186,6 +188,7 @@ sh inkling2/build_inkling2.sh
 ./build/dankattn-inkling2 "$PACK" jspec ids.bin 2 256          # joint speculation, 2 lanes, exact check (INK_JCHECK=0 skips)
 ./build/dankattn-inkling2 "$PACK" rdump ids.bin 6000 8 out.bin  # chunked prefill of 6000, then one M=8 step: all rows' logits
 ./build/dankattn-inkling2 "$PACK" nll ids.bin 8000              # teacher-forced mean NLL through the decode/verify path
+./build/dankattn-inkling2 "$PACK" vbench2 ids.bin 2048 8 32     # verify-step GPU ms on fixed real-text rows (rolled back)
 ```
 
 ### Environment Variables

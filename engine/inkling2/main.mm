@@ -811,6 +811,32 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (cmd == "vbench2") {
+      // vbench2 <ids.bin> <ctx> <m> <iters>: verify-step GPU time on real text. Chunked prefill of ctx tokens, then
+      // iters M=m steps over consecutive real-text rows, each rolled back (rollback(0, m)) so every config times the
+      // same positions and the same tokens (vbench repeats one token, so routing never fans out).
+      if (argc < 7) mtl::die("vbench2 <ids.bin> <ctx> <m> <iters>");
+      auto all = read_ids_bin(argv[3]);
+      const uint32_t n_ctx = uint32_t(atoi(argv[4])), m = uint32_t(atoi(argv[5])), iters = uint32_t(atoi(argv[6]));
+      for (uint32_t i = 0; i < n_ctx; i += ink2::MP) {
+        const uint32_t c = std::min(ink2::MP, n_ctx - i);
+        std::vector<uint32_t> ch(c);
+        for (uint32_t j = 0; j < c; j++) ch[j] = all[(i + j) % all.size()];
+        M.step(ch);
+      }
+      double tot = 0.0;
+      for (uint32_t it = 0; it < iters + 2u; it++) {
+        std::vector<uint32_t> rows(m);
+        for (uint32_t j = 0; j < m; j++) rows[j] = all[(n_ctx + it * m + j) % all.size()];
+        double ms = 0.0;
+        M.step(rows, &ms);
+        M.rollback(0, m);
+        if (it >= 2u) tot += ms;  // 2 warmup steps
+      }
+      printf("vbench2 (ctx=%u, M=%u, iters=%u): %.3f ms/step GPU\n", n_ctx, m, iters, tot / iters);
+      return 0;
+    }
+
     if (cmd == "nll") {
       // nll <ids.bin> <n>: teacher-forced mean next-token NLL (f64 log-softmax over the softcapped logits) through
       // the decode/verify path in 16-row steps: precision check for engine changes that move logits by ulps.
