@@ -150,7 +150,11 @@ static inline float esigm(float x) { return 1.0f / (1.0f + exp(-x)); }
 // Epilogue over one finished 32-column fragment (rows m < Mloc of this block, global row0).
 static inline void epilogue(device const float* Y, uint N, uint nb, uint Mloc, uint row0, ushort l,
                             device bfloat* e0, device const float* e1, device float* e2, constant MmArgs& a,
-                            uint live = 0xFFFFu) {
+                            uint live = 0xFFFFu
+#if EPI == 4
+                            , device float* e3 = nullptr, device float* e4 = nullptr, device float* e5 = nullptr
+#endif
+                            ) {
 #if EPI != 0
   simdgroup_barrier(mem_flags::mem_device);
 #if EPI == 1
@@ -186,6 +190,42 @@ static inline void epilogue(device const float* Y, uint N, uint nb, uint Mloc, u
 #else
     e0[frag_off(row0 + m, c0 + j, a.R)] = bfloat(xsilu(Y[m * N + nb + j]) * Y[m * N + nb + 16 + j]);
 #endif
+  }
+#elif EPI == 4
+  // Inkling2 o_proj + post-attention sconv + residual/boundary save (single-lane M <= 16, row0 == 0).
+  // e0 = sconv_w, e1 = conv_state_in, e2 = h_res, e3 = blocks, e4 = conv_hist, e5 = conv_state_out.
+  // a.H = is_boundary, a.HC = b_slot, a.R = b_stride, ks = 4 (inv_denom = rsqrt(5.0f)).
+  const uint ch = nb + l;
+  if (ch < N) {
+    device const float* sconv_w = (device const float*)e0;
+    const float sw3 = sconv_w[ch * 4u + 0u];
+    const float sw2 = sconv_w[ch * 4u + 1u];
+    const float sw1 = sconv_w[ch * 4u + 2u];
+    const float sw0 = sconv_w[ch * 4u + 3u];
+    const float inv_denom = rsqrt(5.0f);
+    float h0 = e1[0u * N + ch];
+    float h1 = e1[1u * N + ch];
+    float h2 = e1[2u * N + ch];
+    e4[0u * N + ch] = h0;
+    e4[1u * N + ch] = h1;
+    e4[2u * N + ch] = h2;
+    for (uint m = 0u; m < Mloc; m++) {
+      const float x = Y[size_t(m) * N + ch];
+      e4[(3u + m) * N + ch] = x;
+      const float cv = (sw0 * x + sw1 * h2 + sw2 * h1 + sw3 * h0 + x) * inv_denom;
+      const size_t hi = size_t(m) * N + ch;
+      const float r_old = e2[hi];
+      if (a.H) {
+        e3[size_t(a.HC) * a.R + hi] = r_old;
+        e2[hi] = cv;
+      } else {
+        e2[hi] = r_old + cv;
+      }
+      h0 = h1; h1 = h2; h2 = x;
+    }
+    e5[0u * N + ch] = h0;
+    e5[1u * N + ch] = h1;
+    e5[2u * N + ch] = h2;
   }
 #endif
 #endif
@@ -236,10 +276,15 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
                 threadgroup float* red [[threadgroup(0)]],  // [TILES][simdgroups][16][32], sized by the host
                 uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
                 ushort nsg [[simdgroups_per_threadgroup]], ushort l [[thread_index_in_simdgroup]],
+#if EPI == 4
+                device float* e3_buf [[buffer(12)]],
+                device float* e4_buf [[buffer(13)]], device float* e5_buf [[buffer(14)]],
+#else
                 device const uint* trows [[buffer(12)]],    // GATHER: tile rows (16 per tile)
                 device const uint4* RAW [[buffer(13)]], device uint* pfsink [[buffer(14)]],
+#endif
                 device const uint* rmask [[buffer(15)]]) {
-#ifndef GROUPED
+#if !defined(GROUPED) && EPI != 4
   if (tg.z >= a.pf_z0) {
     const uint i = (((tg.z - a.pf_z0) * a.pf_gy + tg.y) * a.pf_gx + tg.x) * a.pf_tpt + uint(sg) * 32 + l;
     const uint b = i * 16;
@@ -473,7 +518,11 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
         const uint m = m0 + 8 * ((i >> 2) & 1), n = nb + n0 + (i & 3) + 16 * (i >> 3);
         if (m < Mloc[t] && ((live >> m) & 1u)) Yt[m * a.N + n] = acc[t][i];
       }
+#if EPI == 4
+      epilogue(Yt, a.N, nb, Mloc[t], row0 + 16 * t, l, E0, E1, E2, a, live, e3_buf, e4_buf, e5_buf);
+#else
       epilogue(Yt, a.N, nb, Mloc[t], row0 + 16 * t, l, E0, E1, E2, a, live);
+#endif
 #endif
     }
     return;
@@ -527,7 +576,11 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
   for (uint t = 0; t < TILES; t++)
     if (Mloc[t]) {
       const uint live = a.rm ? rmask[tg.z * 4 + t] : 0xFFFFu;
+#if EPI == 4
+      epilogue(Y + size_t(t) * 16 * a.N, a.N, nb, Mloc[t], row0 + 16 * t, l, E0, E1, E2, a, live, e3_buf, e4_buf, e5_buf);
+#else
       epilogue(Y + size_t(t) * 16 * a.N, a.N, nb, Mloc[t], row0 + 16 * t, l, E0, E1, E2, a, live);
+#endif
     }
 }
 

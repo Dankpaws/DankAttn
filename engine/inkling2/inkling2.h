@@ -169,7 +169,8 @@ struct Model {
 
   // Pipelines
   id<MTLComputePipelineState> p_embed, p_attn_res, p_attn_res_rms, p_attn_res_mg_prep, p_attn_res_mg_prep_shared;
-  id<MTLComputePipelineState> p_mg_prep, p_mg_down, p_mg_apply, p_mg_down3, p_mg_apply3, p_rms_frag;
+  id<MTLComputePipelineState> p_mg_prep, p_mg_down, p_mg_apply, p_mg_down3, p_mg_apply3, p_rms_frag, p_rms_frag3;
+  id<MTLComputePipelineState> p_attn_res_rms_scores, p_rms_scores, p_attn_res_mg_down, p_attn_res_mg_down3;
   id<MTLComputePipelineState> p_mg_down_mma, p_mg_apply_mma;
   id<MTLComputePipelineState> p_q_rel, p_q_rel_prep, p_q_rel_mma, p_kv_conv, p_attn_split, p_attn_reduce, p_post_conv;
   id<MTLComputePipelineState> p_attn_pf_local, p_attn_pf_global_bf16, p_attn_pf_global_kv8;
@@ -182,7 +183,7 @@ struct Model {
   id<MTLComputePipelineState> p_moe_accum_conv;  // decode fusion: moe_accum + mlp post_sconv
   id<MTLComputePipelineState> p_conv_res_rms;    // decode fusion: attn post_sconv + pre-MLP attn_res_rms
   id<MTLComputePipelineState> p_conv_res_mg;     // decode fusion: attn post_sconv + pre-MLP attn_res_mg_prep
-  id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
+  id<MTLComputePipelineState> p_mm_w8, p_mm_w8_oconv, p_mm_w6_gu, p_mm_w6_dn;
   id<MTLComputePipelineState> p_mmp_w8, p_mmp_w8_mtp, p_mmp_w6_gu, p_mmp_w6_dn;
   id<MTLComputePipelineState> p_moe_fp4_gu, p_moe_fp4_dn;
   id<MTLComputePipelineState> p_moe_fp8_gu, p_moe_fp8_dn;

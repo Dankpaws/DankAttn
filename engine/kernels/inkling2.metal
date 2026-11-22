@@ -907,6 +907,438 @@ kernel void ink_mg_apply3(device const float* h_in [[buffer(0)]], device const f
       (1.0f - tanh(df)) * h_in[h_slot * stride_m + idx_row] + tanh(dg) * msg_in[slot * stride_m + idx_row];
 }
 
+// 3f. Replicated-row stream fusions (M <= 16 decode/verify): eliminate dependent barrier phases without
+//     starving GPU cores by running the small-state row prep (L2-resident) in each weight-reading TG.
+//     Only tg.y == 0 writes shared side-effect buffers; b_h is double-buffered (h_in -> h_out) to avoid races.
+
+// 3f-1. Plain-visit pre-MLP fusion: attn_res(mlp) + rms(mlp) + router scores in ONE phase!
+//       Grid: (M, E / 8, 1) = (M, 16, 1), TG: 256 threads. 100% bit-identical to the 2 separate phases.
+struct AttnResRmsScoresArgs {
+  uint H, E, M, n_prev, b_stride;
+  float eps;
+};
+kernel void ink_attn_res_rms_scores(device const float4* blocks [[buffer(0)]],
+                                    device const float4* partial [[buffer(1)]],
+                                    device const float4* queries [[buffer(2)]],
+                                    device const float4* wn [[buffer(3)]],
+                                    device bfloat* frag [[buffer(4)]],
+                                    device float4* f32_out [[buffer(5)]],
+                                    device const float4* rw [[buffer(6)]],
+                                    device float* scores [[buffer(7)]],
+                                    constant AttnResRmsScoresArgs& a [[buffer(8)]],
+                                    uint2 tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, eg = tg.y;
+  const bool is_writer = (eg == 0u);
+  const uint H4 = a.H >> 2, bs4 = a.b_stride >> 2;
+  const uint B = a.n_prev + 1u;
+  const float inv_sqrt_h = rsqrt(float(a.H));
+  const bool has2 = (tid + 512u) < H4;
+
+  threadgroup float sm_s[12][8];
+  threadgroup float sm_d[12][8];
+  threadgroup float wts[12];
+  threadgroup float sm_r[8];
+  threadgroup float4 sm_mn[576];
+
+  const float4 q0 = queries[tid];
+  const float4 q1 = queries[tid + 256u];
+  const float4 q2 = has2 ? queries[tid + 512u] : float4(0.0f);
+
+  for (uint b = 0u; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float4 v0 = st[tid], v1 = st[tid + 256u];
+    float s2 = dot(v0, v0) + dot(v1, v1);
+    float dt = dot(v0, q0) + dot(v1, q1);
+    if (has2) {
+      const float4 v2 = st[tid + 512u];
+      s2 += dot(v2, v2);
+      dt += dot(v2, q2);
+    }
+    s2 = simd_sum(s2);
+    dt = simd_sum(dt);
+    if ((tid & 31u) == 0u) { sm_s[b][tid >> 5] = s2; sm_d[b][tid >> 5] = dt; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float inv_rms[12];
+    float mx = -1e30f;
+    for (uint b = 0u; b < B; b++) {
+      float t2 = 0.0f, td = 0.0f;
+      for (uint i = 0u; i < 8u; i++) { t2 += sm_s[b][i]; td += sm_d[b][i]; }
+      const float ir = rsqrt(t2 / float(a.H) + a.eps);
+      inv_rms[b] = ir;
+      const float w = td * ir * inv_sqrt_h;
+      wts[b] = w;
+      mx = max(mx, w);
+    }
+    float den = 0.0f;
+    for (uint b = 0u; b < B; b++) { wts[b] = exp(wts[b] - mx); den += wts[b]; }
+    const float inv_d = 1.0f / den;
+    for (uint b = 0u; b < B; b++) wts[b] *= inv_d * inv_rms[b];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f);
+  for (uint b = 0u; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float wb = wts[b];
+    acc0 = fma(st[tid], wb, acc0);
+    acc1 = fma(st[tid + 256u], wb, acc1);
+    if (has2) acc2 = fma(st[tid + 512u], wb, acc2);
+  }
+
+  float rs2 = dot(acc0, acc0) + dot(acc1, acc1) + (has2 ? dot(acc2, acc2) : 0.0f);
+  rs2 = simd_sum(rs2);
+  if ((tid & 31u) == 0u) sm_r[tid >> 5] = rs2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float t = 0.0f;
+    for (uint i = 0u; i < 8u; i++) t += sm_r[i];
+    sm_r[0] = rsqrt(t / float(a.H) + a.eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = sm_r[0];
+
+  auto emit = [&](uint c4, float4 v) {
+    const bfloat4 bv = bfloat4(v * inv * wn[c4]);
+    const float4 fv = float4(bv);
+    sm_mn[c4] = fv;
+    if (is_writer) {
+      const uint c = c4 << 2;
+      frag[frag_off(row, c + 0u, a.H)] = bv.x;
+      frag[frag_off(row, c + 1u, a.H)] = bv.y;
+      frag[frag_off(row, c + 2u, a.H)] = bv.z;
+      frag[frag_off(row, c + 3u, a.H)] = bv.w;
+      f32_out[size_t(row) * H4 + c4] = fv;
+    }
+  };
+  emit(tid, acc0);
+  emit(tid + 256u, acc1);
+  if (has2) emit(tid + 512u, acc2);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint e = eg * 8u + sg;
+  if (e < a.E) {
+    device const float4* wr = rw + size_t(e) * H4;
+    float acc = 0.0f;
+    for (uint c = lane; c < H4; c += 32u) acc += dot(sm_mn[c], wr[c]);
+    acc = simd_sum(acc);
+    if (lane == 0u) scores[size_t(row) * a.E + e] = isigm(acc);
+  }
+}
+
+// 3f-2. Fused RMSNorm -> bf16 fragment + router scores (for has_msgs MLP after mg_apply).
+//       Grid: (M, E / 8, 1) = (M, 16, 1), TG: 256 threads. 100% bit-identical.
+kernel void ink_rms_scores(device const float4* x [[buffer(0)]],
+                           device const float4* w [[buffer(1)]],
+                           device bfloat* frag [[buffer(2)]],
+                           device float4* f32_out [[buffer(3)]],
+                           device const float4* rw [[buffer(4)]],
+                           device float* scores [[buffer(5)]],
+                           constant uint& H [[buffer(6)]],
+                           constant uint& E [[buffer(7)]],
+                           constant float& eps [[buffer(8)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, eg = tg.y;
+  const bool is_writer = (eg == 0u);
+  const uint H4 = H >> 2;
+  const bool has2 = (tid + 512u) < H4;
+  threadgroup float sm[8];
+  threadgroup float4 sm_mn[576];
+
+  device const float4* xr = x + size_t(row) * H4;
+  const float4 x0 = xr[tid];
+  const float4 x1 = xr[tid + 256u];
+  const float4 x2 = has2 ? xr[tid + 512u] : float4(0.0f);
+  float s2 = dot(x0, x0) + dot(x1, x1) + (has2 ? dot(x2, x2) : 0.0f);
+  s2 = simd_sum(s2);
+  if ((tid & 31u) == 0u) sm[tid >> 5] = s2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float t = 0.0f;
+    for (uint i = 0u; i < 8u; i++) t += sm[i];
+    sm[0] = rsqrt(t / float(H) + eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = sm[0];
+
+  auto emit = [&](uint c4, float4 v) {
+    const bfloat4 bv = bfloat4(v * inv * w[c4]);
+    const float4 fv = float4(bv);
+    sm_mn[c4] = fv;
+    if (is_writer) {
+      const uint c = c4 << 2;
+      frag[frag_off(row, c + 0u, H)] = bv.x;
+      frag[frag_off(row, c + 1u, H)] = bv.y;
+      frag[frag_off(row, c + 2u, H)] = bv.z;
+      frag[frag_off(row, c + 3u, H)] = bv.w;
+      f32_out[size_t(row) * H4 + c4] = fv;
+    }
+  };
+  emit(tid, x0);
+  emit(tid + 256u, x1);
+  if (has2) emit(tid + 512u, x2);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint e = eg * 8u + sg;
+  if (e < E) {
+    device const float4* wr = rw + size_t(e) * H4;
+    float acc = 0.0f;
+    for (uint c = lane; c < H4; c += 32u) acc += dot(sm_mn[c], wr[c]);
+    acc = simd_sum(acc);
+    if (lane == 0u) scores[size_t(row) * E + e] = isigm(acc);
+  }
+}
+
+// 3f-3. has_msgs pre-MLP fusion: attn_res + mg_prep + mg_down in ONE phase!
+//       Grid: (M, R / 8, 1) = (M, 8, 1), TG: 256 threads (all 8 simdgroups compute 8 ranks/TG). 100% bit-identical.
+struct AttnResMgDownArgs {
+  uint H, R, M, n_prev, b_stride;
+  float eps;
+};
+kernel void ink_attn_res_mg_down(device const float4* blocks [[buffer(0)]],
+                                 device const float4* partial [[buffer(1)]],
+                                 device const float4* queries [[buffer(2)]],
+                                 device const float4* msgs [[buffer(3)]],
+                                 device float4* mh_out [[buffer(4)]],
+                                 device const bfloat4* w_down [[buffer(5)]],
+                                 device float* low_out [[buffer(6)]],
+                                 constant AttnResMgDownArgs& a [[buffer(7)]],
+                                 uint2 tg [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, rg = tg.y;
+  const bool is_writer = (rg == 0u);
+  const uint H4 = a.H >> 2, bs4 = a.b_stride >> 2;
+  const uint B = a.n_prev + 1u;
+  const float inv_sqrt_h = rsqrt(float(a.H));
+  const bool has2 = (tid + 512u) < H4;
+
+  threadgroup float sm_s[12][8];
+  threadgroup float sm_d[12][8];
+  threadgroup float wts[12];
+  threadgroup float sm_h[8], sm_m[8];
+  threadgroup bfloat4 sm_cat[1152];
+
+  const float4 q0 = queries[tid];
+  const float4 q1 = queries[tid + 256u];
+  const float4 q2 = has2 ? queries[tid + 512u] : float4(0.0f);
+
+  for (uint b = 0u; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float4 v0 = st[tid], v1 = st[tid + 256u];
+    float s2 = dot(v0, v0) + dot(v1, v1);
+    float dt = dot(v0, q0) + dot(v1, q1);
+    if (has2) {
+      const float4 v2 = st[tid + 512u];
+      s2 += dot(v2, v2);
+      dt += dot(v2, q2);
+    }
+    s2 = simd_sum(s2);
+    dt = simd_sum(dt);
+    if ((tid & 31u) == 0u) { sm_s[b][tid >> 5] = s2; sm_d[b][tid >> 5] = dt; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float inv_rms[12];
+    float mx = -1e30f;
+    for (uint b = 0u; b < B; b++) {
+      float t2 = 0.0f, td = 0.0f;
+      for (uint i = 0u; i < 8u; i++) { t2 += sm_s[b][i]; td += sm_d[b][i]; }
+      const float ir = rsqrt(t2 / float(a.H) + a.eps);
+      inv_rms[b] = ir;
+      const float w = td * ir * inv_sqrt_h;
+      wts[b] = w;
+      mx = max(mx, w);
+    }
+    float den = 0.0f;
+    for (uint b = 0u; b < B; b++) { wts[b] = exp(wts[b] - mx); den += wts[b]; }
+    const float inv_d = 1.0f / den;
+    for (uint b = 0u; b < B; b++) wts[b] *= inv_d * inv_rms[b];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f);
+  for (uint b = 0u; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float wb = wts[b];
+    acc0 = fma(st[tid], wb, acc0);
+    acc1 = fma(st[tid + 256u], wb, acc1);
+    if (has2) acc2 = fma(st[tid + 512u], wb, acc2);
+  }
+  if (is_writer) {
+    device float4* dst = mh_out + size_t(row) * H4;
+    dst[tid] = acc0;
+    dst[tid + 256u] = acc1;
+    if (has2) dst[tid + 512u] = acc2;
+  }
+
+  device const float4* mr = msgs + size_t(row) * H4;
+  const float4 m0 = mr[tid], m1 = mr[tid + 256u];
+  const float4 m2 = has2 ? mr[tid + 512u] : float4(0.0f);
+  float sh = simd_sum(dot(acc0, acc0) + dot(acc1, acc1) + (has2 ? dot(acc2, acc2) : 0.0f));
+  float sv = simd_sum(dot(m0, m0) + dot(m1, m1) + (has2 ? dot(m2, m2) : 0.0f));
+  if ((tid & 31u) == 0u) { sm_h[tid >> 5] = sh; sm_m[tid >> 5] = sv; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float th = 0.0f, tm = 0.0f;
+    for (uint i = 0u; i < 8u; i++) { th += sm_h[i]; tm += sm_m[i]; }
+    sm_h[0] = rsqrt(th / float(a.H) + a.eps);
+    sm_m[0] = rsqrt(tm / float(a.H) + a.eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv_h = sm_h[0], inv_m = sm_m[0];
+  sm_cat[tid] = bfloat4(acc0 * inv_h);
+  sm_cat[tid + 256u] = bfloat4(acc1 * inv_h);
+  if (has2) sm_cat[tid + 512u] = bfloat4(acc2 * inv_h);
+  sm_cat[H4 + tid] = bfloat4(m0 * inv_m);
+  sm_cat[H4 + tid + 256u] = bfloat4(m1 * inv_m);
+  if (has2) sm_cat[H4 + tid + 512u] = bfloat4(m2 * inv_m);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint r = rg * 8u + sg;
+  if (r < a.R) {
+    const uint H2_4 = a.H >> 1;
+    device const bfloat4* wd = w_down + size_t(r) * H2_4;
+    float acc = 0.0f;
+    for (uint c = lane; c < H2_4; c += 32u) acc += dot(float4(sm_cat[c]), float4(wd[c]));
+    acc = simd_sum(acc);
+    if (lane == 0u) low_out[size_t(row) * a.R + r] = acc;
+  }
+}
+
+// 3f-4. has_msgs pre-Attn fusion: attn_res + mg_prep + mg_down3 in ONE phase!
+//       Grid: (M, R / 4, 3) = (M, 16, 3), TG: 256 threads (sg < 4 computes 4 ranks/TG). 100% bit-identical.
+struct AttnResMgDown3Args {
+  uint H, R, M, n_prev, b_stride, q_shared, low_stride_f;
+  float eps;
+};
+kernel void ink_attn_res_mg_down3(device const float4* blocks [[buffer(0)]],
+                                  device const float4* partial [[buffer(1)]],
+                                  device const float4* queries [[buffer(2)]],
+                                  device const float4* msgs [[buffer(3)]],
+                                  device float4* h_out [[buffer(4)]],
+                                  device const bfloat4* wd0 [[buffer(5)]],
+                                  device const bfloat4* wd1 [[buffer(6)]],
+                                  device const bfloat4* wd2 [[buffer(7)]],
+                                  device float* low_out [[buffer(8)]],
+                                  constant AttnResMgDown3Args& a [[buffer(9)]],
+                                  uint3 tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, rg = tg.y, slot = tg.z;
+  const bool is_writer = (rg == 0u);
+  const uint H4 = a.H >> 2, bs4 = a.b_stride >> 2;
+  const uint qi = a.q_shared ? 0u : slot;
+  const uint B = a.n_prev + 1u;
+  const float inv_sqrt_h = rsqrt(float(a.H));
+  const bool has2 = (tid + 512u) < H4;
+
+  threadgroup float sm_s[12][8];
+  threadgroup float sm_d[12][8];
+  threadgroup float wts[12];
+  threadgroup float sm_h[8], sm_m[8];
+  threadgroup bfloat4 sm_cat[1152];
+
+  device const float4* q = queries + size_t(qi) * H4;
+  const float4 q0 = q[tid];
+  const float4 q1 = q[tid + 256u];
+  const float4 q2 = has2 ? q[tid + 512u] : float4(0.0f);
+
+  for (uint b = 0u; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float4 v0 = st[tid], v1 = st[tid + 256u];
+    float s2 = dot(v0, v0) + dot(v1, v1);
+    float dt = dot(v0, q0) + dot(v1, q1);
+    if (has2) {
+      const float4 v2 = st[tid + 512u];
+      s2 += dot(v2, v2);
+      dt += dot(v2, q2);
+    }
+    s2 = simd_sum(s2);
+    dt = simd_sum(dt);
+    if ((tid & 31u) == 0u) { sm_s[b][tid >> 5] = s2; sm_d[b][tid >> 5] = dt; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float inv_rms[12];
+    float mx = -1e30f;
+    for (uint b = 0u; b < B; b++) {
+      float t2 = 0.0f, td = 0.0f;
+      for (uint i = 0u; i < 8u; i++) { t2 += sm_s[b][i]; td += sm_d[b][i]; }
+      const float ir = rsqrt(t2 / float(a.H) + a.eps);
+      inv_rms[b] = ir;
+      const float w = td * ir * inv_sqrt_h;
+      wts[b] = w;
+      mx = max(mx, w);
+    }
+    float den = 0.0f;
+    for (uint b = 0u; b < B; b++) { wts[b] = exp(wts[b] - mx); den += wts[b]; }
+    const float inv_d = 1.0f / den;
+    for (uint b = 0u; b < B; b++) wts[b] *= inv_d * inv_rms[b];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f);
+  for (uint b = 0u; b < B; b++) {
+    device const float4* st = (b < a.n_prev) ? (blocks + size_t(b) * bs4 + size_t(row) * H4)
+                                             : (partial + size_t(row) * H4);
+    const float wb = wts[b];
+    acc0 = fma(st[tid], wb, acc0);
+    acc1 = fma(st[tid + 256u], wb, acc1);
+    if (has2) acc2 = fma(st[tid + 512u], wb, acc2);
+  }
+  if (is_writer && (!a.q_shared || slot == 0u)) {
+    device float4* dst = h_out + (size_t(qi) * a.M + row) * H4;
+    dst[tid] = acc0;
+    dst[tid + 256u] = acc1;
+    if (has2) dst[tid + 512u] = acc2;
+  }
+
+  device const float4* mr = msgs + (size_t(slot) * a.M + row) * H4;
+  const float4 m0 = mr[tid], m1 = mr[tid + 256u];
+  const float4 m2 = has2 ? mr[tid + 512u] : float4(0.0f);
+  float sh = simd_sum(dot(acc0, acc0) + dot(acc1, acc1) + (has2 ? dot(acc2, acc2) : 0.0f));
+  float sv = simd_sum(dot(m0, m0) + dot(m1, m1) + (has2 ? dot(m2, m2) : 0.0f));
+  if ((tid & 31u) == 0u) { sm_h[tid >> 5] = sh; sm_m[tid >> 5] = sv; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float th = 0.0f, tm = 0.0f;
+    for (uint i = 0u; i < 8u; i++) { th += sm_h[i]; tm += sm_m[i]; }
+    sm_h[0] = rsqrt(th / float(a.H) + a.eps);
+    sm_m[0] = rsqrt(tm / float(a.H) + a.eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv_h = sm_h[0], inv_m = sm_m[0];
+  sm_cat[tid] = bfloat4(acc0 * inv_h);
+  sm_cat[tid + 256u] = bfloat4(acc1 * inv_h);
+  if (has2) sm_cat[tid + 512u] = bfloat4(acc2 * inv_h);
+  sm_cat[H4 + tid] = bfloat4(m0 * inv_m);
+  sm_cat[H4 + tid + 256u] = bfloat4(m1 * inv_m);
+  if (has2) sm_cat[H4 + tid + 512u] = bfloat4(m2 * inv_m);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint r = rg * 8u + sg;
+  if (r < a.R) {
+    const uint H2_4 = a.H >> 1;
+    device const bfloat4* w_down = (slot == 0u) ? wd0 : ((slot == 1u) ? wd1 : wd2);
+    device const bfloat4* wd = w_down + size_t(r) * H2_4;
+    float acc = 0.0f;
+    for (uint c = lane; c < H2_4; c += 32u) acc += dot(float4(sm_cat[c]), float4(wd[c]));
+    acc = simd_sum(acc);
+    if (lane == 0u) low_out[size_t(slot) * a.low_stride_f + size_t(row) * a.R + r] = acc;
+  }
+}
+
 // 4. RMSNorm (float4) -> bf16 fragment (and optional f32 copy for router).
 // Grid: (M, 1, 1), TG: 256 threads.
 kernel void ink_rms_frag(device const float4* x [[buffer(0)]], device const float4* w [[buffer(1)]],
@@ -937,6 +1369,47 @@ kernel void ink_rms_frag(device const float4* x [[buffer(0)]], device const floa
     frag[frag_off(row, c + 2u, H)] = bv.z;
     frag[frag_off(row, c + 3u, H)] = bv.w;
     if (write_f32) f32_out[size_t(row) * H4 + c4] = float4(bv);
+  }
+}
+
+// 4b. Batched 3-slot RMSNorm (float4) -> bf16 fragments for Q/K/V after mg_apply3 (1 dispatch instead of 3).
+// Grid: (M, 3, 1), TG: 256 threads. 100% bit-identical to 3x ink_rms_frag.
+kernel void ink_rms_frag3(device const float4* x [[buffer(0)]],
+                          device const float4* w0 [[buffer(1)]],
+                          device const float4* w1 [[buffer(2)]],
+                          device const float4* w2 [[buffer(3)]],
+                          device bfloat* frag0 [[buffer(4)]],
+                          device bfloat* frag1 [[buffer(5)]],
+                          device bfloat* frag2 [[buffer(6)]],
+                          constant uint& H [[buffer(7)]],
+                          constant uint& M [[buffer(8)]],
+                          constant float& eps [[buffer(9)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, slot = tg.y;
+  const uint H4 = H >> 2;
+  threadgroup float sm[8];
+  device const float4* xr = x + (size_t(slot) * M + row) * H4;
+  float s2 = 0.0f;
+  for (uint c = tid; c < H4; c += 256u) { const float4 v = xr[c]; s2 += dot(v, v); }
+  s2 = simd_sum(s2);
+  if ((tid & 31u) == 0u) sm[tid >> 5] = s2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float t = 0.0f; for (uint i = 0u; i < 8u; i++) t += sm[i];
+    sm[0] = rsqrt(t / float(H) + eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = sm[0];
+  device const float4* w = (slot == 0u) ? w0 : ((slot == 1u) ? w1 : w2);
+  device bfloat* frag = (slot == 0u) ? frag0 : ((slot == 1u) ? frag1 : frag2);
+  for (uint c4 = tid; c4 < H4; c4 += 256u) {
+    const bfloat4 bv = bfloat4(xr[c4] * inv * w[c4]);
+    const uint c = c4 << 2;
+    frag[frag_off(row, c + 0u, H)] = bv.x;
+    frag[frag_off(row, c + 1u, H)] = bv.y;
+    frag[frag_off(row, c + 2u, H)] = bv.z;
+    frag[frag_off(row, c + 3u, H)] = bv.w;
   }
 }
 
@@ -1310,10 +1783,11 @@ kernel void ink_moe_scores(device const float4* mn [[buffer(0)]],
                            device const float4* rw [[buffer(1)]],
                            device float* scores [[buffer(2)]],
                            constant uint& H [[buffer(3)]], constant uint& E [[buffer(4)]],
-                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           uint2 tpg2 [[threads_per_threadgroup]]) {
   const uint row = tg.x;
   const uint sg = tid >> 5, lane = tid & 31u;
-  const uint e = tg.y * 8u + sg;
+  const uint e = tg.y * (tpg2.x >> 5) + sg;
   if (e >= E) return;
   const uint H4 = H >> 2;
   device const float4* mr = mn + size_t(row) * H4;

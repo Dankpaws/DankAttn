@@ -48,6 +48,9 @@ struct AttnResRmsArgs { uint32_t H, M, n_prev, b_stride, write_f32; float eps; }
 struct AttnResMgArgs { uint32_t H, M, n_prev, b_stride, q_shared, cat_stride_b4; float eps; };
 struct MsgGateArgs { uint32_t H, R; float eps; };
 struct MsgGate3Args { uint32_t H, R, M, q_shared, cat_stride_b4, low_stride_f; };
+struct AttnResRmsScoresArgs { uint32_t H, E, M, n_prev, b_stride; float eps; };
+struct AttnResMgDownArgs { uint32_t H, R, M, n_prev, b_stride; float eps; };
+struct AttnResMgDown3Args { uint32_t H, R, M, n_prev, b_stride, q_shared, low_stride_f; float eps; };
 struct MgMmaArgs { uint32_t H, R, M, q_shared, cat_stride_b, low_stride_f; };
 struct QRelArgs {
   uint32_t nh, hd, d_rel, rel_extent, qgrs_n, pos0, is_global;
@@ -667,9 +670,14 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_mg_apply = C.pipe(ink_src, "ink_mg_apply");
   p_mg_down3 = C.pipe(ink_src, "ink_mg_down3");
   p_mg_apply3 = C.pipe(ink_src, "ink_mg_apply3");
+  p_attn_res_rms_scores = C.pipe(ink_src, "ink_attn_res_rms_scores");
+  p_rms_scores = C.pipe(ink_src, "ink_rms_scores");
+  p_attn_res_mg_down = C.pipe(ink_src, "ink_attn_res_mg_down");
+  p_attn_res_mg_down3 = C.pipe(ink_src, "ink_attn_res_mg_down3");
   p_mg_down_mma = C.pipe(attn_src, "ink_mg_down_mma");
   p_mg_apply_mma = C.pipe(attn_src, "ink_mg_apply_mma");
   p_rms_frag = C.pipe(ink_src, "ink_rms_frag");
+  p_rms_frag3 = C.pipe(ink_src, "ink_rms_frag3");
   p_q_rel = C.pipe(ink_src, "ink_q_rel");
   p_q_rel_prep = C.pipe(ink_src, "ink_q_rel_prep");
   p_q_rel_mma = C.pipe(attn_src, "ink_q_rel_mma");
@@ -701,6 +709,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   const std::string pf_w8 = getenv("INK_PF_W8") ? getenv("INK_PF_W8") : "1";
   const std::string pf_moe = getenv("INK_PF_MOE") ? getenv("INK_PF_MOE") : "1";
   p_mm_w8 = C.pipe(mm_src, "mm2", {{"WBITS", "8"}, {"GS", "128"}, {"TILES", "1"}, {"PF", pf_w8}});
+  p_mm_w8_oconv = C.pipe(mm_src, "mm2", {{"WBITS", "8"}, {"GS", "128"}, {"TILES", "1"}, {"PF", pf_w8}, {"EPI", "4"}});
   p_mmp_w8 = C.pipe(mm_src, "mmp", {{"WBITS", "8"}, {"GS", "128"}, {"MMP_CH", "8"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"}});
   p_moe_fp4_gu = C.pipe(mm_src, "mm2", {
       {"WBITS", "40"}, {"GS", "16"}, {"TILES", "1"}, {"GROUPED", "1"}, {"PF", pf_moe},
@@ -1189,6 +1198,13 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   // Decode fusions (INK_FUSE=1; default off): bit-identical, but measured +0.2 ms at ctx 512 M=1 on M5 Ultra
   // (the single-TG fused kernels cost more than the ~4 us post-sconv phases they absorb).
   static const bool fuse = getenv("INK_FUSE") && atoi(getenv("INK_FUSE")) != 0;
+  // Batch all n_core*4 loop messages per pass + skip tap-capture barriers + fused final attn_res_rms (default on, bit-identical).
+  static const bool batch_msg = !(getenv("INK_BATCH_MSG") && atoi(getenv("INK_BATCH_MSG")) == 0);
+  // Replicated-row stream fusions for M <= 16 (default 15 = all 4 on, bit-identical):
+  //   1: attn_res+rms+scores (plain), 2: rms+scores (msg), 4: attn_res+mg_down (msg mlp), 8: attn_res+mg_down3 (msg attn).
+  static const uint32_t stream_fuse = getenv("INK_STREAM_FUSE") ? uint32_t(atoi(getenv("INK_STREAM_FUSE"))) : 15u;
+  // Fuse post-attention sconv + residual/boundary into o_proj mm2 epilogue (single-lane M <= 16, bit-identical).
+  static const bool fuse_oconv = !(getenv("INK_FUSE_OCONV") && atoi(getenv("INK_FUSE_OCONV")) == 0);
   // Decode router in one phase (INK_ROUTE_FAST, default on; same picks, weights and slots).
   static const bool route_fast = !(getenv("INK_ROUTE_FAST") && atoi(getenv("INK_ROUTE_FAST")) == 0);
   std::vector<id<MTLCommandBuffer>> done_cbs;
@@ -1274,12 +1290,12 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     for (uint32_t ti = 0; ti < 3u; ti++) {
       if (log_idx == mtp_taps[ti]) {
         copy_f32(b_h, 0, b_taps, size_t(ti) * MP * H * sizeof(float), size_t(M) * H * sizeof(float));
-        barrier();
+        if (!batch_msg) barrier();
       }
     }
   };
 
-  auto run_layer = [&](uint32_t log_idx, uint32_t phys_idx, uint32_t& n_blocks, bool has_msgs) {
+  auto run_layer = [&](uint32_t log_idx, uint32_t phys_idx, uint32_t& n_blocks, bool has_msgs, size_t msg_off = 0) {
     maybe_capture(log_idx);
     const auto& ly = L[phys_idx];
     auto& st = (*lanes[0].S)[log_idx];  // structure (cap, kv8) is identical across lanes
@@ -1335,12 +1351,44 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       const uint32_t low_stride_f = MP * gate_rank;
       const uint32_t q_shared = ly.is_local ? 1u : 0u;
 
+      if (!pf && (stream_fuse & 8u)) {
+        AttnResMgDown3Args armd{H, gate_rank, M, n_blocks, b_stride, q_shared, low_stride_f, eps};
+        [enc setComputePipelineState:p_attn_res_mg_down3];
+        [enc setBuffer:b_blocks offset:0 atIndex:0];
+        [enc setBuffer:b_h offset:0 atIndex:1];
+        [enc setBuffer:ly.ar_attn_q.b offset:ly.ar_attn_q.off atIndex:2];
+        [enc setBuffer:b_msgs offset:msg_off atIndex:3];
+        [enc setBuffer:b_qkv_in offset:0 atIndex:4];
+        [enc setBuffer:ly.ctrl_q.down.b offset:ly.ctrl_q.down.off atIndex:5];
+        [enc setBuffer:ly.ctrl_k.down.b offset:ly.ctrl_k.down.off atIndex:6];
+        [enc setBuffer:ly.ctrl_v.down.b offset:ly.ctrl_v.down.off atIndex:7];
+        [enc setBuffer:b_mg_low offset:0 atIndex:8];
+        [enc setBytes:&armd length:sizeof(armd) atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 8u, 3) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+        flush_prof("attn_res");
+
+        MsgGate3Args mg3{H, gate_rank, M, q_shared, cat_stride_b4, low_stride_f};
+        [enc setComputePipelineState:p_mg_apply3];
+        [enc setBuffer:b_qkv_in offset:0 atIndex:0];
+        [enc setBuffer:b_msgs offset:msg_off atIndex:1];
+        [enc setBuffer:b_mg_low offset:0 atIndex:2];
+        [enc setBuffer:ly.ctrl_q.forget.b offset:ly.ctrl_q.forget.off atIndex:3];
+        [enc setBuffer:ly.ctrl_q.gain.b offset:ly.ctrl_q.gain.off atIndex:4];
+        [enc setBuffer:ly.ctrl_k.forget.b offset:ly.ctrl_k.forget.off atIndex:5];
+        [enc setBuffer:ly.ctrl_k.gain.b offset:ly.ctrl_k.gain.off atIndex:6];
+        [enc setBuffer:ly.ctrl_v.forget.b offset:ly.ctrl_v.forget.off atIndex:7];
+        [enc setBuffer:ly.ctrl_v.gain.b offset:ly.ctrl_v.gain.off atIndex:8];
+        [enc setBuffer:b_qkv_out offset:0 atIndex:9];
+        [enc setBytes:&mg3 length:sizeof(mg3) atIndex:10];
+        [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 3) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      } else {
       AttnResMgArgs arm{H, M, n_blocks, b_stride, q_shared, cat_stride_b4, eps};
       [enc setComputePipelineState:(q_shared ? p_attn_res_mg_prep_shared : p_attn_res_mg_prep)];
       [enc setBuffer:b_blocks offset:0 atIndex:0];
       [enc setBuffer:b_h offset:0 atIndex:1];
       [enc setBuffer:ly.ar_attn_q.b offset:ly.ar_attn_q.off atIndex:2];
-      [enc setBuffer:b_msgs offset:0 atIndex:3];
+      [enc setBuffer:b_msgs offset:msg_off atIndex:3];
       [enc setBuffer:b_qkv_in offset:0 atIndex:4];
       [enc setBuffer:b_mg_cat offset:0 atIndex:5];
       [enc setBytes:&arm length:sizeof(arm) atIndex:6];
@@ -1362,7 +1410,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
 
         [enc setComputePipelineState:p_mg_apply_mma];
         [enc setBuffer:b_qkv_in offset:0 atIndex:0];
-        [enc setBuffer:b_msgs offset:0 atIndex:1];
+        [enc setBuffer:b_msgs offset:msg_off atIndex:1];
         [enc setBuffer:b_mg_low offset:0 atIndex:2];
         [enc setBuffer:ly.ctrl_q.forget.b offset:ly.ctrl_q.forget.off atIndex:3];
         [enc setBuffer:ly.ctrl_q.gain.b offset:ly.ctrl_q.gain.off atIndex:4];
@@ -1387,7 +1435,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
 
         [enc setComputePipelineState:p_mg_apply3];
         [enc setBuffer:b_qkv_in offset:0 atIndex:0];
-        [enc setBuffer:b_msgs offset:0 atIndex:1];
+        [enc setBuffer:b_msgs offset:msg_off atIndex:1];
         [enc setBuffer:b_mg_low offset:0 atIndex:2];
         [enc setBuffer:ly.ctrl_q.forget.b offset:ly.ctrl_q.forget.off atIndex:3];
         [enc setBuffer:ly.ctrl_q.gain.b offset:ly.ctrl_q.gain.off atIndex:4];
@@ -1399,13 +1447,32 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
         [enc setBytes:&mg3 length:sizeof(mg3) atIndex:10];
         [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 3) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       }
+      }
       barrier();
       flush_prof("msg_gate");
 
-      const size_t stride_m = size_t(M) * H * sizeof(float);
-      enc_rms(b_qkv_out, 0u, ly.is_local ? ly.attn_norm : ly.q_norm, b_frag_q, nil, zero_u);
-      enc_rms(b_qkv_out, 1u * stride_m, ly.is_local ? ly.attn_norm : ly.k_norm, b_frag_k, nil, zero_u);
-      enc_rms(b_qkv_out, 2u * stride_m, ly.is_local ? ly.attn_norm : ly.v_norm, b_frag_v, nil, zero_u);
+      if (!pf && stream_fuse) {
+        const Raw& w0 = ly.is_local ? ly.attn_norm : ly.q_norm;
+        const Raw& w1 = ly.is_local ? ly.attn_norm : ly.k_norm;
+        const Raw& w2 = ly.is_local ? ly.attn_norm : ly.v_norm;
+        [enc setComputePipelineState:p_rms_frag3];
+        [enc setBuffer:b_qkv_out offset:0 atIndex:0];
+        [enc setBuffer:w0.b offset:w0.off atIndex:1];
+        [enc setBuffer:w1.b offset:w1.off atIndex:2];
+        [enc setBuffer:w2.b offset:w2.off atIndex:3];
+        [enc setBuffer:b_frag_q offset:0 atIndex:4];
+        [enc setBuffer:b_frag_k offset:0 atIndex:5];
+        [enc setBuffer:b_frag_v offset:0 atIndex:6];
+        [enc setBytes:&H length:4 atIndex:7];
+        [enc setBytes:&M length:4 atIndex:8];
+        [enc setBytes:&eps length:4 atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake(M, 3, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      } else {
+        const size_t stride_m = size_t(M) * H * sizeof(float);
+        enc_rms(b_qkv_out, 0u, ly.is_local ? ly.attn_norm : ly.q_norm, b_frag_q, nil, zero_u);
+        enc_rms(b_qkv_out, 1u * stride_m, ly.is_local ? ly.attn_norm : ly.k_norm, b_frag_k, nil, zero_u);
+        enc_rms(b_qkv_out, 2u * stride_m, ly.is_local ? ly.attn_norm : ly.v_norm, b_frag_v, nil, zero_u);
+      }
       fk = b_frag_k;
       fv = b_frag_v;
       barrier();
@@ -1584,10 +1651,50 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     }
 
     }
+    const bool use_oconv = !pf && !fuse && fuse_oconv && M == 1u && lanes.size() == 1u && ks == 4u;
     for (uint32_t _r = 0, _n = ((skipm & (1u << 4)) ? 0u : 1u + ((dupm >> 4) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 4: o_proj
       if (_r > 0u) barrier();
     if (pf) {
       enc_mmp(enc, p_mmp_w8, ly.o_proj, b_frag_o, 0, b_o_out, 0, M, b_dummy);
+    } else if (use_oconv) {
+      auto& sl = (*lanes[0].S)[log_idx];
+      MmArgs a{};
+      a.N = ly.o_proj.N; a.K = ly.o_proj.K; a.M = M;
+      a.sgs = ly.o_proj.sgs;
+      a.ksplit = ly.o_proj.ksplit;
+      a.psplit = 16u * ly.o_proj.N;
+      a.R = b_stride;
+      a.H = ly.is_boundary ? 1u : 0u;
+      a.HC = n_blocks;
+      a.pf_z0 = ~0u;
+      static const int nft_force = getenv("INK_NFT") ? atoi(getenv("INK_NFT")) : 1;
+      bool pref1 = big_gpu;
+      if (nft_force == 1) pref1 = true;
+      if (nft_force == 2) pref1 = false;
+      const bool use_nft2 = !pref1 && ((a.N / 32u) % 2u == 0u && a.sgs <= 4u);
+      const uint32_t nsg = use_nft2 ? (a.sgs * 2u) : a.sgs;
+      const uint32_t nft = nsg / a.sgs;
+      const uint32_t gx = (a.N / 32u + nft - 1u) / nft;
+      [enc setComputePipelineState:p_mm_w8_oconv];
+      [enc setBuffer:ly.o_proj.w offset:ly.o_proj.woff atIndex:0];
+      [enc setBuffer:ly.o_proj.s offset:ly.o_proj.soff atIndex:1];
+      [enc setBuffer:b_frag_o offset:0 atIndex:2];
+      [enc setBuffer:(a.ksplit > 1u ? g_mmpart : b_dummy) offset:(a.ksplit > 1u ? ly.o_proj.pslot * kSplitPartBytes : 0) atIndex:3];
+      [enc setBuffer:b_o_out offset:0 atIndex:4];
+      [enc setBytes:&a length:sizeof(a) atIndex:5];
+      [enc setBuffer:b_dummy offset:0 atIndex:6];
+      [enc setBuffer:b_dummy offset:0 atIndex:7];
+      [enc setBuffer:(a.ksplit > 1u ? g_mmcnt : b_dummy) offset:(a.ksplit > 1u ? ly.o_proj.pslot * kSplitCntBytes : 0) atIndex:8];
+      [enc setBuffer:ly.attn_sconv.b offset:ly.attn_sconv.off atIndex:9];
+      [enc setBuffer:sl.attn_conv offset:0 atIndex:10];
+      [enc setBuffer:b_h offset:0 atIndex:11];
+      [enc setBuffer:b_blocks offset:0 atIndex:12];
+      [enc setBuffer:sl.attn_hist offset:0 atIndex:13];
+      [enc setBuffer:sl.attn_conv_next offset:0 atIndex:14];
+      [enc setBuffer:b_dummy offset:0 atIndex:15];
+      [enc setThreadgroupMemoryLength:size_t(nsg) * 16u * 32u * sizeof(float) atIndex:0];
+      [enc dispatchThreadgroups:MTLSizeMake(gx, a.ksplit, 1) threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
+      std::swap(sl.attn_conv, sl.attn_conv_next);
     } else {
       enc_mm2(enc, p_mm_w8, ly.o_proj, b_frag_o, 0, b_o_out, 0, M, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
     }
@@ -1595,13 +1702,17 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     flush_prof("attn_o");
 
     }
+    const bool use_mid_plain = !pf && !has_msgs && ((stream_fuse & 1u) != 0u);
+    const bool use_rms_scores = !pf && has_msgs && ((stream_fuse & 2u) != 0u);
+    const bool use_mid_msg_down = !pf && has_msgs && ((stream_fuse & 4u) != 0u);
     const bool fuse_h = !pf && fuse;
+    const bool skip_h = fuse_h || use_oconv;
     const uint32_t h_slot = n_blocks;
     for (uint32_t _r = 0, _n = ((skipm & (1u << 5)) ? 0u : 1u + ((dupm >> 5) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 5: post_conv attn
       if (_r > 0u) barrier();
     // H. Post-attention sconv + block boundary / residual add (decode plain layers with fuse: done inside the
-    //    pre-MLP attn_res_rms phase below)
-    if (!fuse_h)
+    //    pre-MLP attn_res_rms phase below; with use_oconv: done inside o_proj mm2 epilogue above)
+    if (!skip_h)
     for (const auto& lr : lanes) {
       auto& sl = (*lr.S)[log_idx];
       const size_t r0 = lr.r0;
@@ -1620,7 +1731,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     }
     }
     if (ly.is_boundary) n_blocks++;
-    if (!fuse_h) {
+    if (!skip_h) {
       barrier();
       flush_prof("post_conv");
     }
@@ -1628,7 +1739,22 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     for (uint32_t _r = 0, _n = (((skipm & (1u << 6)) || (!has_msgs && (skipm & (1u << 14))) || (has_msgs && (skipm & (1u << 15)))) ? 0u : 1u + ((dupm >> 6) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 6 (14: plain layers only, 15: msg layers only): pre-mlp attn_res/mg/rms
       if (_r > 0u) barrier();
     // I. Pre-MLP Block Attention Residual + optional Message Gate + mlp_norm
-    if (fuse_h && !has_msgs) {
+    if (use_mid_plain) {
+      AttnResRmsScoresArgs ars{H, E, M, n_blocks, b_stride, eps};
+      [enc setComputePipelineState:p_attn_res_rms_scores];
+      [enc setBuffer:b_blocks offset:0 atIndex:0];
+      [enc setBuffer:b_h offset:0 atIndex:1];
+      [enc setBuffer:ly.ar_mlp_q.b offset:ly.ar_mlp_q.off atIndex:2];
+      [enc setBuffer:ly.mlp_norm.b offset:ly.mlp_norm.off atIndex:3];
+      [enc setBuffer:b_frag_m offset:0 atIndex:4];
+      [enc setBuffer:b_mn_f32 offset:0 atIndex:5];
+      [enc setBuffer:ly.router_w.b offset:ly.router_w.off atIndex:6];
+      [enc setBuffer:b_rscores offset:0 atIndex:7];
+      [enc setBytes:&ars length:sizeof(ars) atIndex:8];
+      [enc dispatchThreadgroups:MTLSizeMake(M, E / 8u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+      flush_prof("attn_res");
+    } else if (fuse_h && !has_msgs) {
       for (const auto& lr : lanes) {
         auto& sl = (*lr.S)[log_idx];
         ConvResRmsArgs cra{H, lr.m, n_blocks, b_stride, lr.r0, ks, ly.is_boundary ? 1u : 0u, h_slot, eps};
@@ -1674,7 +1800,35 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       flush_prof("attn_res");
     } else {
       const uint32_t cat_stride_b4 = (MP * 2u * H) / 4u;
-      const size_t m_off = 3u * size_t(M) * H * sizeof(float);
+      const size_t m_off = msg_off + 3u * size_t(M) * H * sizeof(float);
+      if (use_mid_msg_down) {
+        AttnResMgDownArgs armd{H, gate_rank, M, n_blocks, b_stride, eps};
+        [enc setComputePipelineState:p_attn_res_mg_down];
+        [enc setBuffer:b_blocks offset:0 atIndex:0];
+        [enc setBuffer:b_h offset:0 atIndex:1];
+        [enc setBuffer:ly.ar_mlp_q.b offset:ly.ar_mlp_q.off atIndex:2];
+        [enc setBuffer:b_msgs offset:m_off atIndex:3];
+        [enc setBuffer:b_mh offset:0 atIndex:4];
+        [enc setBuffer:ly.ctrl_mlp.down.b offset:ly.ctrl_mlp.down.off atIndex:5];
+        [enc setBuffer:b_mg_low offset:0 atIndex:6];
+        [enc setBytes:&armd length:sizeof(armd) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(M, gate_rank / 8u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+        flush_prof("attn_res");
+
+        MsgGateArgs mga{H, gate_rank, eps};
+        [enc setComputePipelineState:p_mg_apply];
+        [enc setBuffer:b_mh offset:0 atIndex:0];
+        [enc setBuffer:b_msgs offset:m_off atIndex:1];
+        [enc setBuffer:b_mg_low offset:0 atIndex:2];
+        [enc setBuffer:ly.ctrl_mlp.forget.b offset:ly.ctrl_mlp.forget.off atIndex:3];
+        [enc setBuffer:ly.ctrl_mlp.gain.b offset:ly.ctrl_mlp.gain.off atIndex:4];
+        [enc setBuffer:b_mh offset:0 atIndex:5];
+        [enc setBytes:&mga length:sizeof(mga) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(M, (H + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        barrier();
+        flush_prof("msg_gate");
+      } else {
       if (fuse_h) {
         for (const auto& lr : lanes) {
           auto& sl = (*lr.S)[log_idx];
@@ -1757,13 +1911,31 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       }
       barrier();
       flush_prof("msg_gate");
+      }
 
-      enc_rms(b_mh, 0, ly.mlp_norm, b_frag_m, b_mn_f32, 1u);
-      barrier();
-      flush_prof("rms");
+      if (use_rms_scores) {
+        [enc setComputePipelineState:p_rms_scores];
+        [enc setBuffer:b_mh offset:0 atIndex:0];
+        [enc setBuffer:ly.mlp_norm.b offset:ly.mlp_norm.off atIndex:1];
+        [enc setBuffer:b_frag_m offset:0 atIndex:2];
+        [enc setBuffer:b_mn_f32 offset:0 atIndex:3];
+        [enc setBuffer:ly.router_w.b offset:ly.router_w.off atIndex:4];
+        [enc setBuffer:b_rscores offset:0 atIndex:5];
+        [enc setBytes:&H length:4 atIndex:6];
+        [enc setBytes:&E length:4 atIndex:7];
+        [enc setBytes:&eps length:4 atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(M, E / 8u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+        flush_prof("rms");
+      } else {
+        enc_rms(b_mh, 0, ly.mlp_norm, b_frag_m, b_mn_f32, 1u);
+        barrier();
+        flush_prof("rms");
+      }
     }
 
     }
+    if (!use_mid_plain && !use_rms_scores)
     for (uint32_t _r = 0, _n = ((skipm & (1u << 7)) ? 0u : 1u + ((dupm >> 7) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 7: router scores
       if (_r > 0u) barrier();
     // J. MoE Router + Grouped NVFP4/MXFP8 Experts + Accum
@@ -1998,10 +2170,22 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     barrier();
     copy_f32(b_pre_h, 0, b_h, 0, size_t(M) * H * sizeof(float));
     if (n_pre_blocks > 0) copy_f32(b_pre_blocks, 0, b_blocks, 0, size_t(n_pre_blocks) * b_stride * sizeof(float));
+    if (!pf && batch_msg) {
+      // Batch all n_core * 4 loop messages in one dispatch, concurrently with the restore copies above!
+      AttnResArgs mara{H, M, n_prev_bs, b_stride, eps};
+      [enc setComputePipelineState:p_attn_res];
+      [enc setBuffer:b_prev_blocks offset:0 atIndex:0];
+      [enc setBuffer:b_prev_h offset:0 atIndex:1];
+      [enc setBuffer:loop_msg_q.b offset:loop_msg_q.off atIndex:2];
+      [enc setBuffer:b_msgs offset:0 atIndex:3];
+      [enc setBytes:&mara length:sizeof(mara) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(M, n_core * 4u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
     barrier();
     n_blocks = n_pre_blocks;
 
     for (uint32_t li = 0; li < n_core; li++) {
+    if (pf || !batch_msg) {
     for (uint32_t _r = 0, _n = ((skipm & (1u << 13)) ? 0u : 1u + ((dupm >> 13) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 13: loop attn_res
       if (_r > 0u) barrier();
       AttnResArgs mara{H, M, n_prev_bs, b_stride, eps};
@@ -2014,7 +2198,9 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       [enc dispatchThreadgroups:MTLSizeMake(M, 4, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       barrier();
     }
-      run_layer(log_idx++, core_start + li, n_blocks, true);
+    }
+      const size_t msg_off = (!pf && batch_msg) ? (size_t(li) * 4u * size_t(M) * H * sizeof(float)) : 0u;
+      run_layer(log_idx++, core_start + li, n_blocks, true, msg_off);
     }
     early_commit();
   }
@@ -2023,17 +2209,19 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   for (uint32_t l = core_end; l < nL; l++) run_layer(log_idx++, l, n_blocks, false);
 
   // 6. Final AttnRes + Norm (+ capture tap 3 = final normalized hidden) + lm_head + softcap + argmax
-  AttnResArgs fara{H, M, n_blocks, b_stride, eps};
-  [enc setComputePipelineState:p_attn_res];
-  [enc setBuffer:b_blocks offset:0 atIndex:0];
-  [enc setBuffer:b_h offset:0 atIndex:1];
-  [enc setBuffer:ar_out_q.b offset:ar_out_q.off atIndex:2];
-  [enc setBuffer:b_mh offset:0 atIndex:3];
-  [enc setBytes:&fara length:sizeof(fara) atIndex:4];
-  [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-  barrier();
-
   const uint32_t wf32_final = has_mtp ? 1u : 0u;
+  if (pf || !batch_msg) {
+    AttnResArgs fara{H, M, n_blocks, b_stride, eps};
+    [enc setComputePipelineState:p_attn_res];
+    [enc setBuffer:b_blocks offset:0 atIndex:0];
+    [enc setBuffer:b_h offset:0 atIndex:1];
+    [enc setBuffer:ar_out_q.b offset:ar_out_q.off atIndex:2];
+    [enc setBuffer:b_mh offset:0 atIndex:3];
+    [enc setBytes:&fara length:sizeof(fara) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+  }
+
   if (pf) {
     if (has_mtp) {
       [enc setComputePipelineState:p_rms_frag];
@@ -2080,15 +2268,32 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     flush_prof("argmax");
     enc_sample(1u, pos + M - 1u);
   } else {
-    [enc setComputePipelineState:p_rms_frag];
-    [enc setBuffer:b_mh offset:0 atIndex:0];
-    [enc setBuffer:norm.b offset:norm.off atIndex:1];
-    [enc setBuffer:b_frag_m offset:0 atIndex:2];
-    [enc setBuffer:(has_mtp ? b_taps : b_dummy) offset:(has_mtp ? (3u * size_t(MP) * H * sizeof(float)) : 0) atIndex:3];
-    [enc setBytes:&H length:4 atIndex:4];
-    [enc setBytes:&eps length:4 atIndex:5];
-    [enc setBytes:&wf32_final length:4 atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (batch_msg) {
+      AttnResRmsArgs far{H, M, n_blocks, b_stride, wf32_final, eps};
+      [enc setComputePipelineState:p_attn_res_rms];
+      [enc setBuffer:b_blocks offset:0 atIndex:0];
+      [enc setBuffer:b_h offset:0 atIndex:1];
+      [enc setBuffer:ar_out_q.b offset:ar_out_q.off atIndex:2];
+      [enc setBuffer:norm.b offset:norm.off atIndex:3];
+      [enc setBuffer:norm.b offset:norm.off atIndex:4];
+      [enc setBuffer:norm.b offset:norm.off atIndex:5];
+      [enc setBuffer:b_frag_m offset:0 atIndex:6];
+      [enc setBuffer:b_frag_m offset:0 atIndex:7];
+      [enc setBuffer:b_frag_m offset:0 atIndex:8];
+      [enc setBuffer:(has_mtp ? b_taps : b_dummy) offset:(has_mtp ? (3u * size_t(MP) * H * sizeof(float)) : 0) atIndex:9];
+      [enc setBytes:&far length:sizeof(far) atIndex:10];
+      [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    } else {
+      [enc setComputePipelineState:p_rms_frag];
+      [enc setBuffer:b_mh offset:0 atIndex:0];
+      [enc setBuffer:norm.b offset:norm.off atIndex:1];
+      [enc setBuffer:b_frag_m offset:0 atIndex:2];
+      [enc setBuffer:(has_mtp ? b_taps : b_dummy) offset:(has_mtp ? (3u * size_t(MP) * H * sizeof(float)) : 0) atIndex:3];
+      [enc setBytes:&H length:4 atIndex:4];
+      [enc setBytes:&eps length:4 atIndex:5];
+      [enc setBytes:&wf32_final length:4 atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
     barrier();
 
     for (uint32_t _r = 0, _n = ((skipm & (1u << 12)) ? 0u : 1u + ((dupm >> 12) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 12: lm_head + argmax
