@@ -61,6 +61,8 @@ struct AttnArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, is_loc
 struct AttnPfArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window; };
 struct AttnDecArgs { uint32_t M, nh, nkv, hd, rel_extent, pos0, cap, window, n_splits, fork_pos; };
 struct PostConvArgs { uint32_t M, H, ks, is_boundary, is_mlp, b_slot, b_stride; };
+struct AccumConvArgs { uint32_t m, H, ks, r0, ystride; };
+struct ConvResRmsArgs { uint32_t H, m, n_prev, b_stride, r0, ks, is_boundary, b_slot; float eps; };
 struct RouteArgs { uint32_t M, H, E, topk; float route_scale; };
 struct PlanArgs { uint32_t M, E, topk, gx_gu, gx_dn; };
 struct MtpMixArgs { uint32_t H, M_stride, write_frag, write_f32, row_off; float eps; };
@@ -71,6 +73,12 @@ struct PackFragArgs { uint32_t H, B, gamma; };
 struct RnnArgs { uint32_t H, R, step; };
 struct MtpPickArgs { uint32_t V_valid, V_pad, step; float cap; float inv_t; uint32_t s0, s1, pos0; };
 struct SampRow { uint32_t N, ld, pos, s0, s1; float inv_t, lmin, top_p; uint32_t top_k; };
+
+// Split-K (Lin.ksplit > 1, dense M <= 16 only): per-split partials and self-resetting last-arrival counters for
+// mm2's reduce, allocated at load.
+static id<MTLBuffer> g_mmpart = nil, g_mmcnt = nil;
+static constexpr size_t kSplitPartBytes = size_t(16) * 16u * 8192u * sizeof(float);  // per pslot: ksplit <= 16, N <= 8192
+static constexpr size_t kSplitCntBytes = size_t(1) << 14;                            // per pslot
 
 void enc_mm2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
              const Lin& lin, id<MTLBuffer> X, size_t xoff, id<MTLBuffer> Y, size_t yoff,
@@ -95,22 +103,33 @@ void enc_mm2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
     a.ystride = ystride_f;
     a.rm = 1;
   }
+  // INK_NFT: 32-column fragments per threadgroup (layout only, same bits). 1 (default): one, measured -0.08 ms
+  // over the per-call choice at ctx 512 M=1; 2: two where possible; 0: the per-call choice (prefer_nft1).
+  static const int nft_force = getenv("INK_NFT") ? atoi(getenv("INK_NFT")) : 1;
+  if (nft_force == 1) prefer_nft1 = true;
+  if (nft_force == 2) prefer_nft1 = false;
   const bool use_nft2 = !prefer_nft1 && ((lin.N / 32u) % 2u == 0u && lin.sgs <= 4u);
   const uint32_t nsg = use_nft2 ? (lin.sgs * 2u) : lin.sgs;
   const uint32_t nft = nsg / lin.sgs;
   const uint32_t gx = (lin.N / 32u + nft - 1u) / nft;
   const uint32_t gz = grouped ? std::min<uint32_t>(M * 8u, lin.experts) : 1u;
+  const uint32_t ks = grouped ? 1u : lin.ksplit;
+  if (ks > 1u) {
+    a.ksplit = ks;
+    a.psplit = 16u * lin.N;  // one 16-row block (M <= 16)
+    if (size_t(ks) * a.psplit * sizeof(float) > kSplitPartBytes) mtl::die("mm2: split partials buffer too small");
+  }
 
   [enc setComputePipelineState:pipe];
   [enc setBuffer:lin.w offset:lin.woff atIndex:0];
   [enc setBuffer:lin.s offset:lin.soff atIndex:1];
   [enc setBuffer:X offset:xoff atIndex:2];
-  [enc setBuffer:dummy offset:0 atIndex:3];
+  [enc setBuffer:(ks > 1u ? g_mmpart : dummy) offset:(ks > 1u ? lin.pslot * kSplitPartBytes : 0) atIndex:3];
   [enc setBuffer:Y offset:yoff atIndex:4];
   [enc setBytes:&a length:sizeof(a) atIndex:5];
   [enc setBuffer:(grouped ? slots : dummy) offset:0 atIndex:6];
   [enc setBuffer:(grouped ? nslots : dummy) offset:0 atIndex:7];
-  [enc setBuffer:dummy offset:0 atIndex:8];
+  [enc setBuffer:(ks > 1u ? g_mmcnt : dummy) offset:(ks > 1u ? lin.pslot * kSplitCntBytes : 0) atIndex:8];
   [enc setBuffer:(E0 ? E0 : dummy) offset:0 atIndex:9];
   [enc setBuffer:dummy offset:0 atIndex:10];
   [enc setBuffer:dummy offset:0 atIndex:11];
@@ -119,7 +138,7 @@ void enc_mm2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
   [enc setBuffer:dummy offset:0 atIndex:14];
   [enc setBuffer:(grouped ? rmask : dummy) offset:0 atIndex:15];
   [enc setThreadgroupMemoryLength:size_t(nsg) * 16u * 32u * sizeof(float) atIndex:0];
-  [enc dispatchThreadgroups:MTLSizeMake(gx, 1, gz) threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
+  [enc dispatchThreadgroups:MTLSizeMake(gx, ks, gz) threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
 }
 
 // Dispatch mmp (dense W8 prefill, MMP_CH=8, MMP_NF=2, MMP_FAST=1).
@@ -130,7 +149,7 @@ void enc_mmp(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe,
   a.N = lin.N;
   a.K = lin.K;
   a.M = M;
-  a.ksplit = 1;
+  a.ksplit = lin.ksplit;  // replay mm2's split order
   a.sgs = lin.sgs;
   const uint32_t gx = (lin.N / 32u + 1u) / 2u;       // MMP_NF = 2
   const uint32_t gy = (M + 127u) / 128u;             // MMP_CH = 8 -> 128 rows/TG
@@ -158,7 +177,7 @@ void enc_mmp_nf1(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p
   a.N = lin.N;
   a.K = lin.K;
   a.M = M;
-  a.ksplit = 1;
+  a.ksplit = lin.ksplit;  // replay mm2's split order
   a.sgs = lin.sgs;
   a.R = R_epi;
   const uint32_t gx = lin.N / 32u;
@@ -189,7 +208,7 @@ void enc_mmpg(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipe
   a.N = lin.N;
   a.K = lin.K;
   a.M = M;
-  a.ksplit = 1;
+  a.ksplit = lin.ksplit;  // replay mm2's split order
   a.sgs = lin.sgs;
   a.ldx = ldx;   // 0: gather via rlist (moe_gu); 2: compact off+i (moe_dn)
   a.R = R_epi;
@@ -310,6 +329,37 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     else if (units % 3u == 0u) ln.sgs = 3;
     else if (units % 2u == 0u) ln.sgs = 2;
     else ln.sgs = 1;
+    // Decode split table (INK_SPLIT_TAB=0 drops it): measured 2026-11-22 on M5 Ultra, ctx 512 M=1, against the
+    // sgs heuristic above: attn.o 1 x 12 -0.33 ms, NVFP4 moe gu / dn sgs 2 -0.22 / -0.12 ms, together -0.73 ms
+    // (with INK_NFT 1: -0.76). Teacher-forced NLL moves within the reordering noise (+0.0036 / +0.0001 nats on two
+    // 8k-token texts; other reorders scatter -0.0007 .. +0.0027).
+    if (!(getenv("INK_SPLIT_TAB") && atoi(getenv("INK_SPLIT_TAB")) == 0)) {
+      static const uint32_t tab[][5] = {{8, 2304, 3072, 1, 12}, {40, 2304, 2304, 2, 1}, {40, 2304, 1152, 2, 1}};
+      for (const auto& r : tab)
+        if (r[0] == ln.bits && r[1] == ln.N && r[2] == ln.K && units % (r[3] * r[4]) == 0) {
+          ln.sgs = r[3];
+          ln.ksplit = r[4];
+        }
+    }
+    // INK_SPLITS="bits:N:K:sgs:ksplit,..." (screen): K-split of that tensor shape across simdgroups (sgs) and, for
+    // dense tensors, threadgroups (ksplit). Changes the reduction tree for decode, verify and prefill alike
+    // (mmp/mmpg replay mm2's slices and splits), so those paths stay mutually exact.
+    if (const char* ov = getenv("INK_SPLITS")) {
+      std::string spec(ov);
+      size_t at = 0;
+      while (at < spec.size()) {
+        size_t e = spec.find(',', at);
+        if (e == std::string::npos) e = spec.size();
+        unsigned b = 0, n = 0, k = 0, g = 0, q = 0;
+        if (sscanf(spec.substr(at, e - at).c_str(), "%u:%u:%u:%u:%u", &b, &n, &k, &g, &q) == 5 && b == ln.bits &&
+            n == ln.N && k == ln.K && g >= 1 && g <= 12 && q >= 1 && q <= 16 && units % (g * q) == 0 &&
+            (q == 1 || (ln.experts <= 1 && ln.N <= 8192))) {
+          ln.sgs = g;
+          ln.ksplit = q;
+        }
+        at = e + 1;
+      }
+    }
     return ln;
   };
 
@@ -355,6 +405,9 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     ly.qgrs = get_lin(p + ".attn.qgrs");
     ly.k_proj = get_lin(p + ".attn.k");
     ly.v_proj = get_lin(p + ".attn.v");
+    ly.qgrs.pslot = 1;  // qgrs || k || v share a phase: disjoint split-K scratch
+    ly.k_proj.pslot = 2;
+    ly.v_proj.pslot = 3;
     ly.o_proj = get_lin(p + ".attn.o");
     ly.q_scale = get_raw(p + ".attn.q_scale");
     ly.rel_scale = get_raw(p + ".attn.rel_scale");
@@ -489,6 +542,9 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   b_conf_out = C.buf(MAXM * sizeof(float));
   b_samp_rows = C.buf(MAXM * sizeof(SampRow));
   b_dummy = C.buf(64);
+  g_mmpart = C.buf(4u * kSplitPartBytes);  // pslots 0..3
+  g_mmcnt = C.buf(4u * kSplitCntBytes);
+  memset([g_mmcnt contents], 0, 4u * kSplitCntBytes);  // last-arrival counters start at 0; mm2 resets each after use
 
   // Optional DSpark MTP drafter overlay
   NSData* mjd = [NSData dataWithContentsOfFile:@((dir + "/mtp_manifest.json").c_str())];
@@ -619,6 +675,10 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_route = C.pipe(ink_src, "ink_moe_route");
   p_pack_dec = C.pipe(ink_src, "ink_moe_pack_dec");
   p_moe_accum = C.pipe(ink_src, "ink_moe_accum");
+  p_route_fast = C.pipe(ink_src, "ink_moe_route_fast");
+  p_moe_accum_conv = C.pipe(ink_src, "ink_moe_accum_post_sconv");
+  p_conv_res_rms = C.pipe(ink_src, "ink_post_sconv_attn_res_rms");
+  p_conv_res_mg = C.pipe(ink_src, "ink_post_sconv_attn_res_mg_prep");
   p_softcap_argmax_p1 = C.pipe(ink_src, "ink_softcap_argmax_p1");
   p_softcap_argmax_p2 = C.pipe(ink_src, "ink_softcap_argmax_p2");
   p_copy = C.pipe(ink_src, "ink_copy_f32");
@@ -626,18 +686,22 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   p_plan_pf = C.pipe(ink_src, "ink_moe_plan_pf");
   p_moe_accum_pf = C.pipe(ink_src, "ink_moe_accum_pf");
 
-  p_mm_w8 = C.pipe(mm_src, "mm2", {{"WBITS", "8"}, {"GS", "128"}, {"TILES", "1"}});
+  // INK_PF_W8 / INK_PF_MOE: k-steps of weights in flight per simdgroup in the M <= 16 mm2 matmuls (load
+  // scheduling only: the accumulation order, so every output bit, is unchanged).
+  const std::string pf_w8 = getenv("INK_PF_W8") ? getenv("INK_PF_W8") : "1";
+  const std::string pf_moe = getenv("INK_PF_MOE") ? getenv("INK_PF_MOE") : "1";
+  p_mm_w8 = C.pipe(mm_src, "mm2", {{"WBITS", "8"}, {"GS", "128"}, {"TILES", "1"}, {"PF", pf_w8}});
   p_mmp_w8 = C.pipe(mm_src, "mmp", {{"WBITS", "8"}, {"GS", "128"}, {"MMP_CH", "8"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"}});
   p_moe_fp4_gu = C.pipe(mm_src, "mm2", {
-      {"WBITS", "40"}, {"GS", "16"}, {"TILES", "1"}, {"GROUPED", "1"},
+      {"WBITS", "40"}, {"GS", "16"}, {"TILES", "1"}, {"GROUPED", "1"}, {"PF", pf_moe},
       {"EPI", "3"}, {"SWIGLU_SOFTCAP_G", "4.0"}, {"SWIGLU_SOFTCAP_U", "25.0"}});
   p_moe_fp4_dn = C.pipe(mm_src, "mm2", {
-      {"WBITS", "40"}, {"GS", "16"}, {"TILES", "1"}, {"GROUPED", "1"}});
+      {"WBITS", "40"}, {"GS", "16"}, {"TILES", "1"}, {"GROUPED", "1"}, {"PF", pf_moe}});
   p_moe_fp8_gu = C.pipe(mm_src, "mm2", {
-      {"WBITS", "80"}, {"GS", "32"}, {"TILES", "1"}, {"GROUPED", "1"},
+      {"WBITS", "80"}, {"GS", "32"}, {"TILES", "1"}, {"GROUPED", "1"}, {"PF", pf_moe},
       {"EPI", "3"}, {"SWIGLU_SOFTCAP_G", "4.0"}, {"SWIGLU_SOFTCAP_U", "25.0"}});
   p_moe_fp8_dn = C.pipe(mm_src, "mm2", {
-      {"WBITS", "80"}, {"GS", "32"}, {"TILES", "1"}, {"GROUPED", "1"}});
+      {"WBITS", "80"}, {"GS", "32"}, {"TILES", "1"}, {"GROUPED", "1"}, {"PF", pf_moe}});
   p_mmpg_fp4_gu = C.pipe(mm_src, "mmpg", {
       {"WBITS", "40"}, {"GS", "16"}, {"GROUPED", "1"}, {"MMP_CH", "4"}, {"MMP_NF", "2"}, {"MMP_FAST", "1"},
       {"EPI", "3"}, {"SWIGLU_SOFTCAP_G", "4.0"}, {"SWIGLU_SOFTCAP_U", "25.0"}});
@@ -1045,6 +1109,12 @@ void Model::rollback(uint32_t accepted, uint32_t M_step) {
   }
 }
 
+std::vector<uint32_t> Model::step_all(const std::vector<uint32_t>& ids, std::vector<float>* all_logits) {
+  tap_row0 = 0;
+  auto* pS = (fork_src >= 0) ? (fork_src == active_lane ? &S : &lanes_[fork_src].S) : nullptr;
+  return step_core(ids, {{&S, pS, &pos, fork_pos, 0u, uint32_t(ids.size()), &samp}}, nullptr, nullptr, all_logits, nullptr);
+}
+
 std::vector<uint32_t> Model::step(const std::vector<uint32_t>& ids, double* gpu_ms,
                                   std::vector<float>* last_logits,
                                   std::map<std::string, double>* prof) {
@@ -1071,8 +1141,25 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
                 : [cb computeCommandEncoder];
   };
   id<MTLComputeCommandEncoder> enc = new_enc();
+  // INK_XBAR=n (screen only): n extra empty dispatch + barrier phases after every barrier, to price one phase.
+  static const uint32_t xbar = getenv("INK_XBAR") ? uint32_t(atoi(getenv("INK_XBAR"))) : 0u;
+  // INK_SKIP=mask (screen only, wrong output): drop op groups + their barriers from the stream to time them.
+  static const uint32_t skipm = getenv("INK_SKIP") ? uint32_t(strtoul(getenv("INK_SKIP"), nullptr, 0)) : 0u;
+  // INK_DUP=mask (screen only): run those op groups 1 + INK_DUPN times; the extra time prices one instance in-stream.
+  static const uint32_t dupm = getenv("INK_DUP") ? uint32_t(strtoul(getenv("INK_DUP"), nullptr, 0)) : 0u;
+  static const uint32_t dupn = getenv("INK_DUPN") ? uint32_t(atoi(getenv("INK_DUPN"))) : 1u;
   auto barrier = [&]() {
-    if (conc) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (!conc) return;
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    for (uint32_t k = 0; k < xbar; k++) {
+      const uint32_t zero = 0u;
+      [enc setComputePipelineState:p_copy];
+      [enc setBuffer:b_dummy offset:0 atIndex:0];
+      [enc setBuffer:b_dummy offset:0 atIndex:1];
+      [enc setBytes:&zero length:4 atIndex:2];
+      [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
   };
 
   auto flush_prof = [&](const char* tag) {
@@ -1082,6 +1169,24 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     [cb waitUntilCompleted];
     if (cb.error) mtl::die("GPU step error", cb.error);
     (*prof)[tag] += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    cb = [C.q commandBuffer];
+    enc = new_enc();
+  };
+
+  // Early commits (INK_EARLY, default on): hand finished segments to the GPU while the CPU encodes the rest.
+  // Same queue = in-order execution, so outputs are unchanged; only encode latency is hidden.
+  static const bool early = !(getenv("INK_EARLY") && atoi(getenv("INK_EARLY")) == 0);
+  // Decode fusions (INK_FUSE=1; default off): bit-identical, but measured +0.2 ms at ctx 512 M=1 on M5 Ultra
+  // (the single-TG fused kernels cost more than the ~4 us post-sconv phases they absorb).
+  static const bool fuse = getenv("INK_FUSE") && atoi(getenv("INK_FUSE")) != 0;
+  // Decode router in one phase (INK_ROUTE_FAST, default on; same picks, weights and slots).
+  static const bool route_fast = !(getenv("INK_ROUTE_FAST") && atoi(getenv("INK_ROUTE_FAST")) == 0);
+  std::vector<id<MTLCommandBuffer>> done_cbs;
+  auto early_commit = [&]() {
+    if (prof || !early) return;
+    [enc endEncoding];
+    [cb commit];
+    done_cbs.push_back(cb);
     cb = [C.q commandBuffer];
     enc = new_enc();
   };
@@ -1165,6 +1270,8 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     };
 
     id<MTLBuffer> fk = b_frag_q, fv = b_frag_q;
+    for (uint32_t _r = 0, _n = (((skipm & (1u << 0)) || (!has_msgs && (skipm & (1u << 16))) || (has_msgs && (skipm & (1u << 17)))) ? 0u : 1u + ((dupm >> 0) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 0 (16: plain, 17: msg): pre-attn attn_res/mg/rms
+      if (_r > 0u) barrier();
     if (phys_idx == 0) {
       enc_rms(b_h, 0, ly.attn_norm, b_frag_q, nil, zero_u);
       barrier();
@@ -1275,6 +1382,9 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       flush_prof("rms");
     }
 
+    }
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 1)) ? 0u : 1u + ((dupm >> 1) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 1: qkv proj
+      if (_r > 0u) barrier();
     // D. Attention projections (W8): qgrs || k || v concurrently
     if (pf) {
       enc_mmp(enc, p_mmp_w8, ly.qgrs, b_frag_q, 0, b_qgrs, 0, M, b_dummy);
@@ -1290,6 +1400,9 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     barrier();
     flush_prof("attn_kv");
 
+    }
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 2)) ? 0u : 1u + ((dupm >> 2) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 2: q_rel + kv_conv
+      if (_r > 0u) barrier();
     // E + F. Q+Rel || K sconv || V sconv concurrently
     QRelArgs qra{nh, hd, d_rel, rel_extent, ly.qgrs.N, pos, ly.is_local ? 0u : 1u,
                  qk_clip, rel_clip, log_n_floor, log_alpha};
@@ -1373,6 +1486,9 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       flush_prof("q_rel");
     }
 
+    }
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 3)) ? 0u : 1u + ((dupm >> 3) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 3: attention
+      if (_r > 0u) barrier();
     // G. Attention: Metal 4 matmul2d FlashAttention for prefill (pf), split-K GQA for decode/verify
     if (pf) {
       AttnPfArgs pfa{M, nh, nkv, hd, rel_extent, pos, st.cap, window};
@@ -1437,6 +1553,9 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       flush_prof("attn");
     }
 
+    }
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 4)) ? 0u : 1u + ((dupm >> 4) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 4: o_proj
+      if (_r > 0u) barrier();
     if (pf) {
       enc_mmp(enc, p_mmp_w8, ly.o_proj, b_frag_o, 0, b_o_out, 0, M, b_dummy);
     } else {
@@ -1445,7 +1564,14 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     barrier();
     flush_prof("attn_o");
 
-    // H. Post-attention sconv + block boundary / residual add
+    }
+    const bool fuse_h = !pf && fuse;
+    const uint32_t h_slot = n_blocks;
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 5)) ? 0u : 1u + ((dupm >> 5) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 5: post_conv attn
+      if (_r > 0u) barrier();
+    // H. Post-attention sconv + block boundary / residual add (decode plain layers with fuse: done inside the
+    //    pre-MLP attn_res_rms phase below)
+    if (!fuse_h)
     for (const auto& lr : lanes) {
       auto& sl = (*lr.S)[log_idx];
       const size_t r0 = lr.r0;
@@ -1462,12 +1588,39 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       [enc dispatchThreadgroups:MTLSizeMake(lr.m, (H + 255u) / 256u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       std::swap(sl.attn_conv, sl.attn_conv_next);
     }
+    }
     if (ly.is_boundary) n_blocks++;
-    barrier();
-    flush_prof("post_conv");
+    if (!fuse_h) {
+      barrier();
+      flush_prof("post_conv");
+    }
 
+    for (uint32_t _r = 0, _n = (((skipm & (1u << 6)) || (!has_msgs && (skipm & (1u << 14))) || (has_msgs && (skipm & (1u << 15)))) ? 0u : 1u + ((dupm >> 6) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 6 (14: plain layers only, 15: msg layers only): pre-mlp attn_res/mg/rms
+      if (_r > 0u) barrier();
     // I. Pre-MLP Block Attention Residual + optional Message Gate + mlp_norm
-    if (!has_msgs) {
+    if (fuse_h && !has_msgs) {
+      for (const auto& lr : lanes) {
+        auto& sl = (*lr.S)[log_idx];
+        ConvResRmsArgs cra{H, lr.m, n_blocks, b_stride, lr.r0, ks, ly.is_boundary ? 1u : 0u, h_slot, eps};
+        [enc setComputePipelineState:p_conv_res_rms];
+        [enc setBuffer:b_o_out offset:0 atIndex:0];
+        [enc setBuffer:ly.attn_sconv.b offset:ly.attn_sconv.off atIndex:1];
+        [enc setBuffer:sl.attn_conv offset:0 atIndex:2];
+        [enc setBuffer:b_h offset:0 atIndex:3];
+        [enc setBuffer:b_blocks offset:0 atIndex:4];
+        [enc setBuffer:sl.attn_hist offset:0 atIndex:5];
+        [enc setBuffer:sl.attn_conv_next offset:0 atIndex:6];
+        [enc setBuffer:ly.ar_mlp_q.b offset:ly.ar_mlp_q.off atIndex:7];
+        [enc setBuffer:ly.mlp_norm.b offset:ly.mlp_norm.off atIndex:8];
+        [enc setBuffer:b_frag_m offset:0 atIndex:9];
+        [enc setBuffer:b_mn_f32 offset:0 atIndex:10];
+        [enc setBytes:&cra length:sizeof(cra) atIndex:11];
+        [enc dispatchThreadgroups:MTLSizeMake(lr.m, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        std::swap(sl.attn_conv, sl.attn_conv_next);
+      }
+      barrier();
+      flush_prof("attn_res");
+    } else if (!has_msgs) {
       AttnResRmsArgs mar{H, M, n_blocks, b_stride, 1u, eps};
       [enc setComputePipelineState:p_attn_res_rms];
       [enc setBuffer:b_blocks offset:0 atIndex:0];
@@ -1483,10 +1636,36 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       [enc setBytes:&mar length:sizeof(mar) atIndex:10];
       [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       barrier();
+      static const uint32_t dup_mlp_ar = getenv("INK_DUP_MLPAR") ? uint32_t(atoi(getenv("INK_DUP_MLPAR"))) : 0u;
+      for (uint32_t k = 0; k < dup_mlp_ar; k++) {  // screen only: repeat the (idempotent) dispatch
+        [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+      }
       flush_prof("attn_res");
     } else {
       const uint32_t cat_stride_b4 = (MP * 2u * H) / 4u;
       const size_t m_off = 3u * size_t(M) * H * sizeof(float);
+      if (fuse_h) {
+        for (const auto& lr : lanes) {
+          auto& sl = (*lr.S)[log_idx];
+          ConvResRmsArgs cra{H, lr.m, n_blocks, b_stride, lr.r0, ks, ly.is_boundary ? 1u : 0u, h_slot, eps};
+          [enc setComputePipelineState:p_conv_res_mg];
+          [enc setBuffer:b_o_out offset:0 atIndex:0];
+          [enc setBuffer:ly.attn_sconv.b offset:ly.attn_sconv.off atIndex:1];
+          [enc setBuffer:sl.attn_conv offset:0 atIndex:2];
+          [enc setBuffer:b_h offset:0 atIndex:3];
+          [enc setBuffer:b_blocks offset:0 atIndex:4];
+          [enc setBuffer:sl.attn_hist offset:0 atIndex:5];
+          [enc setBuffer:sl.attn_conv_next offset:0 atIndex:6];
+          [enc setBuffer:ly.ar_mlp_q.b offset:ly.ar_mlp_q.off atIndex:7];
+          [enc setBuffer:b_msgs offset:m_off atIndex:8];
+          [enc setBuffer:b_mh offset:0 atIndex:9];
+          [enc setBuffer:b_mg_cat offset:0 atIndex:10];
+          [enc setBytes:&cra length:sizeof(cra) atIndex:11];
+          [enc dispatchThreadgroups:MTLSizeMake(lr.m, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+          std::swap(sl.attn_conv, sl.attn_conv_next);
+        }
+      } else {
       AttnResMgArgs arm{H, M, n_blocks, b_stride, 0u, cat_stride_b4, eps};
       [enc setComputePipelineState:p_attn_res_mg_prep];
       [enc setBuffer:b_blocks offset:0 atIndex:0];
@@ -1497,6 +1676,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       [enc setBuffer:b_mg_cat offset:0 atIndex:5];
       [enc setBytes:&arm length:sizeof(arm) atIndex:6];
       [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
       barrier();
       flush_prof("attn_res");
 
@@ -1553,6 +1733,9 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       flush_prof("rms");
     }
 
+    }
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 7)) ? 0u : 1u + ((dupm >> 7) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 7: router scores
+      if (_r > 0u) barrier();
     // J. MoE Router + Grouped NVFP4/MXFP8 Experts + Accum
     if (pf) {
       [enc setComputePipelineState:p_scores_mma];
@@ -1574,6 +1757,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     }
     barrier();
 
+    }
     RouteArgs ra{M, H, E, topk, route_scale};
     const bool is_fp4 = (ly.moe_gu.bits == 40);
     if (pf) {
@@ -1625,7 +1809,20 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       barrier();
       flush_prof("moe_accum");
     } else {
-      if (M == 1u) {
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 7)) ? 0u : 1u + ((dupm >> 7) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 7: router top-k
+      if (_r > 0u) barrier();
+      if (route_fast) {
+        [enc setComputePipelineState:p_route_fast];
+        [enc setBuffer:b_rscores offset:0 atIndex:0];
+        [enc setBuffer:ly.router_b.b offset:ly.router_b.off atIndex:1];
+        [enc setBuffer:b_top_idx offset:0 atIndex:2];
+        [enc setBuffer:b_top_w offset:0 atIndex:3];
+        [enc setBuffer:b_slots offset:0 atIndex:4];
+        [enc setBuffer:b_nslots offset:0 atIndex:5];
+        [enc setBuffer:b_rmask offset:0 atIndex:6];
+        [enc setBytes:&ra length:sizeof(ra) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(E, 1, 1)];
+      } else if (M == 1u) {
         [enc setComputePipelineState:p_route];
         [enc setBuffer:b_rscores offset:0 atIndex:0];
         [enc setBuffer:ly.router_b.b offset:ly.router_b.off atIndex:1];
@@ -1657,17 +1854,25 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       barrier();
       flush_prof("moe_route");
 
+    }
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 8)) ? 0u : 1u + ((dupm >> 8) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 8: moe gate/up
+      if (_r > 0u) barrier();
       enc_mm2(enc, is_fp4 ? p_moe_fp4_gu : p_moe_fp8_gu, ly.moe_gu, b_frag_m, 0, b_dummy, 0, M,
               b_frag_gu, b_dummy, b_slots, b_nslots, b_rmask, true, I_moe, 0u, 0u);
       barrier();
       flush_prof("moe_gu");
+    }
       const uint32_t xstride_dn = (MAXM * I_moe * sizeof(uint16_t)) / 16u;
       const uint32_t ystride_dn = MAXM * H;
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 9)) ? 0u : 1u + ((dupm >> 9) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 9: moe down
+      if (_r > 0u) barrier();
       enc_mm2(enc, is_fp4 ? p_moe_fp4_dn : p_moe_fp8_dn, ly.moe_dn, b_frag_gu, 0, b_moe_y, 0, M,
               nil, b_dummy, b_slots, b_nslots, b_rmask, true, 0u, xstride_dn, ystride_dn);
       barrier();
       flush_prof("moe_dn");
 
+    }
+    if (!fuse && !(skipm & (1u << 10))) {  // INK_SKIP bit 10: moe accum (fused into section K when fuse)
       [enc setComputePipelineState:p_moe_accum];
       [enc setBuffer:b_moe_y offset:0 atIndex:0];
       [enc setBuffer:b_slots offset:0 atIndex:1];
@@ -1681,8 +1886,32 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       barrier();
       flush_prof("moe_accum");
     }
+    }
 
-    // K. Post-MLP sconv + residual add -> b_h (bf16-rounded)
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 11)) ? 0u : 1u + ((dupm >> 11) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 11: post_conv mlp
+      if (_r > 0u) barrier();
+    // K. Post-MLP sconv + residual add -> b_h (bf16-rounded); decode with fuse: + moe_accum in the same phase
+    if (!pf && fuse) {
+      const uint32_t ystride_dn = MAXM * H;
+      for (const auto& lr : lanes) {
+        auto& sl = (*lr.S)[log_idx];
+        AccumConvArgs aca{lr.m, H, ks, lr.r0, ystride_dn};
+        [enc setComputePipelineState:p_moe_accum_conv];
+        [enc setBuffer:b_moe_y offset:0 atIndex:0];
+        [enc setBuffer:b_slots offset:0 atIndex:1];
+        [enc setBuffer:b_nslots offset:0 atIndex:2];
+        [enc setBuffer:b_top_idx offset:0 atIndex:3];
+        [enc setBuffer:b_top_w offset:0 atIndex:4];
+        [enc setBuffer:ly.mlp_sconv.b offset:ly.mlp_sconv.off atIndex:5];
+        [enc setBuffer:sl.mlp_conv offset:0 atIndex:6];
+        [enc setBuffer:b_h offset:0 atIndex:7];
+        [enc setBuffer:sl.mlp_hist offset:0 atIndex:8];
+        [enc setBuffer:sl.mlp_conv_next offset:0 atIndex:9];
+        [enc setBytes:&aca length:sizeof(aca) atIndex:10];
+        [enc dispatchThreadgroups:MTLSizeMake(lr.m, ((H >> 2) + 63u) / 64u, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        std::swap(sl.mlp_conv, sl.mlp_conv_next);
+      }
+    } else
     for (const auto& lr : lanes) {
       auto& sl = (*lr.S)[log_idx];
       const size_t r0 = lr.r0;
@@ -1701,6 +1930,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     }
     barrier();
     flush_prof("post_conv");
+    }
   };
 
   uint32_t n_blocks = 0;
@@ -1714,8 +1944,10 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   if (n_pre_blocks > 0) copy_f32(b_blocks, 0, b_pre_blocks, 0, size_t(n_pre_blocks) * b_stride * sizeof(float));
   barrier();
 
+  early_commit();
   // 3. Pass 0 over core
   for (uint32_t l = core_start; l < core_end; l++) run_layer(log_idx++, l, n_blocks, false);
+  early_commit();
 
   // 4. Passes 1 .. num_passes - 1
   for (uint32_t p = 1; p < num_passes; p++) {
@@ -1732,6 +1964,8 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     n_blocks = n_pre_blocks;
 
     for (uint32_t li = 0; li < n_core; li++) {
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 13)) ? 0u : 1u + ((dupm >> 13) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 13: loop attn_res
+      if (_r > 0u) barrier();
       AttnResArgs mara{H, M, n_prev_bs, b_stride, eps};
       [enc setComputePipelineState:p_attn_res];
       [enc setBuffer:b_prev_blocks offset:0 atIndex:0];
@@ -1741,8 +1975,10 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       [enc setBytes:&mara length:sizeof(mara) atIndex:4];
       [enc dispatchThreadgroups:MTLSizeMake(M, 4, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       barrier();
+    }
       run_layer(log_idx++, core_start + li, n_blocks, true);
     }
+    early_commit();
   }
 
   // 5. Coda
@@ -1817,6 +2053,8 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     barrier();
 
+    for (uint32_t _r = 0, _n = ((skipm & (1u << 12)) ? 0u : 1u + ((dupm >> 12) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 12: lm_head + argmax
+      if (_r > 0u) barrier();
     enc_mm2(enc, p_mm_w8, lm_head, b_frag_m, 0, b_logits, 0, M, nil, b_dummy, nil, nil, nil, false);
     barrier();
     flush_prof("lm_head");
@@ -1836,14 +2074,19 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     [enc setBuffer:b_tok_out offset:0 atIndex:2];
     [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     flush_prof("argmax");
+    }
     enc_sample(M, 0u);
   }
 
   [enc endEncoding];
   [cb commit];
   [cb waitUntilCompleted];
+  for (id<MTLCommandBuffer> d : done_cbs) {
+    [d waitUntilCompleted];
+    if (d.error) mtl::die("GPU step error", d.error);
+  }
   if (cb.error) mtl::die("GPU step error", cb.error);
-  if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+  if (gpu_ms) *gpu_ms = (cb.GPUEndTime - (done_cbs.empty() ? cb : done_cbs.front()).GPUStartTime) * 1000.0;
 
   for (const auto& lr : lanes) *lr.pos += lr.m;
   std::vector<uint32_t> out(M, 0u);

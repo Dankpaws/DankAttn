@@ -811,6 +811,60 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (cmd == "nll") {
+      // nll <ids.bin> <n>: teacher-forced mean next-token NLL (f64 log-softmax over the softcapped logits) through
+      // the decode/verify path in 16-row steps: precision check for engine changes that move logits by ulps.
+      if (argc < 5) mtl::die("nll <ids.bin> <n>");
+      auto all = read_ids_bin(argv[3]);
+      const uint32_t n = std::min<uint32_t>(uint32_t(atoi(argv[4])), uint32_t(all.size()));
+      double tot = 0.0;
+      uint32_t cnt = 0, hits = 0;
+      std::vector<float> lg;
+      for (uint32_t i = 0; i + 1 < n; i += 16) {
+        const uint32_t m = std::min<uint32_t>(16u, n - 1u - i);
+        std::vector<uint32_t> rows(all.begin() + i, all.begin() + i + m);
+        M.step_all(rows, &lg);
+        const size_t V = lg.size() / m;
+        for (uint32_t r = 0; r < m; r++) {
+          const float* x = lg.data() + size_t(r) * V;
+          double mx = -1e300;
+          size_t am = 0;
+          for (size_t v = 0; v < V; v++) if (x[v] > mx) { mx = x[v]; am = v; }
+          double se = 0.0;
+          for (size_t v = 0; v < V; v++) se += std::exp(double(x[v]) - mx);
+          const uint32_t tgt = all[i + r + 1u];
+          tot += (mx + std::log(se)) - double(x[tgt]);
+          hits += (am == tgt) ? 1u : 0u;
+          cnt++;
+        }
+      }
+      printf("nll n=%u: mean %.6f nats (ppl %.4f), top1 %.4f\n", cnt, tot / cnt, std::exp(tot / cnt), double(hits) / cnt);
+      return 0;
+    }
+
+    if (cmd == "rdump") {
+      // rdump <ids.bin> <ctx> <m> <out.bin>: chunked prefill of ctx tokens, then one M=m step; writes all m rows'
+      // logits (decode/verify path), for bit-identity A/B across engine builds.
+      if (argc < 7) mtl::die("rdump <ids.bin> <ctx> <m> <out.bin>");
+      auto all = read_ids_bin(argv[3]);
+      const uint32_t n_ctx = uint32_t(atoi(argv[4])), m = uint32_t(atoi(argv[5]));
+      for (uint32_t i = 0; i < n_ctx; i += ink2::MP) {
+        const uint32_t c = std::min(ink2::MP, n_ctx - i);
+        std::vector<uint32_t> ch(c);
+        for (uint32_t j = 0; j < c; j++) ch[j] = all[(i + j) % all.size()];
+        M.step(ch);
+      }
+      std::vector<uint32_t> rows(m);
+      for (uint32_t j = 0; j < m; j++) rows[j] = all[(n_ctx + j) % all.size()];
+      std::vector<float> lg;
+      auto out = M.step_all(rows, &lg);
+      FILE* f = fopen(argv[6], "wb");
+      fwrite(lg.data(), 4, lg.size(), f);
+      fclose(f);
+      printf("rdump ctx=%u m=%u last_tok=%u rows=%zu\n", n_ctx, m, out.back(), lg.size() / std::max<size_t>(1, m));
+      return 0;
+    }
+
     mtl::die(("unknown command: " + cmd).c_str());
   }
 }

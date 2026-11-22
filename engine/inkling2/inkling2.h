@@ -23,6 +23,7 @@ struct Lin {
   id<MTLBuffer> w = nil, s = nil;
   size_t woff = 0, soff = 0;
   uint32_t N = 0, K = 0, bits = 0, gs = 0, experts = 1, ksplit = 1, sgs = 1;
+  uint32_t pslot = 0;  // split-K scratch region: tensors that run concurrently (qgrs || k || v) need their own
 };
 
 struct Raw {
@@ -175,6 +176,10 @@ struct Model {
   id<MTLComputePipelineState> p_attn_dec_local, p_attn_dec_global_bf16, p_attn_dec_global_kv8;
   id<MTLComputePipelineState> p_scores, p_scores_mma, p_route, p_pack_dec, p_moe_accum, p_softcap_argmax_p1, p_softcap_argmax_p2, p_copy;
   id<MTLComputePipelineState> p_topk_pf, p_plan_pf, p_moe_accum_pf;
+  id<MTLComputePipelineState> p_route_fast;      // decode router: rank top-k + prefix slots, one phase
+  id<MTLComputePipelineState> p_moe_accum_conv;  // decode fusion: moe_accum + mlp post_sconv
+  id<MTLComputePipelineState> p_conv_res_rms;    // decode fusion: attn post_sconv + pre-MLP attn_res_rms
+  id<MTLComputePipelineState> p_conv_res_mg;     // decode fusion: attn post_sconv + pre-MLP attn_res_mg_prep
   id<MTLComputePipelineState> p_mm_w8, p_mm_w6_gu, p_mm_w6_dn;
   id<MTLComputePipelineState> p_mmp_w8, p_mmp_w8_mtp, p_mmp_w6_gu, p_mmp_w6_dn;
   id<MTLComputePipelineState> p_moe_fp4_gu, p_moe_fp4_dn;
@@ -214,6 +219,8 @@ struct Model {
   void reset();
   // Run M <= MP tokens starting at current `pos`, advancing `pos += M`.
   // M <= MAXM uses bit-exact mm2 decode/verify; M > MAXM uses mmp/mmpg chunked prefill (computes last row's logits).
+  // All rows' logits of one step (decode/verify path), for A/B dumps.
+  std::vector<uint32_t> step_all(const std::vector<uint32_t>& ids, std::vector<float>* all_logits);
   std::vector<uint32_t> step(const std::vector<uint32_t>& ids, double* gpu_ms = nullptr,
                              std::vector<float>* last_logits = nullptr,
                              std::map<std::string, double>* prof = nullptr);

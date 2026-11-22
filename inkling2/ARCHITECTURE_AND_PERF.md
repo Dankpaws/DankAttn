@@ -83,6 +83,19 @@ Every `ltest` / `jspec` run is bit-exact per lane vs. the same sequence alone. A
 
 Studio, 4 lanes × 131,072 (`INK_RING_SLACK=4096`, 15.25 GB state), T=1.0, 2026-11-21: 27,193-token prompt prefill 3,262 tok/s; code effort low 178 tok/s decode (3.7 tok/round), effort high 141 tok/s; 4 concurrent chats 190 tok/s total; same-seed requests identical alone vs. concurrent (12/12); an OpenCode agent turn reused 16,913 / 20,025 prompt tokens (prefill 1.1 s vs. 4.7 s cold).
 
+### End-to-End Quality vs. SGLang (`9bcfe2b` live server, 2026-11-21)
+
+`sgl-eval` greedy through the OpenAI front end (8 lanes, `INK_CAP=131072`, side 16,384), same settings as the SGLang (CUDA, BF16 KV) runs on gpu-desktop; per-question pairing with `~/experiments/inkling2-mini/paired.py`. Reference is SGLang on the base checkpoint, except RULER (SGLang only ran the uncensored one).
+
+| Eval | SGLang | DankAttn | Paired |
+| :--- | :---: | :---: | :--- |
+| MMLU 1,140 (effort none, 4,096 tok) | 85.96% | **86.14%** | 30 vs 32 discordant, z = +0.25; 91.39% both on 1,057 finished |
+| GSM8K 1,319 | 93.40% | 92.87% | 23 vs 16, z = −1.12 |
+| HumanEval 164 | 90.2% | 93.9% | 2 vs 8, p ≈ 0.11 |
+| RULER2 32k / 64k / 128k (12 × 3) | 85.4 / 74.5 / 66.7% | 83.3 / 81.0 / 83.3% | 30 identical items: 82.5→90, 73→80, 60→80 |
+
+W8 attention + `kv8` global KV + chunked prefill show no measurable quality loss. The 128k RULER gap is mostly SGLang truncating at the 4,096 cap (both-finished: 90 vs 95%); DankAttn generated 28% fewer tokens there, cause not isolated. n = 3 per RULER subtask. RULER 128k needs `INK_CAP=139264` (prompts average 127,878 tokens + 4,096 answer).
+
 ### Speculation Sweep & the MoE Expert Fan-Out Tax (`spec 256 code_prompt.bin`)
 
 Measured at `7ba4268`, before Waves 1–13; the ordering of configs still holds but absolute numbers are now higher (see the table above).
@@ -182,6 +195,7 @@ sh inkling2/build_inkling2.sh
     - **Top-2 Markov Beam-Tree DSpark (`tspec`, parked on branch `inkling2-tree-spec`, `e83d6b5`)**: 4-beam Top-2 tree in one command buffer (`draft` flat at 1.63 vs. 1.60 ms) lifted acceptance +12–23% per round, but 128-expert top-8 MoE fan-out raised verify time +9–13% (`15.7 → 17.1–17.8 ms`), capping net single-stream speedup at **+1.1% to +4.6%** (`132 → 138 tok/s` code, `131 → 132 tok/s` prose).
 
 ### Open Questions
+- Why DankAttn reasons shorter than SGLang at 128k (1,277 vs 1,778 mean generated tokens on RULER): base vs. uncensored checkpoint, or numerics. A base-checkpoint SGLang RULER run would separate them.
 - Chunked prefill vs. `M=1` final-row KL is 1e-5..4e-3 depending on prompt length (`lgdump`, real text, 23–1,600 tok), which is above the `0.00042` golden KL quoted in §1. It predates Waves 1–13 (same band at `5ecec5d`). Worth one `inkling2_golden.py --ids` run at ~600 tokens to see which path sits closer to BF16.
 - Base M5 on macOS 27.0 miscompiled (or otherwise mis-executed) a logically neutral edit in `ink_attn_pf_mma`. Re-check with `lgdump` Studio-vs-MBP bit equality after any attention-kernel change or OS update; `pfcheck`'s max diff alone is too noisy to catch it.
 
