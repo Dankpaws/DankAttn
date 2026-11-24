@@ -61,7 +61,7 @@ CONTENT = {T("<|content_text|>"): "text", T("<|content_thinking|>"): "think",
            T("<|content_xml|>"): "xml", T("<|content_tool_error|>"): "text"}
 # The model never legitimately opens a user / system / tool turn: stop there too.
 STOPS = [EOS, T("<|message_user|>"), T("<|message_system|>"), T("<|message_tool|>")]
-EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+EFFORTS = ("off", "none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 _eng_env = dict(os.environ, INK_CAP=str(args.cap), INK_LANES=str(args.lanes), INK_POWER=args.power)
 if args.no_eco_draft:
@@ -88,9 +88,20 @@ def render(body):
         if eff not in EFFORTS:
             raise BadRequest(f"reasoning_effort must be one of {', '.join(EFFORTS)}")
         kw["reasoning_effort"] = eff
-    if kw.pop("enable_thinking", True) is False and "reasoning_effort" not in kw:
+    et_kw = kw.pop("enable_thinking", None)
+    et_top = body.get("enable_thinking", None)
+    et = et_kw if et_kw is not None else et_top
+    disable_thinking = (et is False) or (kw.get("reasoning_effort") == "off")
+    if kw.get("reasoning_effort") == "off":
         kw["reasoning_effort"] = "none"
-    return template.render(messages=normalize_messages(body), tools=body.get("tools"), **kw)
+    elif et is False and "reasoning_effort" not in kw:
+        kw["reasoning_effort"] = "none"
+    rendered = template.render(messages=normalize_messages(body), tools=body.get("tools"), **kw)
+    if disable_thinking:
+        # Inkling's template sets effort=0 for "none" but the model still emits a short thinking
+        # block unless we close thinking (with tools) or open <|content_text|> directly.
+        rendered += "<|message_model|><|content_thinking|><|end_message|>" if body.get("tools") else "<|message_model|><|content_text|>"
+    return rendered
 
 
 class InkParser:

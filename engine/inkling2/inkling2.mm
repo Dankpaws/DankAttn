@@ -1327,8 +1327,12 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   // Replicated-row stream fusions for M <= 16 (default 15 = all 4 on; wins on both Ultra and Base M5, bit-identical):
   //   1: attn_res+rms+scores (plain), 2: rms+scores (msg), 4: attn_res+mg_down (msg mlp), 8: attn_res+mg_down3 (msg attn).
   static const uint32_t stream_fuse = getenv("INK_STREAM_FUSE") ? uint32_t(atoi(getenv("INK_STREAM_FUSE"))) : 15u;
-  // Fuse post-attention sconv + residual/boundary into o_proj mm2 epilogue (single-lane M <= 16, bit-identical).
-  static const bool fuse_oconv = !(getenv("INK_FUSE_OCONV") && atoi(getenv("INK_FUSE_OCONV")) == 0);
+  // Fuse post-attention sconv + residual/boundary into o_proj mm2 epilogue (single-lane, bit-identical):
+  //   0: off, 1 (default): M == 1 only, 2: M <= 16 (measured +0.13 ms at M=8 due to serial M-loop).
+  static const uint32_t fuse_oconv = getenv("INK_FUSE_OCONV") ? uint32_t(atoi(getenv("INK_FUSE_OCONV"))) : 1u;
+  // Fuse MoE accum + post-MLP sconv + residual add (ink_moe_accum_post_sconv, bit-identical):
+  //   0: off, 1 (default): M == 1 only, 2: all M <= 16.
+  static const uint32_t fuse_mconv = getenv("INK_FUSE_MCONV") ? uint32_t(atoi(getenv("INK_FUSE_MCONV"))) : 1u;
   // Decode router in one phase (INK_ROUTE_FAST, default on; same picks, weights and slots).
   static const bool route_fast = !(getenv("INK_ROUTE_FAST") && atoi(getenv("INK_ROUTE_FAST")) == 0);
   std::vector<id<MTLCommandBuffer>> done_cbs;
@@ -1787,7 +1791,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     }
 
     }
-    const bool use_oconv = !pf && !fuse && fuse_oconv && M == 1u && lanes.size() == 1u && ks == 4u;
+    const bool use_oconv = !pf && !fuse && ((fuse_oconv >= 2u && M <= 16u) || (fuse_oconv == 1u && M == 1u)) && lanes.size() == 1u && ks == 4u;
     for (uint32_t _r = 0, _n = ((skipm & (1u << 4)) ? 0u : 1u + ((dupm >> 4) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 4: o_proj
       if (_r > 0u) barrier();
     if (pf) {
@@ -2218,7 +2222,8 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
       flush_prof("moe_dn");
 
     }
-    if (!fuse && !(skipm & (1u << 10))) {  // INK_SKIP bit 10: moe accum (fused into section K when fuse)
+    const bool use_mconv = !pf && (fuse || (fuse_mconv >= 2u && M <= 16u) || (fuse_mconv == 1u && M == 1u));
+    if (!use_mconv && !(skipm & (1u << 10))) {  // INK_SKIP bit 10: moe accum (fused into section K when use_mconv)
       [enc setComputePipelineState:p_moe_accum];
       [enc setBuffer:b_moe_y offset:0 atIndex:0];
       [enc setBuffer:b_slots offset:0 atIndex:1];
@@ -2234,10 +2239,11 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     }
     }
 
+    const bool use_mconv_k = !pf && (fuse || (fuse_mconv >= 2u && M <= 16u) || (fuse_mconv == 1u && M == 1u));
     for (uint32_t _r = 0, _n = ((skipm & (1u << 11)) ? 0u : 1u + ((dupm >> 11) & 1u) * dupn); _r < _n; _r++) {  // INK_SKIP/INK_DUP bit 11: post_conv mlp
       if (_r > 0u) barrier();
-    // K. Post-MLP sconv + residual add -> b_h (bf16-rounded); decode with fuse: + moe_accum in the same phase
-    if (!pf && fuse) {
+    // K. Post-MLP sconv + residual add -> b_h (bf16-rounded); decode with use_mconv: + moe_accum in the same phase
+    if (use_mconv_k) {
       const uint32_t ystride_dn = MAXM * H;
       for (const auto& lr : lanes) {
         auto& sl = (*lr.S)[log_idx];
@@ -2866,9 +2872,12 @@ void Model::mtp_commit_lanes(const std::vector<MtpCommitReq>& reqs, uint32_t tot
 
   [enc endEncoding];
   [cb commit];
-  [cb waitUntilCompleted];
-  if (cb.error) mtl::die("GPU mtp_commit_lanes error", cb.error);
-  if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+  static const bool sync_commit = getenv("INK_SYNC_COMMIT") && atoi(getenv("INK_SYNC_COMMIT")) != 0;
+  if (gpu_ms || sync_commit) {
+    [cb waitUntilCompleted];
+    if (cb.error) mtl::die("GPU mtp_commit_lanes error", cb.error);
+    if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+  }
   for (const auto& rq : reqs) {
     if (rq.lane == active_lane) mtp_ctx_pos += rq.n_commit;
     else lanes_[rq.lane].mtp_ctx_pos += rq.n_commit;
