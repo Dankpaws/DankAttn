@@ -5,8 +5,21 @@ set -e
 cd "$(dirname "$0")"
 
 before="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+req_before="$(git rev-parse HEAD:requirements.txt 2>/dev/null || true)"
 git pull --ff-only
 after="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+req_after="$(git rev-parse HEAD:requirements.txt 2>/dev/null || true)"
+
+if [ -d .venv ] && [ "$req_before" != "$req_after" ]; then
+  echo "requirements.txt changed; updating .venv..."
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install --python .venv/bin/python -r requirements.txt
+  elif [ -x .venv/bin/pip ]; then
+    .venv/bin/pip install --quiet -r requirements.txt
+  fi
+fi
+
+[ -f bin/dankattn ] && chmod +x bin/dankattn
 
 target="${1:-auto}"
 built=0

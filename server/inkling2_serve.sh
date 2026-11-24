@@ -6,7 +6,9 @@
 T=$(cd "$(dirname "$0")/.." && pwd)
 PACK=${INK_PACK:-$HOME/pack-inkling2-mini-w8}
 PORT=${INK_PORT:-8342}
-PY=${PYTHON:-python3}
+if [ -n "${PYTHON:-}" ]; then PY="$PYTHON"
+elif [ -x "$T/.venv/bin/python" ]; then PY="$T/.venv/bin/python"
+else PY=python3; fi
 LOG=$T/inkling2-server.log
 export INK_CAP=${INK_CAP:-32768} INK_LANES=${INK_LANES:-4} INK_RING_SLACK=${INK_RING_SLACK:-4096}
 pids() { pgrep -f "inkling2_server.py --pack" ; pgrep -f "build/dankattn-inkling2 .* serve"; }

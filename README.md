@@ -12,6 +12,42 @@ It currently targets three architectures:
 
 Everything runs directly on Apple Silicon Metal without PyTorch, MLX, or llama.cpp in the inference path. Kernels compile from source at startup with `MTLMathModeSafe` and `MTLMathFloatingPointFunctionsPrecise` so decode, verify, multi-lane batching, and speculation remain bit-identical.
 
+## Quick Install (Apple Silicon)
+
+Install the `dankattn` CLI, Python front-end environment, and Metal 4 engine binaries (~4 seconds to compile locally with Xcode Command Line Tools):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dankpaws/DankAttn/main/install.sh | sh
+```
+
+Then pull a pre-packed model from Hugging Face and start the OpenAI-compatible server:
+
+```sh
+# Inkling-2-Mini (~19 GB, runs on 32 GB+ Apple Silicon)
+dankattn pull inkling2
+dankattn run inkling2            # foreground (Ctrl-C to stop)
+# or background daemon:
+dankattn serve inkling2 start
+dankattn serve inkling2 smoke
+
+# Hy4-flash (220B MoE, 96 GB+ Apple Silicon)
+dankattn pull hy4
+dankattn run hy4
+```
+
+`dankattn` inspects your Mac's unified memory and prints the exact profile it selects at startup — it never throttles speed, and any explicit flag or `INK_*` / `HY4_*` env var overrides it:
+
+| Unified RAM | Auto-sized `inkling2` profile | Notes |
+| :--- | :--- | :--- |
+| **64 GB+** | `cap=131072`, `lanes=8`, `side_cap=16384` | Full 8-lane Studio profile (`:8x-fast`, `:4x-select`, ~33.4 GB) |
+| **48 GB** | `cap=131072`, `lanes=4`, `side_cap=16384` | 4-lane Split-KV (`:4x-fast`, `:4x-select`, ~29 GB) |
+| **32 GB** | `cap=131072`, `lanes=1` | Full 128k context (~23.8 GB); for 4-lane `:4x-fast` pass `--lanes 4 --cap 32768 --side-cap 8192` |
+
+Useful commands:
+- `dankattn doctor` — verify chip, RAM, `iogpu.wired_limit_mb`, toolchain, downloaded packs, and auto-sized profiles.
+- `dankattn run inkling2 --power auto --idle-unload 300` — on MacBooks, `--power auto` (default) uses full performance on AC and battery-saving eco DSpark on battery/Low Power Mode; `--idle-unload <sec>` unloads the GPU after inactivity and wakes transparently from the SSD prefix cache on the next request.
+- `dankattn update` — pull the latest release and rebuild installed binaries (~4 seconds).
+
 ## Requirements
 
 - **Hardware**: Apple Silicon with Metal 4 / `MetalPerformancePrimitives` (`mpp::tensor_ops` cooperative `matmul2d`). Developed and benchmarked on an **M5 Ultra Mac Studio (96 GB)** and **Base M5 MacBook Pro (32 GB)**. Other Apple Silicon chips with Metal 4 support should work.
@@ -112,10 +148,12 @@ See [inkling2/ARCHITECTURE_AND_PERF.md](inkling2/ARCHITECTURE_AND_PERF.md) for a
 ## Updating
 
 ```sh
+dankattn update
+# or inside a git clone:
 sh update.sh
 ```
 
-`update.sh` runs `git pull --ff-only` and rebuilds whichever engine binaries you already have in `build/` (takes ~4 seconds on Apple Silicon; pass `inkling2`, `hy4`, or `all` to choose explicitly). Existing model packs stay compatible across updates unless a GitHub Release notes otherwise — just restart your running server after updating.
+`dankattn update` (wrapping `update.sh`) runs `git pull --ff-only`, updates `.venv` if `requirements.txt` changed, and rebuilds whichever engine binaries you already have in `build/` (~4 seconds on Apple Silicon; pass `inkling2`, `hy4`, or `all` to choose explicitly). Existing model packs stay compatible across updates unless a GitHub Release notes otherwise — just restart your running server after updating.
 
 ## Architecture Highlights
 
@@ -128,6 +166,10 @@ sh update.sh
 ## Repository Layout
 
 ```
+install.sh              One-liner macOS Apple Silicon installer (venv, build, CLI symlink)
+update.sh               Pull + refresh venv + rebuild installed binaries
+bin/
+  dankattn              Unified CLI (pull, run, serve, update, doctor)
 engine/
   mtl.h                 Metal runtime, library cache, wired-memory check
   mm_args.h             Shared MmArgs struct (host/kernel ABI)

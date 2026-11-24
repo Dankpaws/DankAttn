@@ -11,7 +11,9 @@ export HY4_SIDE_CAP=${HY4_SIDE_CAP:-32768}
 PORT=${HY4_PORT:-8341}
 export HY4_CAP=${HY4_CAP:-524288}
 export HY4_MP=${HY4_MP:-1024}
-PY=${PYTHON:-python3}
+if [ -n "${PYTHON:-}" ]; then PY="$PYTHON"
+elif [ -x "$T/.venv/bin/python" ]; then PY="$T/.venv/bin/python"
+else PY=python3; fi
 LOG=$T/hy4-server.log
 case "$1" in
   start)

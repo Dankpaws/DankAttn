@@ -1,0 +1,452 @@
+#!/bin/sh
+# Unified CLI for DankAttn (Apple Silicon Metal 4 LLM inference engine).
+# Usage: dankattn <command> [args...]
+set -eu
+
+# Resolve symlinks to locate the DankAttn repository root
+resolve_root() {
+  src="$0"
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    target="$(readlink "$src")"
+    case "$target" in
+      /*) src="$target" ;;
+      *)  src="$dir/$target" ;;
+    esac
+  done
+  cd -P "$(dirname "$src")/.." && pwd
+}
+
+ROOT="${DANKATTN_HOME:-$(resolve_root)}"
+
+say()  { printf '[dankattn] %s\n' "$*"; }
+warn() { printf '[dankattn] WARNING: %s\n' "$*" >&2; }
+die()  { printf '[dankattn] ERROR: %s\n' "$*" >&2; exit 1; }
+
+pick_python() {
+  if [ -n "${PYTHON:-}" ]; then
+    echo "$PYTHON"
+  elif [ -x "$ROOT/.venv/bin/python" ]; then
+    echo "$ROOT/.venv/bin/python"
+  else
+    command -v python3 || die "python3 not found"
+  fi
+}
+
+detect_ram_gb() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    echo "$((bytes / 1073741824))"
+  else
+    echo "0"
+  fi
+}
+
+detect_chip() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon"
+  else
+    echo "$(uname -s)/$(uname -m)"
+  fi
+}
+
+detect_wired_limit_mb() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo "0"
+  else
+    echo "0"
+  fi
+}
+
+model_meta() {
+  # Sets: M_NAME, M_HF_REPO, M_PACK_DIRNAME, M_BIN, M_BUILD_SCRIPT, M_DEFAULT_PORT
+  case "$1" in
+    inkling2|inkling|inkling-2-mini|ink)
+      M_NAME="inkling2"
+      M_HF_REPO="Dankpaws/Inkling-2-Mini-DankAttn-w8"
+      M_PACK_DIRNAME="pack-inkling2-mini-w8"
+      M_BIN="$ROOT/build/dankattn-inkling2"
+      M_BUILD_SCRIPT="$ROOT/inkling2/build_inkling2.sh"
+      M_DEFAULT_PORT="8342"
+      ;;
+    hy4|hy4-flash)
+      M_NAME="hy4"
+      M_HF_REPO="Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3"
+      M_PACK_DIRNAME="pack-g64-gptq-v3"
+      M_BIN="$ROOT/build/dankattn-hy4"
+      M_BUILD_SCRIPT="$ROOT/hy4/build_hy4.sh"
+      M_DEFAULT_PORT="8341"
+      ;;
+    *)
+      die "Unknown model '$1'. Supported models: inkling2, hy4"
+      ;;
+  esac
+}
+
+find_pack() {
+  # $1 = explicit --pack override (may be empty)
+  # Uses M_NAME, M_PACK_DIRNAME
+  if [ -n "${1:-}" ]; then
+    echo "$1"
+    return 0
+  fi
+  if [ "$M_NAME" = "inkling2" ] && [ -n "${INK_PACK:-}" ]; then
+    echo "$INK_PACK"
+    return 0
+  fi
+  if [ "$M_NAME" = "hy4" ] && [ -n "${HY4_PACK:-}" ]; then
+    echo "$HY4_PACK"
+    return 0
+  fi
+  for cand in \
+    "$ROOT/models/$M_PACK_DIRNAME" \
+    "$ROOT/$M_PACK_DIRNAME" \
+    "$HOME/$M_PACK_DIRNAME" \
+    "./$M_PACK_DIRNAME"; do
+    if [ -f "$cand/manifest.json" ]; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  echo "$ROOT/models/$M_PACK_DIRNAME"
+}
+
+resolve_inkling2_profile() {
+  # Sets: P_CAP, P_LANES, P_SIDE_CAP, P_RING_SLACK, P_TIER_NOTE
+  # Explicit flags/env always win; auto-sizing only fills unset values.
+  ram="$(detect_ram_gb)"
+  if [ "$ram" -ge 64 ]; then
+    def_cap=131072; def_lanes=8; def_side=16384; def_slack=4096
+    P_TIER_NOTE="64 GB+ profile (8 lanes, 128k L0 + 16k Split-KV side lanes, ~33.4 GB total)"
+  elif [ "$ram" -ge 48 ]; then
+    def_cap=131072; def_lanes=4; def_side=16384; def_slack=4096
+    P_TIER_NOTE="48 GB profile (4 lanes, 128k L0 + 16k Split-KV side lanes, ~29 GB total)"
+  elif [ "$ram" -ge 32 ]; then
+    def_cap=131072; def_lanes=1; def_side=0; def_slack=4096
+    P_TIER_NOTE="32 GB profile (1 lane, 128k context, ~23.8 GB total; for 4-lane :4x-fast use --lanes 4 --cap 32768 --side-cap 8192)"
+  elif [ "$ram" -gt 0 ]; then
+    def_cap=16384; def_lanes=1; def_side=0; def_slack=0
+    P_TIER_NOTE="low-memory fallback (<32 GB detected; 32 GB+ recommended for Inkling-2-Mini)"
+  else
+    def_cap=32768; def_lanes=4; def_side=0; def_slack=4096
+    P_TIER_NOTE="default profile"
+  fi
+
+  P_CAP="${OPT_CAP:-${INK_CAP:-$def_cap}}"
+  P_LANES="${OPT_LANES:-${INK_LANES:-$def_lanes}}"
+  P_SIDE_CAP="${OPT_SIDE_CAP:-${INK_SIDE_CAP:-$def_side}}"
+  P_RING_SLACK="${INK_RING_SLACK:-$def_slack}"
+}
+
+resolve_hy4_profile() {
+  ram="$(detect_ram_gb)"
+  if [ "$ram" -gt 0 ] && [ "$ram" -lt 96 ]; then
+    warn "Hy4-flash requires ~87 GB weights + ~6.5 GB wired GPU state (96 GB+ unified memory recommended; detected ${ram} GB)."
+  fi
+  P_CAP="${OPT_CAP:-${HY4_CAP:-524288}}"
+  P_MP="${HY4_MP:-1024}"
+  P_SIDE_LANES="${OPT_LANES:-${HY4_SIDE_LANES:-3}}"
+  P_SIDE_CAP="${OPT_SIDE_CAP:-${HY4_SIDE_CAP:-32768}}"
+  P_TIER_NOTE="96 GB+ profile (512k main slot + ${P_SIDE_LANES}x ${P_SIDE_CAP} side lanes)"
+}
+
+check_wired_limit() {
+  # $1 = minimum recommended wired limit MB
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  need_mb="$1"
+  cur_mb="$(detect_wired_limit_mb)"
+  if [ "$cur_mb" -gt 0 ] && [ "$cur_mb" -lt "$need_mb" ]; then
+    warn "macOS iogpu.wired_limit_mb is ${cur_mb} MB (recommended >= ${need_mb} MB for $M_NAME)."
+    warn "Raise it with:  sudo sysctl iogpu.wired_limit_mb=${need_mb}"
+  fi
+}
+
+ensure_binary() {
+  if [ ! -x "$M_BIN" ]; then
+    say "Binary $M_BIN not found; compiling now..."
+    sh "$M_BUILD_SCRIPT"
+  fi
+}
+
+cmd_pull() {
+  [ $# -ge 1 ] || die "Usage: dankattn pull <inkling2|hy4> [--dir <path>]"
+  model_meta "$1"
+  shift
+  dest="$ROOT/models/$M_PACK_DIRNAME"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || die "--dir requires a path"; dest="$2"; shift 2 ;;
+      *) die "Unknown option for pull: $1" ;;
+    esac
+  done
+
+  py="$(pick_python)"
+  mkdir -p "$(dirname "$dest")"
+  say "Downloading $M_HF_REPO -> $dest"
+  if [ -x "$ROOT/.venv/bin/hf" ]; then
+    "$ROOT/.venv/bin/hf" download "$M_HF_REPO" --local-dir "$dest"
+  elif command -v hf >/dev/null 2>&1; then
+    hf download "$M_HF_REPO" --local-dir "$dest"
+  else
+    "$py" -c '
+import sys
+from huggingface_hub import snapshot_download
+repo, dest = sys.argv[1], sys.argv[2]
+snapshot_download(repo_id=repo, local_dir=dest)
+' "$M_HF_REPO" "$dest"
+  fi
+  say "Ready: $dest"
+}
+
+parse_serve_opts() {
+  OPT_PACK=""
+  OPT_PORT=""
+  OPT_CAP=""
+  OPT_LANES=""
+  OPT_SIDE_CAP=""
+  OPT_POWER=""
+  OPT_IDLE_UNLOAD=""
+  OPT_NO_ECO_DRAFT=0
+  OPT_PULL=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pack)        [ $# -ge 2 ] || die "--pack requires a path"; OPT_PACK="$2"; shift 2 ;;
+      --port)        [ $# -ge 2 ] || die "--port requires a number"; OPT_PORT="$2"; shift 2 ;;
+      --cap)         [ $# -ge 2 ] || die "--cap requires a number"; OPT_CAP="$2"; shift 2 ;;
+      --lanes)       [ $# -ge 2 ] || die "--lanes requires a number"; OPT_LANES="$2"; shift 2 ;;
+      --side-cap)    [ $# -ge 2 ] || die "--side-cap requires a number"; OPT_SIDE_CAP="$2"; shift 2 ;;
+      --power)       [ $# -ge 2 ] || die "--power requires auto|performance|eco"; OPT_POWER="$2"; shift 2 ;;
+      --idle-unload) [ $# -ge 2 ] || die "--idle-unload requires seconds"; OPT_IDLE_UNLOAD="$2"; shift 2 ;;
+      --no-eco-draft) OPT_NO_ECO_DRAFT=1; shift ;;
+      --pull)        OPT_PULL=1; shift ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_run() {
+  [ $# -ge 1 ] || die "Usage: dankattn run <inkling2|hy4> [options]"
+  model_meta "$1"
+  shift
+  parse_serve_opts "$@"
+
+  pack="$(find_pack "$OPT_PACK")"
+  if [ ! -f "$pack/manifest.json" ]; then
+    if [ "$OPT_PULL" -eq 1 ]; then
+      cmd_pull "$M_NAME" --dir "$pack"
+    else
+      die "Model pack not found at $pack. Download it first with:  dankattn pull $M_NAME"
+    fi
+  fi
+
+  ensure_binary
+  py="$(pick_python)"
+  port="${OPT_PORT:-$M_DEFAULT_PORT}"
+  ram="$(detect_ram_gb)"
+  chip="$(detect_chip)"
+
+  if [ "$M_NAME" = "inkling2" ]; then
+    resolve_inkling2_profile
+    power="${OPT_POWER:-${INK_POWER:-auto}}"
+    idle="${OPT_IDLE_UNLOAD:-${DANKATTN_IDLE_UNLOAD:-0}}"
+    say "Hardware: $chip (${ram} GB RAM) -> $P_TIER_NOTE"
+    say "Config:   port=$port cap=$P_CAP lanes=$P_LANES side_cap=$P_SIDE_CAP ring_slack=$P_RING_SLACK power=$power idle_unload=${idle}s"
+    say "Override: pass --cap/--lanes/--side-cap/--port/--power/--idle-unload or INK_* env vars"
+    export INK_CAP="$P_CAP" INK_LANES="$P_LANES" INK_RING_SLACK="$P_RING_SLACK" INK_POWER="$power"
+    if [ "$P_SIDE_CAP" -gt 0 ]; then export INK_SIDE_CAP="$P_SIDE_CAP"; else unset INK_SIDE_CAP; fi
+    extra=""
+    if [ "$OPT_NO_ECO_DRAFT" -eq 1 ]; then extra="--no-eco-draft"; fi
+    cd "$ROOT"
+    exec "$py" server/inkling2_server.py \
+      --pack "$pack" --engine "$M_BIN" --port "$port" \
+      --cap "$P_CAP" --lanes "$P_LANES" \
+      --power "$power" --idle-unload "$idle" $extra
+  else
+    resolve_hy4_profile
+    check_wired_limit 90112
+    say "Hardware: $chip (${ram} GB RAM) -> $P_TIER_NOTE"
+    say "Config:   port=$port cap=$P_CAP mp=$P_MP side_lanes=$P_SIDE_LANES side_cap=$P_SIDE_CAP"
+    say "Override: pass --cap/--lanes/--side-cap/--port or HY4_* env vars"
+    export HY4_CAP="$P_CAP" HY4_MP="$P_MP" HY4_SIDE_LANES="$P_SIDE_LANES" HY4_SIDE_CAP="$P_SIDE_CAP"
+    cd "$ROOT"
+    exec "$py" server/hy4_server.py \
+      --pack "$pack" --engine "$M_BIN" --port "$port" --cap "$P_CAP"
+  fi
+}
+
+cmd_serve() {
+  [ $# -ge 1 ] || die "Usage: dankattn serve <inkling2|hy4> [start|stop|status|smoke|logs] [options]"
+  model_meta "$1"
+  shift
+
+  action="start"
+  if [ $# -ge 1 ]; then
+    case "$1" in
+      start|stop|status|smoke|logs) action="$1"; shift ;;
+    esac
+  fi
+
+  parse_serve_opts "$@"
+  py="$(pick_python)"
+  export PYTHON="$py"
+
+  if [ "$action" = "logs" ]; then
+    if [ "$M_NAME" = "inkling2" ]; then
+      logfile="$ROOT/inkling2-server.log"
+    else
+      logfile="$ROOT/hy4-server.log"
+    fi
+    [ -f "$logfile" ] || die "No log file yet at $logfile"
+    exec tail -n 80 -f "$logfile"
+  fi
+
+  if [ "$M_NAME" = "inkling2" ]; then
+    port="${OPT_PORT:-${INK_PORT:-$M_DEFAULT_PORT}}"
+    export INK_PORT="$port"
+    if [ "$action" = "start" ]; then
+      pack="$(find_pack "$OPT_PACK")"
+      [ -f "$pack/manifest.json" ] || die "Model pack not found at $pack. Download it first with:  dankattn pull inkling2"
+      ensure_binary
+      resolve_inkling2_profile
+      power="${OPT_POWER:-${INK_POWER:-auto}}"
+      idle="${OPT_IDLE_UNLOAD:-${DANKATTN_IDLE_UNLOAD:-0}}"
+      say "Hardware: $(detect_chip) ($(detect_ram_gb) GB RAM) -> $P_TIER_NOTE"
+      say "Config:   port=$port cap=$P_CAP lanes=$P_LANES side_cap=$P_SIDE_CAP ring_slack=$P_RING_SLACK power=$power idle_unload=${idle}s"
+      export INK_PACK="$pack" INK_CAP="$P_CAP" INK_LANES="$P_LANES" INK_RING_SLACK="$P_RING_SLACK"
+      export INK_POWER="$power" DANKATTN_IDLE_UNLOAD="$idle"
+      if [ "$P_SIDE_CAP" -gt 0 ]; then export INK_SIDE_CAP="$P_SIDE_CAP"; else unset INK_SIDE_CAP; fi
+      if [ "$OPT_NO_ECO_DRAFT" -eq 1 ]; then export INK_ECO_DRAFT=0; fi
+    fi
+    exec sh "$ROOT/server/inkling2_serve.sh" "$action"
+  else
+    port="${OPT_PORT:-${HY4_PORT:-$M_DEFAULT_PORT}}"
+    export HY4_PORT="$port"
+    if [ "$action" = "start" ]; then
+      pack="$(find_pack "$OPT_PACK")"
+      [ -f "$pack/manifest.json" ] || die "Model pack not found at $pack. Download it first with:  dankattn pull hy4"
+      ensure_binary
+      resolve_hy4_profile
+      check_wired_limit 90112
+      say "Hardware: $(detect_chip) ($(detect_ram_gb) GB RAM) -> $P_TIER_NOTE"
+      say "Config:   port=$port cap=$P_CAP mp=$P_MP side_lanes=$P_SIDE_LANES side_cap=$P_SIDE_CAP"
+      export HY4_PACK="$pack" HY4_CAP="$P_CAP" HY4_MP="$P_MP" HY4_SIDE_LANES="$P_SIDE_LANES" HY4_SIDE_CAP="$P_SIDE_CAP"
+    fi
+    exec sh "$ROOT/hy4/serve_hy4.sh" "$action"
+  fi
+}
+
+cmd_doctor() {
+  ram="$(detect_ram_gb)"
+  chip="$(detect_chip)"
+  wired="$(detect_wired_limit_mb)"
+  py="$(pick_python 2>/dev/null || echo 'missing')"
+
+  echo "DankAttn Doctor"
+  echo "  Install root : $ROOT"
+  echo "  Version      : $(git -C "$ROOT" describe --tags --always 2>/dev/null || echo unknown)"
+  echo "  Platform     : $(uname -s)/$(uname -m)"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "  macOS        : $(sw_vers -productVersion 2>/dev/null || echo unknown)"
+    echo "  Chip         : $chip"
+    echo "  Unified RAM  : ${ram} GB"
+    if [ "$wired" -gt 0 ]; then
+      echo "  Wired limit  : ${wired} MB (iogpu.wired_limit_mb)"
+    else
+      echo "  Wired limit  : default (system-managed)"
+    fi
+  fi
+  if command -v clang++ >/dev/null 2>&1; then
+    echo "  Compiler     : $(command -v clang++) (OK)"
+  else
+    echo "  Compiler     : MISSING (run: xcode-select --install)"
+  fi
+  echo "  Python       : $py"
+  for bin in dankattn-inkling2 dankattn-hy4; do
+    if [ -x "$ROOT/build/$bin" ]; then
+      echo "  Binary       : build/$bin (OK)"
+    else
+      echo "  Binary       : build/$bin (not built)"
+    fi
+  done
+
+  echo ""
+  echo "Model Packs & Auto-Sized Profiles:"
+  OPT_CAP=""; OPT_LANES=""; OPT_SIDE_CAP=""
+
+  model_meta inkling2
+  ink_pack="$(find_pack "")"
+  resolve_inkling2_profile
+  if [ -f "$ink_pack/manifest.json" ]; then ink_status="installed ($ink_pack)"; else ink_status="not downloaded (run: dankattn pull inkling2)"; fi
+  echo "  inkling2     : $ink_status"
+  echo "    -> $P_TIER_NOTE"
+
+  model_meta hy4
+  hy4_pack="$(find_pack "")"
+  resolve_hy4_profile
+  if [ -f "$hy4_pack/manifest.json" ]; then hy4_status="installed ($hy4_pack)"; else hy4_status="not downloaded (run: dankattn pull hy4)"; fi
+  echo "  hy4          : $hy4_status"
+  if [ "$ram" -gt 0 ] && [ "$ram" -lt 96 ]; then
+    echo "    -> requires 96 GB+ unified memory (detected ${ram} GB)"
+  else
+    echo "    -> $P_TIER_NOTE"
+  fi
+}
+
+cmd_version() {
+  ver="$(git -C "$ROOT" describe --tags --always 2>/dev/null || echo unknown)"
+  echo "dankattn $ver ($ROOT)"
+}
+
+cmd_help() {
+  cat <<'EOF'
+DankAttn — Native Metal 4 LLM inference engine for Apple Silicon
+
+Usage:
+  dankattn pull <inkling2|hy4> [--dir <path>]
+      Download pre-packed weights from Hugging Face.
+
+  dankattn run <inkling2|hy4> [options]
+      Run the OpenAI-compatible server in the foreground (Ctrl-C to stop).
+      Pass --pull to download the model automatically if missing.
+
+  dankattn serve <inkling2|hy4> [start|stop|status|smoke|logs] [options]
+      Manage the OpenAI-compatible server in the background (default: start).
+
+  dankattn update [inkling2|hy4|all]
+      Pull the latest DankAttn release and rebuild installed binaries (~4s).
+
+  dankattn doctor
+      Inspect hardware, wired memory limit, toolchain, packs, and auto-sized profiles.
+
+  dankattn version
+      Show installed version and path.
+
+Options for run / serve:
+  --pack <dir>           Path to model pack directory
+  --port <port>          HTTP port (default: 8342 inkling2, 8341 hy4)
+  --cap <tokens>         Main slot context capacity (overrides auto-size)
+  --lanes <n>            Concurrent lanes / side lanes (overrides auto-size)
+  --side-cap <tokens>    Side-lane suffix capacity (overrides auto-size)
+  --power <mode>         auto | performance | eco (inkling2, default: auto)
+  --idle-unload <sec>    Unload engine after N idle seconds; wakes via pcache (inkling2)
+  --no-eco-draft         Keep speed-maximizing DSpark drafts on battery (inkling2)
+  --pull                 Auto-download model if missing (run only)
+
+Explicit flags and INK_* / HY4_* environment variables always override auto-sized defaults.
+EOF
+}
+
+cmd="${1:-help}"
+if [ $# -gt 0 ]; then shift; fi
+
+case "$cmd" in
+  pull)              cmd_pull "$@" ;;
+  run)               cmd_run "$@" ;;
+  serve)             cmd_serve "$@" ;;
+  update)            exec sh "$ROOT/update.sh" "$@" ;;
+  doctor)            cmd_doctor ;;
+  version|-v|--version) cmd_version ;;
+  help|-h|--help)    cmd_help ;;
+  *)                 die "Unknown command '$cmd'. Run 'dankattn help' for usage." ;;
+esac
