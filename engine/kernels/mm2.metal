@@ -18,7 +18,10 @@ using namespace mpp::tensor_ops;
 #ifndef GS
 #define GS 128
 #endif
-#if WBITS == 6
+#if WBITS == 2 || WBITS == 20
+#define WLOAD uint2
+#define WV 1            // uint2 per lane per k-step (8 B = 32 x 2-bit codes)
+#elif WBITS == 6
 #define WLOAD uint2
 #define WV 3            // uint2 per lane per k-step (24 B = 16 B lo4 + 8 B hi2)
 #elif WBITS == 40       // NVFP4 (E2M1, GS=16, in-unpack scaling)
@@ -40,7 +43,11 @@ using namespace mpp::tensor_ops;
 
 static inline float xsilu(float x) { return x / (1.0f + exp(-x)); }
 
-#if WBITS == 40
+#if WBITS == 2
+constant float W2_LUT[4] = {-1.0f, -0.2998f, 0.2998f, 1.0f};
+#elif WBITS == 20
+constant float W2_LUT[4] = {-1.0f, -0.33333334f, 0.33333334f, 1.0f};
+#elif WBITS == 40
 constant float E2M1_LUT[16] = {
   0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -60,7 +67,15 @@ template<typename Dst>
 static inline void unpack_w(thread const WLOAD* v, thread Dst& out,
                             device const half* sp0 = nullptr, device const half* sp1 = nullptr,
                             ushort nbase = 0) {
-#if WBITS == 4
+#if WBITS == 2 || WBITS == 20
+  const uint w2[2] = {v[0].x, v[0].y};
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 2; j++)
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 16; i++) {
+      out[16 * j + i] = bfloat(W2_LUT[(w2[j] >> (2 * i)) & 3u]);
+    }
+#elif WBITS == 4
   const uint w4[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
 #pragma clang loop unroll(full)
   for (int j = 0; j < 4; j++)

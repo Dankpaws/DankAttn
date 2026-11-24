@@ -42,6 +42,11 @@ def pack_codes(q, bits):
     e = q4.transpose(0, 2, 1, 3)[:, :, RN, RK]  # [NF, KS, 32, 32]
     if bits == 8:
         return e.astype(np.int8).view(np.uint8).reshape(-1)
+    if bits == 2:
+        # 8 bytes per lane per k-step: 32 x 2-bit codes in 0..3 packed 4 per byte
+        u = e.astype(np.uint8) & 0x03
+        u = u.reshape(NF, KS, 32, 8, 4)
+        return (u[..., 0] | (u[..., 1] << 2) | (u[..., 2] << 4) | (u[..., 3] << 6)).reshape(-1)
     if bits == 6:
         # 24 bytes per lane per k-step: 16 bytes lo4 (same nibble order as W4) + 8 bytes hi2 (2 bits x 32)
         u = (e + 32).astype(np.uint8)  # 0..63
