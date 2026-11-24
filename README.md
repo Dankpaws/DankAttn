@@ -61,32 +61,9 @@ Useful commands:
   ```
 - **Python (front end only)**: Python 3.11+ with the packages in `requirements.txt`.
 
-## Quickstart (Hy4)
-
-1. Build the engine binary:
-   ```sh
-   sh hy4/build_hy4.sh
-   ```
-   This produces `build/dankattn-hy4` in a couple of seconds. Metal kernels compile at runtime from `engine/kernels/`.
-
-2. Install front-end dependencies:
-   ```sh
-   python3 -m venv .venv
-   . .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-3. Point `HY4_PACK` at a DankAttn Hy4 pack directory (containing `manifest.json`, weight shards, `engram.bin`, `tokenizer.json`, and `chat_template.jinja`) and start the OpenAI-compatible server on `:8341`:
-   ```sh
-   HY4_PACK=/path/to/pack-g64-gptq-v3 sh hy4/serve_hy4.sh start
-   sh hy4/serve_hy4.sh smoke
-   ```
-   Or run the front end directly:
-   ```sh
-   python3 server/hy4_server.py --pack /path/to/pack-g64-gptq-v3 --engine ./build/dankattn-hy4 --port 8341 --cap 524288
-   ```
-
 ## Benchmarks (M5 Ultra, Hy4 `pack-g64-gptq-v3`)
+
+Pre-packed weights are available on Hugging Face: [`Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3).
 
 Measured at 12,272-token context (`pack-g64-gptq-v3`, `kv8` on sparse layers, W4g64 GPTQ experts, W8 dense/attention projections):
 
@@ -107,7 +84,7 @@ Quality of `pack-g64-gptq-v3` against the bf16 reference: `wikitext-2` (24x 512-
 
 See [hy4/ARCHITECTURE_AND_PERF.md](hy4/ARCHITECTURE_AND_PERF.md) for per-op profiles, optimization history, and experiments that were tested and rejected.
 
-## Benchmarks & Quickstart (Inkling-2-Mini, `pack-inkling2-mini-w8`)
+## Benchmarks (Inkling-2-Mini, `pack-inkling2-mini-w8`)
 
 ![DankAttn Inkling-2-Mini M5 Ultra Overview](assets/dankattn-inkling2-overview.png)
 
@@ -126,22 +103,6 @@ Pre-packed weights are available on Hugging Face: [`Dankpaws/Inkling-2-Mini-Dank
 | Multi-lane (`jspec` 4 lanes / `lbench` 16 lanes) | **317.1 tok/s wall** (1024/1024 exact) / **501 tok/s GPU** | **65.8 tok/s wall** (4 lanes) |
 | Parallel Section Fill (`:4x-fast` / `:8x-fast`, live SSE) | **319.0 / 343.6 eff visible tok/s** (TTFT 1.55–2.15 s) | — |
 | SSD Prefix Cache restore (`ctest`, 1.5k / 8k tok) | **12.8 ms / 20.9 ms** (211 / 346 MB, `0.000e+00` exact) | **23.0 ms** (1.5k, `0.000e+00` exact) |
-
-```sh
-# 1. Download pre-packed weights (~19 GB)
-hf download Dankpaws/Inkling-2-Mini-DankAttn-w8 --local-dir ./pack-inkling2-mini-w8
-
-# 2. Build & verify
-sh inkling2/build_inkling2.sh
-./build/dankattn-inkling2 ./pack-inkling2-mini-w8 vtest
-./build/dankattn-inkling2 ./pack-inkling2-mini-w8 pfbench 2048
-
-# 3. Start OpenAI-compatible server on :8342 (8 lanes, 128k L0 + 16k Split-KV side lanes, SSD prefix cache)
-#    On 32 GB Macs, use INK_CAP=32768 or 131072 with INK_LANES=1
-INK_PACK=./pack-inkling2-mini-w8 INK_CAP=131072 INK_LANES=8 INK_SIDE_CAP=16384 \
-  sh server/inkling2_serve.sh start
-sh server/inkling2_serve.sh smoke
-```
 
 See [inkling2/ARCHITECTURE_AND_PERF.md](inkling2/ARCHITECTURE_AND_PERF.md) for architecture details, head-to-head benchmarks, MoE fan-out analysis, packing instructions, CLI flags, and environment variables.
 
