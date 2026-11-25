@@ -77,8 +77,16 @@ model_meta() {
       M_BUILD_SCRIPT="$ROOT/hy4/build_hy4.sh"
       M_DEFAULT_PORT="8341"
       ;;
+    ernie55|ernie|ernie-5.5|ernie-5.5-flash)
+      M_NAME="ernie55"
+      M_HF_REPO="Dankpaws/ERNIE-5.5-Flash-Preview-DankAttn-w2-g32"
+      M_PACK_DIRNAME="pack-ernie55-w2-g32-w8attn"
+      M_BIN="$ROOT/build/dankattn-ernie55"
+      M_BUILD_SCRIPT="$ROOT/ernie55/build_ernie55.sh"
+      M_DEFAULT_PORT="8343"
+      ;;
     *)
-      die "Unknown model '$1'. Supported models: inkling2, hy4"
+      die "Unknown model '$1'. Supported models: inkling2, hy4, ernie55"
       ;;
   esac
 }
@@ -96,6 +104,10 @@ find_pack() {
   fi
   if [ "$M_NAME" = "hy4" ] && [ -n "${HY4_PACK:-}" ]; then
     echo "$HY4_PACK"
+    return 0
+  fi
+  if [ "$M_NAME" = "ernie55" ] && [ -n "${E5_PACK:-}" ]; then
+    echo "$E5_PACK"
     return 0
   fi
   for cand in \
@@ -150,6 +162,15 @@ resolve_hy4_profile() {
   P_TIER_NOTE="96 GB+ profile (512k main slot + ${P_SIDE_LANES}x ${P_SIDE_CAP} side lanes)"
 }
 
+resolve_ernie55_profile() {
+  ram="$(detect_ram_gb)"
+  if [ "$ram" -gt 0 ] && [ "$ram" -lt 96 ]; then
+    warn "ERNIE-5.5-Flash requires ~85.5 GiB weights + ~2.0 GiB GPU state (96 GB+ unified memory recommended; detected ${ram} GB)."
+  fi
+  P_CAP="${OPT_CAP:-${E5_CAP:-262144}}"
+  P_TIER_NOTE="96 GB+ profile (${P_CAP} ctx, 85.5 GiB weights + 2.0 GiB state, 3-gram PLD speculation ON)"
+}
+
 check_wired_limit() {
   # $1 = minimum recommended wired limit MB
   [ "$(uname -s)" = "Darwin" ] || return 0
@@ -169,7 +190,7 @@ ensure_binary() {
 }
 
 cmd_pull() {
-  [ $# -ge 1 ] || die "Usage: dankattn pull <inkling2|hy4> [--dir <path>]"
+  [ $# -ge 1 ] || die "Usage: dankattn pull <inkling2|hy4|ernie55> [--dir <path>]"
   model_meta "$1"
   shift
   dest="$ROOT/models/$M_PACK_DIRNAME"
@@ -226,7 +247,7 @@ parse_serve_opts() {
 }
 
 cmd_run() {
-  [ $# -ge 1 ] || die "Usage: dankattn run <inkling2|hy4> [options]"
+  [ $# -ge 1 ] || die "Usage: dankattn run <inkling2|hy4|ernie55> [options]"
   model_meta "$1"
   shift
   parse_serve_opts "$@"
@@ -262,7 +283,7 @@ cmd_run() {
       --pack "$pack" --engine "$M_BIN" --port "$port" \
       --cap "$P_CAP" --lanes "$P_LANES" \
       --power "$power" --idle-unload "$idle" $extra
-  else
+  elif [ "$M_NAME" = "hy4" ]; then
     resolve_hy4_profile
     check_wired_limit 90112
     say "Hardware: $chip (${ram} GB RAM) -> $P_TIER_NOTE"
@@ -272,11 +293,21 @@ cmd_run() {
     cd "$ROOT"
     exec "$py" server/hy4_server.py \
       --pack "$pack" --engine "$M_BIN" --port "$port" --cap "$P_CAP"
+  else
+    resolve_ernie55_profile
+    check_wired_limit 90112
+    say "Hardware: $chip (${ram} GB RAM) -> $P_TIER_NOTE"
+    say "Config:   port=$port cap=$P_CAP"
+    say "Override: pass --cap/--port or E5_* env vars"
+    export E5_CAP="$P_CAP"
+    cd "$ROOT"
+    exec "$py" server/ernie55_server.py \
+      --pack "$pack" --engine "$M_BIN" --port "$port" --cap "$P_CAP"
   fi
 }
 
 cmd_serve() {
-  [ $# -ge 1 ] || die "Usage: dankattn serve <inkling2|hy4> [start|stop|status|smoke|logs] [options]"
+  [ $# -ge 1 ] || die "Usage: dankattn serve <inkling2|hy4|ernie55> [start|stop|status|smoke|logs] [options]"
   model_meta "$1"
   shift
 
@@ -294,8 +325,10 @@ cmd_serve() {
   if [ "$action" = "logs" ]; then
     if [ "$M_NAME" = "inkling2" ]; then
       logfile="$ROOT/inkling2-server.log"
-    else
+    elif [ "$M_NAME" = "hy4" ]; then
       logfile="$ROOT/hy4-server.log"
+    else
+      logfile="$ROOT/ernie55-server.log"
     fi
     [ -f "$logfile" ] || die "No log file yet at $logfile"
     exec tail -n 80 -f "$logfile"
@@ -319,7 +352,7 @@ cmd_serve() {
       if [ "$OPT_NO_ECO_DRAFT" -eq 1 ]; then export INK_ECO_DRAFT=0; fi
     fi
     exec sh "$ROOT/server/inkling2_serve.sh" "$action"
-  else
+  elif [ "$M_NAME" = "hy4" ]; then
     port="${OPT_PORT:-${HY4_PORT:-$M_DEFAULT_PORT}}"
     export HY4_PORT="$port"
     if [ "$action" = "start" ]; then
@@ -333,6 +366,20 @@ cmd_serve() {
       export HY4_PACK="$pack" HY4_CAP="$P_CAP" HY4_MP="$P_MP" HY4_SIDE_LANES="$P_SIDE_LANES" HY4_SIDE_CAP="$P_SIDE_CAP"
     fi
     exec sh "$ROOT/hy4/serve_hy4.sh" "$action"
+  else
+    port="${OPT_PORT:-${E5_PORT:-$M_DEFAULT_PORT}}"
+    export E5_PORT="$port"
+    if [ "$action" = "start" ]; then
+      pack="$(find_pack "$OPT_PACK")"
+      [ -f "$pack/manifest.json" ] || die "Model pack not found at $pack. Download it first with:  dankattn pull ernie55"
+      ensure_binary
+      resolve_ernie55_profile
+      check_wired_limit 90112
+      say "Hardware: $(detect_chip) ($(detect_ram_gb) GB RAM) -> $P_TIER_NOTE"
+      say "Config:   port=$port cap=$P_CAP"
+      export E5_PACK="$pack" E5_CAP="$P_CAP"
+    fi
+    exec sh "$ROOT/server/ernie55_serve.sh" "$action"
   fi
 }
 
@@ -362,7 +409,7 @@ cmd_doctor() {
     echo "  Compiler     : MISSING (run: xcode-select --install)"
   fi
   echo "  Python       : $py"
-  for bin in dankattn-inkling2 dankattn-hy4; do
+  for bin in dankattn-inkling2 dankattn-hy4 dankattn-ernie55; do
     if [ -x "$ROOT/build/$bin" ]; then
       echo "  Binary       : build/$bin (OK)"
     else
@@ -391,6 +438,17 @@ cmd_doctor() {
   else
     echo "    -> $P_TIER_NOTE"
   fi
+
+  model_meta ernie55
+  e5_pack="$(find_pack "")"
+  resolve_ernie55_profile
+  if [ -f "$e5_pack/manifest.json" ]; then e5_status="installed ($e5_pack)"; else e5_status="not downloaded (run: dankattn pull ernie55)"; fi
+  echo "  ernie55      : $e5_status"
+  if [ "$ram" -gt 0 ] && [ "$ram" -lt 96 ]; then
+    echo "    -> requires 96 GB+ unified memory (detected ${ram} GB)"
+  else
+    echo "    -> $P_TIER_NOTE"
+  fi
 }
 
 cmd_version() {
@@ -403,17 +461,17 @@ cmd_help() {
 DankAttn — Native Metal 4 LLM inference engine for Apple Silicon
 
 Usage:
-  dankattn pull <inkling2|hy4> [--dir <path>]
+  dankattn pull <inkling2|hy4|ernie55> [--dir <path>]
       Download pre-packed weights from Hugging Face.
 
-  dankattn run <inkling2|hy4> [options]
+  dankattn run <inkling2|hy4|ernie55> [options]
       Run the OpenAI-compatible server in the foreground (Ctrl-C to stop).
       Pass --pull to download the model automatically if missing.
 
-  dankattn serve <inkling2|hy4> [start|stop|status|smoke|logs] [options]
+  dankattn serve <inkling2|hy4|ernie55> [start|stop|status|smoke|logs] [options]
       Manage the OpenAI-compatible server in the background (default: start).
 
-  dankattn update [inkling2|hy4|all]
+  dankattn update [inkling2|hy4|ernie55|all]
       Pull the latest DankAttn release and rebuild installed binaries (~4s).
 
   dankattn doctor
@@ -424,7 +482,7 @@ Usage:
 
 Options for run / serve:
   --pack <dir>           Path to model pack directory
-  --port <port>          HTTP port (default: 8342 inkling2, 8341 hy4)
+  --port <port>          HTTP port (default: 8342 inkling2, 8341 hy4, 8343 ernie55)
   --cap <tokens>         Main slot context capacity (overrides auto-size)
   --lanes <n>            Concurrent lanes / side lanes (overrides auto-size)
   --side-cap <tokens>    Side-lane suffix capacity (overrides auto-size)
@@ -433,7 +491,7 @@ Options for run / serve:
   --no-eco-draft         Keep speed-maximizing DSpark drafts on battery (inkling2)
   --pull                 Auto-download model if missing (run only)
 
-Explicit flags and INK_* / HY4_* environment variables always override auto-sized defaults.
+Explicit flags and INK_* / HY4_* / E5_* environment variables always override auto-sized defaults.
 EOF
 }
 

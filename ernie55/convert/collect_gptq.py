@@ -3,7 +3,7 @@
 for ERNIE-5.5-Flash-Preview 2-bit GPTQ quantization.
 
 Runs one forward pass over calibration tokens (e.g., 4k-8k tokens of diverse text/code)
-and saves /mnt/lmcache-nvme/ernie55/gptq_calib.pt (~400 MB).
+and saves gptq_calib.pt (~400 MB).
 """
 import argparse
 import os
@@ -18,9 +18,11 @@ torch.set_grad_enabled(False)
 
 
 def main():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/mnt/lmcache-nvme/ernie55/hf-mxfp4")
-    ap.add_argument("--out", default="/mnt/lmcache-nvme/ernie55/gptq_calib.pt")
+    ap.add_argument("--ckpt", required=True, help="Path to upstream ERNIE-5.5-Flash-Preview checkpoint")
+    ap.add_argument("--out", default="gptq_calib.pt", help="Output calibration .pt path")
+    ap.add_argument("--wikitext", default="", help="Optional path to wikitext-2 raw text file")
     ap.add_argument("--tokens", type=int, default=4096)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -28,19 +30,17 @@ def main():
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(os.path.join(args.ckpt, "tokenizer.json"))
 
-    # Build diverse calibration text from wikitext-2 + DankAttn source code + Homelab docs
+    # Build diverse calibration text from optional wikitext-2 + DankAttn source/docs
     parts = []
-    wt = "/mnt/lmcache-nvme/hy4/wikikl/wikitext-2-raw/wiki.train.raw"
-    if not os.path.exists(wt):
-        wt = "/mnt/lmcache-nvme/hy4/wikikl/wikitext-2-raw/wiki.test.raw"
-    if os.path.exists(wt):
-        parts.append(open(wt, encoding="utf-8", errors="ignore").read()[:60000])
-    for src_path in [
-        "/home/dank/src/opus-hy4/engine/hy4/hy4.mm",
-        "/home/dank/src/opus-hy4/engine/kernels/mm2.metal",
-        "/home/dank/src/opus-hy4/ernie55/ref/ernie55_golden.py",
-        "/home/dank/Documents/Homelab/services/hy4-flash/README.md",
+    if args.wikitext and os.path.exists(args.wikitext):
+        parts.append(open(args.wikitext, encoding="utf-8", errors="ignore").read()[:60000])
+    for rel_path in [
+        "engine/hy4/hy4.mm",
+        "engine/kernels/mm2.metal",
+        "ernie55/ref/ernie55_golden.py",
+        "README.md",
     ]:
+        src_path = os.path.join(repo_root, rel_path)
         if os.path.exists(src_path):
             parts.append(open(src_path, encoding="utf-8", errors="ignore").read()[:30000])
 

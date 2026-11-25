@@ -13,6 +13,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -64,13 +65,28 @@ def fast_rtn_w2(w: torch.Tensor, gs: int = 64, mode: str = "nf2"):
 
 
 def quant_w8_dev(w: torch.Tensor, gs: int = 128):
-    q, s = P.tquant(w, 8, gs, clip=True)
-    return q.cpu(), s.cpu()
+    N = w.shape[0]
+    if N <= 32768:
+        q, s = P.tquant(w, 8, gs, clip=True)
+        return q.cpu(), s.cpu()
+    qs, ss = [], []
+    for i in range(0, N, 16384):
+        qi, si = P.tquant(w[i:i + 16384], 8, gs, clip=True)
+        qs.append(qi.cpu())
+        ss.append(si.cpu())
+    return torch.cat(qs, dim=0), torch.cat(ss, dim=0)
 
 
 def quant_w4_dev(w: torch.Tensor, gs: int = 64):
     q, s = P.tquant(w, 4, gs, clip=True)
     return q.cpu(), s.cpu()
+
+
+def make_hadamard(n: int, device: torch.device) -> torch.Tensor:
+    H = torch.tensor([[1.0]], dtype=torch.float32, device=device)
+    while H.shape[0] < n:
+        H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+    return H * (1.0 / math.sqrt(n))
 
 
 def main():
@@ -83,9 +99,13 @@ def main():
     ap.add_argument("--gptq_damp", type=float, default=0.01)
     ap.add_argument("--gptq_damp_dn", type=float, default=0.10)
     ap.add_argument("--gptq_dn", action="store_true", help="Also run per-expert GPTQ on moe.dn")
+    ap.add_argument("--hadamard", action="store_true", help="Apply 2048-pt Walsh-Hadamard rotation to MoE experts")
     ap.add_argument("--keep_w4", default="", help="Comma-separated MoE layer ids to keep at W4-g64")
+    ap.add_argument("--w2_gs32_layers", default="", help="Optional layer range/list for W2-g32 (e.g. 2-33 or 2,3,4)")
+    ap.add_argument("--w4_attn", action="store_true", help="Quantize large attn/moe_out projections to W4-g64 (saves ~2.6 GiB for W2-g32)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max_layers", type=int, default=0, help="Debug: pack only first N layers")
+    ap.add_argument("--layer_range", default="", help="Optional START:END layer slice (e.g. 0:22 or 22:43) for multi-GPU packing")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -93,7 +113,18 @@ def main():
     loader = G.CkptLoader(args.src, device=args.device)
     cfg = loader.cfg
     dev = loader.device
+    H2048 = make_hadamard(2048, dev) if args.hadamard else None
     keep_w4 = set(int(x) for x in args.keep_w4.split(",") if x.strip())
+    w2_gs32 = set()
+    for part in args.w2_gs32_layers.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = [int(x) for x in part.split("-")]
+            w2_gs32.update(range(a, b + 1))
+        else:
+            w2_gs32.add(int(part))
     w2_bits_tag = 2 if args.w2_mode == "nf2" else 20  # mm2.metal WBITS=2 (NF2) or 20 (SYM2)
     gptq_cal = torch.load(args.gptq, map_location="cpu")["layers"] if args.gptq else None
 
@@ -147,26 +178,69 @@ def main():
             sfile=fs, soff=os_, sbytes=sc.nbytes, rows={},
         )
 
-    # 1. Global tensors
-    print("Packing embed, norm, hch, lm_head, multimax...", flush=True)
-    put_raw("embed", loader.raw("model.embed_tokens.weight", to_dev=False).to(torch.bfloat16))
-    h_fn = loader.raw("model.mhc_contract.hc_head_fn", to_dev=False).float()
-    if h_fn.shape[0] == cfg["hc_mult"] * cfg["hidden_size"]:
-        h_fn = h_fn.t().contiguous()
-    put_raw("hch.fn", h_fn)
-    put_raw("hch.base", loader.raw("model.mhc_contract.hc_head_base", to_dev=False).float())
-    put_raw("hch.scale", loader.raw("model.mhc_contract.hc_head_scale", to_dev=False).float())
-    put_raw("norm", loader.raw("model.norm.weight", to_dev=False).to(torch.bfloat16))
-    put_w8("lm_head", loader.linear_weight("lm_head"), gs=128)
-    put_raw("multimax.r", loader.raw("model.lm_head.multimax_ranges", to_dev=False).float())
-    put_raw("multimax.t", loader.raw("model.lm_head.multimax_ts", to_dev=False).float())
+    def put_w4(name: str, w: torch.Tensor, gs: int = 64, rows: dict | None = None):
+        N, K = w.shape
+        q, s = quant_w4_dev(w, gs)
+        cb = pack_codes(q.numpy(), 4)
+        sb = pack_scales(s.numpy())
+        f, o = W.put(cb.tobytes())
+        fs, os_ = W.put(sb.tobytes())
+        W.tensors[name] = dict(
+            kind="w", N=N, K=K, bits=4, gs=gs, experts=1,
+            file=f, off=o, bytes=cb.nbytes, sfile=fs, soff=os_, sbytes=sb.nbytes,
+            rows=rows or {},
+        )
+
+    def put_w4_grouped(name: str, w3: torch.Tensor, gs: int = 64):
+        E_, N, K = w3.shape
+        cb_e = N * K // 2
+        if W.cur is None or W.size + E_ * cb_e + P.PAGE > W.max_file:
+            W._open()
+        first = None
+        scs = []
+        for e in range(E_):
+            q, s = quant_w4_dev(w3[e], gs)
+            f, o = W.put(pack_codes(q.numpy(), 4).tobytes())
+            if first is None:
+                first = (f, o)
+            scs.append(pack_scales(s.numpy()))
+        sc = np.concatenate(scs)
+        fs, os_ = W.put(sc.tobytes())
+        W.tensors[name] = dict(
+            kind="w", N=N, K=K, bits=4, gs=gs, experts=E_,
+            file=first[0], off=first[1], bytes=E_ * cb_e,
+            sfile=fs, soff=os_, sbytes=sc.nbytes, rows={},
+        )
+
+    put_attn = (lambda name, w, rows=None: put_w4(name, w, gs=64, rows=rows)) if args.w4_attn else (lambda name, w, rows=None: put_w8(name, w, gs=128, rows=rows))
+    put_attn_grp = (lambda name, w3: put_w4_grouped(name, w3, gs=64)) if args.w4_attn else (lambda name, w3: put_w8_grouped(name, w3, gs=128))
 
     n_layers = args.max_layers or cfg["num_hidden_layers"]
+    if args.layer_range:
+        l_start, l_end = [int(x) for x in args.layer_range.split(":")]
+    else:
+        l_start, l_end = 0, n_layers
+
+    # 1. Global tensors (only packed by the slice starting at layer 0)
+    if l_start == 0:
+        print("Packing embed, norm, hch, lm_head, multimax...", flush=True)
+        put_raw("embed", loader.raw("model.embed_tokens.weight", to_dev=False).to(torch.bfloat16))
+        h_fn = loader.raw("model.mhc_contract.hc_head_fn", to_dev=False).float()
+        if h_fn.shape[0] == cfg["hc_mult"] * cfg["hidden_size"]:
+            h_fn = h_fn.t().contiguous()
+        put_raw("hch.fn", h_fn)
+        put_raw("hch.base", loader.raw("model.mhc_contract.hc_head_base", to_dev=False).float())
+        put_raw("hch.scale", loader.raw("model.mhc_contract.hc_head_scale", to_dev=False).float())
+        put_raw("norm", loader.raw("model.norm.weight", to_dev=False).to(torch.bfloat16))
+        put_w8("lm_head", loader.linear_weight("lm_head"), gs=128)
+        put_raw("multimax.r", loader.raw("model.lm_head.multimax_ranges", to_dev=False).float())
+        put_raw("multimax.t", loader.raw("model.lm_head.multimax_ts", to_dev=False).float())
+
     E = cfg["n_routed_experts"]
     gu_order = P.gu_rows(cfg["moe_intermediate_size"]).to(dev)
     dense_gu_order = P.gu_rows(cfg["intermediate_size"]).to(dev)
 
-    for lid in range(n_layers):
+    for lid in range(l_start, l_end):
         lt0 = time.time()
         lpfx = f"model.layers.{lid}"
         dpfx = f"L{lid}"
@@ -202,7 +276,7 @@ def main():
             w_ckv = loader.linear_weight(f"{apfx}.core_attention.compressor.linear_wkv")
             w_cgate = loader.linear_weight(f"{apfx}.core_attention.compressor.linear_wgate")
             w_in = torch.cat([w_qd, w_kv, w_ckv, w_cgate], dim=0)
-            put_w8(f"{dpfx}.attn.in", w_in, gs=128, rows={
+            put_attn(f"{dpfx}.attn.in", w_in, rows={
                 "qd": [0, 1024], "kv": [1024, 512], "ckv": [1536, 512], "cgate": [2048, 512]
             })
             put_raw(f"{dpfx}.attn.q_norm", loader.raw(f"{apfx}.q_layernorm.weight", to_dev=False).to(torch.bfloat16))
@@ -213,12 +287,12 @@ def main():
 
             w_qu = loader.linear_weight(f"{apfx}.linear_q_up_proj")
             w_gt = loader.linear_weight(f"{apfx}.gate_proj")
-            put_w8(f"{dpfx}.attn.qb", torch.cat([w_qu, w_gt], dim=0), gs=128, rows={
+            put_attn(f"{dpfx}.attn.qb", torch.cat([w_qu, w_gt], dim=0), rows={
                 "q": [0, 32768], "gate": [32768, 8192]
             })
             wo_a = loader.linear_weight(f"{apfx}.linear_o_group_proj").view(cfg["o_groups"], cfg["o_lora_rank"], -1)
-            put_w8_grouped(f"{dpfx}.attn.wo_a", wo_a, gs=128)
-            put_w8(f"{dpfx}.attn.wo_b", loader.linear_weight(f"{apfx}.o_proj"), gs=128)
+            put_attn_grp(f"{dpfx}.attn.wo_a", wo_a)
+            put_attn(f"{dpfx}.attn.wo_b", loader.linear_weight(f"{apfx}.o_proj"))
         else:
             # DSA
             ipfx = f"{apfx}.core_attention.indexer"
@@ -226,7 +300,7 @@ def main():
             w_kva = loader.linear_weight(f"{apfx}.kv_a_proj_with_mqa")
             w_ik = loader.linear_weight(f"{ipfx}.wk")
             w_iw = loader.linear_weight(f"{ipfx}.weights_proj")
-            put_w8(f"{dpfx}.attn.in", torch.cat([w_qa, w_kva, w_ik, w_iw], dim=0), gs=128, rows={
+            put_attn(f"{dpfx}.attn.in", torch.cat([w_qa, w_kva, w_ik, w_iw], dim=0), rows={
                 "qa": [0, 1024], "kva": [1024, 576], "ik": [1600, 128], "iw": [1728, 64]
             })
             put_raw(f"{dpfx}.attn.qa_norm", loader.raw(f"{apfx}.q_a_layernorm.weight", to_dev=False).to(torch.bfloat16))
@@ -238,7 +312,7 @@ def main():
             w_qb = loader.linear_weight(f"{apfx}.q_b_proj")
             w_gt = loader.linear_weight(f"{apfx}.gate_proj")
             w_iqb = loader.linear_weight(f"{ipfx}.wq_b")
-            put_w8(f"{dpfx}.attn.qb", torch.cat([w_qb, w_gt, w_iqb], dim=0), gs=128, rows={
+            put_attn(f"{dpfx}.attn.qb", torch.cat([w_qb, w_gt, w_iqb], dim=0), rows={
                 "q": [0, 16384], "gate": [16384, 16384], "iq": [32768, 8192]
             })
             nope = cfg["hybrid_mla_qk_nope_head_dim"]
@@ -248,7 +322,7 @@ def main():
             # kb transposed: [64, 512, 192] (K=192 -> gs=64)
             put_w8_grouped(f"{dpfx}.attn.kb", w_kvb[:, :nope, :].transpose(1, 2).contiguous(), gs=64)
             put_w8_grouped(f"{dpfx}.attn.vb", w_kvb[:, nope:, :].contiguous(), gs=128)
-            put_w8(f"{dpfx}.attn.o", loader.linear_weight(f"{apfx}.o_proj"), gs=128)
+            put_attn(f"{dpfx}.attn.o", loader.linear_weight(f"{apfx}.o_proj"))
 
         # FFN / MoE
         if not is_moe:
@@ -264,6 +338,8 @@ def main():
             wg0 = loader.raw(f"{mpfx}.gate.weight").float()
             wg1 = loader.raw(f"{mpfx}.gate.weight_1").float()
             w_fc1 = loader.linear_weight(f"{mpfx}.fc1_latent_proj")
+            if H2048 is not None:
+                w_fc1 = H2048 @ w_fc1
             sw1 = loader.linear_weight(f"{mpfx}.shared_experts.w1")
             sw3 = loader.linear_weight(f"{mpfx}.shared_experts.w3")
             sgu = torch.cat([sw1, sw3], dim=0)[gu_order]
@@ -275,43 +351,118 @@ def main():
             put_raw(f"{dpfx}.moe.lnorm", loader.raw(f"{mpfx}.latent_norm.weight", to_dev=False).to(torch.bfloat16))
             w_fc2 = loader.linear_weight(f"{mpfx}.fc2_latent_proj")
             sw2 = loader.linear_weight(f"{mpfx}.shared_experts.w2")
-            put_w8(f"{dpfx}.moe.out", torch.cat([w_fc2, sw2], dim=1), gs=128)
+            put_attn(f"{dpfx}.moe.out", torch.cat([w_fc2, sw2], dim=1))
 
-            # Routed experts: W2-g64 (or W4-g64 if in keep_w4)
+            # Routed experts: W2-g32 / W2-g64 (or W4-g64 if in keep_w4)
             use_w4 = lid in keep_w4
             bits = 4 if use_w4 else w2_bits_tag
             raw_bits = 4 if use_w4 else 2
-            gs = 64 if use_w4 else args.w2_gs
+            gs = 64 if use_w4 else (32 if lid in w2_gs32 else args.w2_gs)
             N_gu, K_gu = 4096, 2048
             N_dn, K_dn = 2048, 2048
             cb_gu = N_gu * K_gu * raw_bits // 8
             cb_dn = N_dn * K_dn * raw_bits // 8
 
             Hinv_gu, hdiag_gu = None, None
+            lat_l, top_l = None, None
+            use_gptq_dn = False
             if not use_w4 and gptq_cal is not None and lid in gptq_cal:
-                Hinv_gu, hdiag_gu = GQ2.prepare_hinv(gptq_cal[lid]["H_gu"].to(dev), damp=args.gptq_damp)
+                H_gu = gptq_cal[lid]["H_gu"].to(dev)
+                if H2048 is not None:
+                    H_gu = H2048 @ H_gu @ H2048
+                Hinv_gu, hdiag_gu = GQ2.prepare_hinv(H_gu, damp=args.gptq_damp)
+                if args.gptq_dn and "lat" in gptq_cal[lid] and "top" in gptq_cal[lid]:
+                    use_gptq_dn = True
+                    lat_l = gptq_cal[lid]["lat"]
+                    top_l = gptq_cal[lid]["top"]
 
-            # Pack moe.gu (1 expert at a time for L3 cache efficiency on CPU)
+            inv_gu_order = torch.argsort(gu_order)
+            beta = cfg["activation_situ_beta"]
+            lbeta = cfg["activation_situ_linear_beta"]
+
+            # Pack moe.gu (batched on GPU for GPTQ, or 1 expert at a time for RTN)
             if W.cur is None or W.size + E * cb_gu + P.PAGE > W.max_file:
                 W._open()
             first_gu, scs_gu = None, []
             num_gu, den_gu = 0.0, 0.0
-            for eid in range(E):
-                w1 = loader.expert_weight(f"{mpfx}.experts.{eid}.w1")
-                w3 = loader.expert_weight(f"{mpfx}.experts.{eid}.w3")
-                w_blk = torch.cat([w1, w3], dim=0)[gu_order]
-                if use_w4:
+            # If use_gptq_dn, store per-expert quantized w1_q/w3_q? Better: compute H_dn right away!
+            Hinv_dn_list = [None] * E
+            hdiag_dn_list = [None] * E
+            if Hinv_gu is not None:
+                B_gu = 16
+                for e0 in range(0, E, B_gu):
+                    e1 = min(E, e0 + B_gu)
+                    B = e1 - e0
+                    blks = []
+                    for eid in range(e0, e1):
+                        w1 = loader.expert_weight(f"{mpfx}.experts.{eid}.w1")
+                        w3 = loader.expert_weight(f"{mpfx}.experts.{eid}.w3")
+                        wb = torch.cat([w1, w3], dim=0)[gu_order]
+                        if H2048 is not None:
+                            wb = wb @ H2048
+                        blks.append(wb)
+                    w_cat = torch.cat(blks, dim=0)  # [B*4096, 2048]
+                    q_cat, s_cat = GQ2.gptq_quant_w2(w_cat, gs=gs, mode=args.w2_mode, Hinv=Hinv_gu, hdiag=hdiag_gu)
+                    q_cpu, s_cpu = q_cat.cpu(), s_cat.cpu()
+                    for bi, eid in enumerate(range(e0, e1)):
+                        qe = q_cpu[bi * N_gu:(bi + 1) * N_gu]
+                        se = s_cpu[bi * N_gu:(bi + 1) * N_gu]
+                        f, o = W.put(pack_codes(qe.numpy(), raw_bits).tobytes())
+                        if first_gu is None:
+                            first_gu = (f, o)
+                        scs_gu.append(pack_scales(se.numpy()))
+                        if use_gptq_dn:
+                            tok_idx = torch.where(top_l == eid)[0]
+                            m = tok_idx.numel()
+                            if m >= 16:
+                                q_dev = q_cat[bi * N_gu:(bi + 1) * N_gu]
+                                s_dev = s_cat[bi * N_gu:(bi + 1) * N_gu]
+                                wq_gu = GQ2.dequant_w2(q_dev, s_dev, gs=gs, mode=args.w2_mode)[inv_gu_order]
+                                w1_q = wq_gu[:2048]
+                                w3_q = wq_gu[2048:]
+                                inp = lat_l[tok_idx].to(dev, dtype=torch.float32)
+                                act = G.situ_and_mul(inp @ w1_q.t(), inp @ w3_q.t(), beta, lbeta)
+                                H_dn = (act.double().t() @ act.double()) / float(m)
+                                damp_e = args.gptq_damp_dn if m >= 64 else max(args.gptq_damp_dn, 0.20)
+                                hi, hd = GQ2.prepare_hinv(H_dn, damp=damp_e)
+                                Hinv_dn_list[eid] = hi.cpu()
+                                hdiag_dn_list[eid] = hd.cpu()
+                    del w_cat, q_cat, s_cat, blks
+            elif not use_w4:
+                B_gu_rtn = 16
+                for e0 in range(0, E, B_gu_rtn):
+                    e1 = min(E, e0 + B_gu_rtn)
+                    blks = []
+                    for eid in range(e0, e1):
+                        w1 = loader.expert_weight(f"{mpfx}.experts.{eid}.w1")
+                        w3 = loader.expert_weight(f"{mpfx}.experts.{eid}.w3")
+                        wb = torch.cat([w1, w3], dim=0)[gu_order]
+                        if H2048 is not None:
+                            wb = wb @ H2048
+                        blks.append(wb)
+                    w_cat = torch.cat(blks, dim=0)
+                    q_cat, s_cat = GQ2.rtn_quant_w2(w_cat, gs=gs, mode=args.w2_mode)
+                    q_cpu, s_cpu = q_cat.cpu(), s_cat.cpu()
+                    for bi in range(e1 - e0):
+                        qe = q_cpu[bi * N_gu:(bi + 1) * N_gu]
+                        se = s_cpu[bi * N_gu:(bi + 1) * N_gu]
+                        f, o = W.put(pack_codes(qe.numpy(), raw_bits).tobytes())
+                        if first_gu is None:
+                            first_gu = (f, o)
+                        scs_gu.append(pack_scales(se.numpy()))
+                    del w_cat, q_cat, s_cat, blks
+            else:
+                for eid in range(E):
+                    w1 = loader.expert_weight(f"{mpfx}.experts.{eid}.w1")
+                    w3 = loader.expert_weight(f"{mpfx}.experts.{eid}.w3")
+                    w_blk = torch.cat([w1, w3], dim=0)[gu_order]
+                    if H2048 is not None:
+                        w_blk = w_blk @ H2048
                     q, s = quant_w4_dev(w_blk, gs=64)
-                elif Hinv_gu is not None:
-                    q, s = GQ2.gptq_quant_w2(w_blk, gs=gs, mode=args.w2_mode, Hinv=Hinv_gu, hdiag=hdiag_gu)
-                    q, s = q.cpu(), s.cpu()
-                else:
-                    q, s = fast_rtn_w2(w_blk, gs=gs, mode=args.w2_mode)
-                    q, s = q.cpu(), s.cpu()
-                f, o = W.put(pack_codes(q.numpy(), raw_bits).tobytes())
-                if first_gu is None:
-                    first_gu = (f, o)
-                scs_gu.append(pack_scales(s.numpy()))
+                    f, o = W.put(pack_codes(q.numpy(), raw_bits).tobytes())
+                    if first_gu is None:
+                        first_gu = (f, o)
+                    scs_gu.append(pack_scales(s.numpy()))
             sc_gu = np.concatenate(scs_gu)
             fs, os_ = W.put(sc_gu.tobytes())
             W.tensors[f"{dpfx}.moe.gu"] = dict(
@@ -325,17 +476,77 @@ def main():
                 W._open()
             first_dn, scs_dn = None, []
             num_dn, den_dn = 0.0, 0.0
-            for eid in range(E):
-                w_blk = loader.expert_weight(f"{mpfx}.experts.{eid}.w2")
+            n_dn_gptq = 0
+            if use_gptq_dn:
+                B_dn = 8
+                for e0 in range(0, E, B_dn):
+                    e1 = min(E, e0 + B_dn)
+                    batch_eids = []
+                    batch_ws = []
+                    batch_hi = []
+                    batch_hd = []
+                    rtn_res = {}
+                    for eid in range(e0, e1):
+                        w_blk = loader.expert_weight(f"{mpfx}.experts.{eid}.w2")
+                        if Hinv_dn_list[eid] is not None:
+                            batch_eids.append(eid)
+                            batch_ws.append(w_blk)
+                            batch_hi.append(Hinv_dn_list[eid].to(dev))
+                            batch_hd.append(hdiag_dn_list[eid].to(dev))
+                            Hinv_dn_list[eid] = None
+                            hdiag_dn_list[eid] = None
+                        else:
+                            q, s = fast_rtn_w2(w_blk, gs=gs, mode=args.w2_mode)
+                            rtn_res[eid] = (q.cpu(), s.cpu())
+                    gptq_res = {}
+                    if batch_eids:
+                        w_b = torch.stack(batch_ws, dim=0)
+                        hi_b = torch.stack(batch_hi, dim=0)
+                        hd_b = torch.stack(batch_hd, dim=0)
+                        q_b, s_b = GQ2.gptq_quant_w2_batched(w_b, hi_b, hd_b, gs=gs, mode=args.w2_mode)
+                        q_b, s_b = q_b.cpu(), s_b.cpu()
+                        for bi, eid in enumerate(batch_eids):
+                            gptq_res[eid] = (q_b[bi], s_b[bi])
+                        n_dn_gptq += len(batch_eids)
+                        del w_b, hi_b, hd_b, q_b, s_b
+                    for eid in range(e0, e1):
+                        q, s = gptq_res[eid] if eid in gptq_res else rtn_res[eid]
+                        f, o = W.put(pack_codes(q.numpy(), raw_bits).tobytes())
+                        if first_dn is None:
+                            first_dn = (f, o)
+                        scs_dn.append(pack_scales(s.numpy()))
+            else:
                 if use_w4:
-                    q, s = quant_w4_dev(w_blk, gs=64)
+                    for eid in range(E):
+                        w_blk = loader.expert_weight(f"{mpfx}.experts.{eid}.w2")
+                        if H2048 is not None:
+                            w_blk = H2048 @ w_blk @ H2048
+                        q, s = quant_w4_dev(w_blk, gs=64)
+                        f, o = W.put(pack_codes(q.numpy(), raw_bits).tobytes())
+                        if first_dn is None:
+                            first_dn = (f, o)
+                        scs_dn.append(pack_scales(s.numpy()))
                 else:
-                    q, s = fast_rtn_w2(w_blk, gs=gs, mode=args.w2_mode)
-                    q, s = q.cpu(), s.cpu()
-                f, o = W.put(pack_codes(q.numpy(), raw_bits).tobytes())
-                if first_dn is None:
-                    first_dn = (f, o)
-                scs_dn.append(pack_scales(s.numpy()))
+                    B_dn_rtn = 16
+                    for e0 in range(0, E, B_dn_rtn):
+                        e1 = min(E, e0 + B_dn_rtn)
+                        blks = []
+                        for eid in range(e0, e1):
+                            wb = loader.expert_weight(f"{mpfx}.experts.{eid}.w2")
+                            if H2048 is not None:
+                                wb = H2048 @ wb @ H2048
+                            blks.append(wb)
+                        w_cat = torch.cat(blks, dim=0)
+                        q_cat, s_cat = GQ2.rtn_quant_w2(w_cat, gs=gs, mode=args.w2_mode)
+                        q_cpu, s_cpu = q_cat.cpu(), s_cat.cpu()
+                        for bi in range(e1 - e0):
+                            qe = q_cpu[bi * N_dn:(bi + 1) * N_dn]
+                            se = s_cpu[bi * N_dn:(bi + 1) * N_dn]
+                            f, o = W.put(pack_codes(qe.numpy(), raw_bits).tobytes())
+                            if first_dn is None:
+                                first_dn = (f, o)
+                            scs_dn.append(pack_scales(se.numpy()))
+                        del w_cat, q_cat, s_cat, blks
             sc_dn = np.concatenate(scs_dn)
             fs, os_ = W.put(sc_dn.tobytes())
             W.tensors[f"{dpfx}.moe.dn"] = dict(
@@ -343,10 +554,8 @@ def main():
                 file=first_dn[0], off=first_dn[1], bytes=E * cb_dn,
                 sfile=fs, soff=os_, sbytes=sc_dn.nbytes, rows={},
             )
-            tag = "W4" if use_w4 else f"W2({args.w2_mode}{'+GPTQ' if Hinv_gu is not None else ''})"
-            print(f"L{lid:02d} ({'DSA' if is_dsa else 'HCA'} {tag}) "
-                  f"rel_gu={num_gu/max(den_gu,1e-30):.4f} rel_dn={num_dn/max(den_dn,1e-30):.4f} "
-                  f"({time.time()-lt0:.1f}s)", flush=True)
+            tag = "W4" if use_w4 else f"W2({args.w2_mode}{'+GPTQ' if Hinv_gu is not None else ''}{f'+dn({n_dn_gptq})' if use_gptq_dn else ''})"
+            print(f"L{lid:02d} ({'DSA' if is_dsa else 'HCA'} {tag}) ({time.time()-lt0:.1f}s)", flush=True)
 
     W.close()
     manifest = {
@@ -390,13 +599,15 @@ def main():
         "eos": cfg["eos_token_id"],
         "pad": cfg["pad_token_id"],
         "w2_mode": args.w2_mode,
+        "hadamard": bool(args.hadamard),
         "files": W.files,
         "tensors": W.tensors,
     }
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f)
-    # Copy tokenizer files for serving
-    for fn in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "config.json"):
+    # Copy tokenizer & official ERNIE chat encoder/decoder files for serving
+    for fn in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "config.json",
+               "encoding_ernie.py", "decoding_ernie.py"):
         sp = os.path.join(args.src, fn)
         if os.path.exists(sp):
             import shutil

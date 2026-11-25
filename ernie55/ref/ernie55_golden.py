@@ -7,7 +7,7 @@ DSA MLA + Lightning Indexer + SWA, Sinkhorn mHC, Multi-Router Latent MoE with Si
 and MultiMax lm_head).
 
 Usage:
-  python3 ernie55_golden.py --ckpt /mnt/lmcache-nvme/ernie55/hf-mxfp4 --text "The capital of France is"
+  python3 ernie55_golden.py --ckpt /path/to/ERNIE-5.5-Flash-Preview --text "The capital of France is"
   python3 ernie55_golden.py --ckpt ... --ids_file ... --save_ref ref.pt
   python3 ernie55_golden.py --ckpt ... --ids_file ... --compare_ref ref.pt --expert_quant w2_g64_nf2
 """
@@ -721,7 +721,7 @@ def forward_all(loader: CkptLoader, token_ids: list[int], expert_quant: str = "n
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/mnt/lmcache-nvme/ernie55/hf-mxfp4")
+    ap.add_argument("--ckpt", required=True, help="Path to ERNIE-5.5-Flash-Preview checkpoint")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--text", default=None)
     ap.add_argument("--ids_file", default=None, help="JSON or .pt list of token ids")

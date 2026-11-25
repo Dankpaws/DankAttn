@@ -131,6 +131,8 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   sh "$HOME_DIR/inkling2/build_inkling2.sh"
   say "Compiling Hy4-flash engine..."
   sh "$HOME_DIR/hy4/build_hy4.sh"
+  say "Compiling ERNIE-5.5-Flash engine..."
+  sh "$HOME_DIR/ernie55/build_ernie55.sh"
 else
   say "Skipping engine compilation (--skip-build)"
 fi

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Pull the latest DankAttn changes and rebuild any installed engine binaries.
-# Usage: sh update.sh [inkling2|hy4|all]
+# Usage: sh update.sh [inkling2|hy4|ernie55|all]
 set -e
 cd "$(dirname "$0")"
 
@@ -32,6 +32,10 @@ if [ "$target" = "hy4" ] || [ "$target" = "all" ] || { [ "$target" = "auto" ] &&
   sh hy4/build_hy4.sh
   built=1
 fi
+if [ "$target" = "ernie55" ] || [ "$target" = "all" ] || { [ "$target" = "auto" ] && [ -x build/dankattn-ernie55 ]; }; then
+  sh ernie55/build_ernie55.sh
+  built=1
+fi
 if [ "$target" = "auto" ] && [ -x build/dankattn ]; then
   sh build.sh
   built=1
@@ -41,6 +45,7 @@ if [ "$built" -eq 0 ]; then
   echo "No existing binaries found in build/. Build one with:"
   echo "  sh inkling2/build_inkling2.sh   # Inkling-2-Mini"
   echo "  sh hy4/build_hy4.sh             # Hy4-flash"
+  echo "  sh ernie55/build_ernie55.sh     # ERNIE-5.5-Flash-Preview"
 fi
 
 echo "DankAttn updated: $before -> $after"

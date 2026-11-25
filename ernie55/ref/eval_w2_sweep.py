@@ -42,8 +42,9 @@ def fast_w2_sym(w: torch.Tensor, clip_r: float = 0.80) -> torch.Tensor:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/mnt/lmcache-nvme/ernie55/hf-mxfp4")
-    ap.add_argument("--out_dir", default="/mnt/lmcache-nvme/ernie55/eval")
+    ap.add_argument("--ckpt", required=True, help="Path to ERNIE-5.5-Flash-Preview checkpoint")
+    ap.add_argument("--wikitext", required=True, help="Path to wikitext-2 wiki.test.raw")
+    ap.add_argument("--out_dir", default="./ernie55_eval")
     ap.add_argument("--tokens", type=int, default=144)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -51,8 +52,7 @@ def main():
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(os.path.join(args.ckpt, "tokenizer.json"))
 
-    wt = "/mnt/lmcache-nvme/hy4/wikikl/wikitext-2-raw/wiki.test.raw"
-    text = open(wt, encoding="utf-8", errors="ignore").read()[:8000]
+    text = open(args.wikitext, encoding="utf-8", errors="ignore").read()[:8000]
     token_ids = [1] + tok.encode(text).ids[: args.tokens - 1]
     T = len(token_ids)
     np.array(token_ids, dtype=np.uint32).tofile(os.path.join(args.out_dir, f"eval_{T}.bin"))
