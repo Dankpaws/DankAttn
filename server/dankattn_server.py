@@ -18,9 +18,10 @@ from fastapi.responses import Response, StreamingResponse
 import uvicorn
 
 from engine_frontend import (
-    BadRequest, ClientGone, EngineProc, Splitter, Unavailable, Watch,
-    api_error, bad_request, error_response, json_body, make_jinja_env,
-    normalize_messages, num, register_common_routes, unavailable,
+    BadRequest, ClientGone, EngineProc, PayloadTooLarge, Splitter, Unavailable, Watch,
+    add_security_args, api_error, bad_request, error_response, install_security_middleware,
+    json_body, make_jinja_env, normalize_messages, num, payload_too_large,
+    register_common_routes, safe_template_kwargs, unavailable,
 )
 
 ap = argparse.ArgumentParser()
@@ -33,6 +34,7 @@ ap.add_argument("--no-spec", action="store_true")
 ap.add_argument("--thinking-budget", type=int,
                 default=int(os.environ.get("DANKATTN_THINK_BUDGET", os.environ.get("OPUS_THINK_BUDGET", "0"))),
                 help="default cap on thinking tokens (0: none); a request's thinking_budget or reasoning_effort overrides it")
+add_security_args(ap)
 args = ap.parse_args()
 
 tok = Tokenizer.from_file(os.path.join(args.pack, "tokenizer.json"))
@@ -67,9 +69,7 @@ def group_of(body):
 
 
 def render(body):
-    kw = body.get("chat_template_kwargs") or {}
-    if not isinstance(kw, dict):
-        raise BadRequest("chat_template_kwargs must be an object")
+    kw = safe_template_kwargs(body)
     msgs = normalize_messages(body)
     return template.render(messages=msgs, tools=body.get("tools"), add_generation_prompt=True, **kw)
 
@@ -97,6 +97,7 @@ def parse_tools(text, enabled=True):
 
 
 app = FastAPI()
+install_security_middleware(app, allow_hosts=args.allow_host, api_key=args.api_key, max_body_mb=args.max_body_mb)
 register_common_routes(
     app, eng, args.model_id, args.cap, lambda: max(LANES, 1), render, tok,
     extra_model_fields={"capabilities": {"synchronized_start": LANES > 1, "max_group": LANES}},
@@ -105,7 +106,10 @@ register_common_routes(
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    body = await json_body(request)
+    try:
+        body = await json_body(request)
+    except PayloadTooLarge as e:
+        return payload_too_large(str(e))
     if body is None:
         return bad_request("the request body must be JSON")
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:

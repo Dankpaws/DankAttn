@@ -27,15 +27,20 @@ struct Config {
   uint32_t as_swa = env_u("HY4_AS_SWA", 8);
   uint32_t as_dsa = env_u("HY4_AS_DSA", 16);
   uint32_t as_draft = env_u("HY4_AS_DRAFT", 8);
+  bool fuse_gate = env_b("HY4_FUSE_GATE", true);
+  bool mm1_draft = env_b("HY4_MM1_DRAFT", true);
+  bool mm1 = env_b("HY4_MM1", false);
   bool conc = env_b("HY4_CONC", true);
   std::string splits = env_s("HY4_SPLITS");
-  bool split_tab = env_b("HY4_SPLIT_TAB", true);
+  int split_tab = env_i("HY4_SPLIT_TAB", -1);  // -1 = auto (on for Ultra/Max, off for Base/Pro); 0/1 overrides
   bool split_dump = env_set("HY4_SPLIT_DUMP");
 
   // DFly2 drafter & speculation
   bool no_dfly = env_set("HY4_NO_DFLY");
   uint32_t dblock = env_u("HY4_DBLOCK", 0);  // 0 = max(manifest.block, 8)
   float draft_cut = float(env_f("HY4_DRAFT_CUT", 0.2));
+  bool draft_adapt = env_b("HY4_DRAFT_ADAPT", true);   // fan-out-aware expected-tok/ms draft length selector
+  double draft_pscale = env_f("HY4_DRAFT_PSCALE", 1.0);
   bool dhead_w8 = env_i("HY4_DHEAD", 4) == 8;
   bool lookup = env_b("HY4_LOOKUP", true);
   double lk_pmin = env_f("HY4_LK_PMIN", 0.1);
@@ -57,6 +62,9 @@ struct Config {
   bool eng_warm = env_b("HY4_ENG_WARM", true);
   bool eng_sync = env_set("HY4_ENG_SYNC");
   bool eng_rdahead = env_set("HY4_ENG_RDAHEAD");
+  bool eng_pf_nocache = env_b("HY4_ENG_PF_NOCACHE", true);
+  bool eng_dedup = env_b("HY4_ENG_DEDUP", true);
+  uint32_t eng_cache_mb = env_u("HY4_ENG_CACHE_MB", 128);
   uint32_t io_threads = env_u("HY4_IO_THREADS", 96);
   uint32_t io_pool = env_u("HY4_IO_POOL", 128);
   bool time_rows = env_set("HY4_TIME_ROWS");

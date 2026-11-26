@@ -22,19 +22,24 @@ LOG=$T/ernie55-server.log
 pids() { pgrep -f "ernie55_server.py --pack" ; pgrep -f "build/dankattn-ernie55 .* serve"; }
 case "$1" in
   start)
-    if curl -s -m 2 localhost:$PORT/v1/models >/dev/null; then echo "already up"; exit 0; fi
+    if curl -sf -m 2 localhost:$PORT/health >/dev/null; then echo "already up"; exit 0; fi
     cd "$T" && nohup "$PY" server/ernie55_server.py \
       --pack "$PACK" --port $PORT --cap $CAP >> "$LOG" 2>&1 < /dev/null &
-    for i in $(seq 1 120); do curl -s -m 2 localhost:$PORT/v1/models >/dev/null && { echo "ERNIE55_READY ${i}s"; exit 0; }; sleep 1; done
+    for i in $(seq 1 120); do curl -sf -m 2 localhost:$PORT/health >/dev/null && { echo "ERNIE55_READY ${i}s"; exit 0; }; sleep 1; done
     echo "start failed; see $LOG"; exit 1 ;;
   stop)
     pkill -f "ernie55_server.py --pack"; sleep 2; pkill -f "build/dankattn-ernie55 .* serve"
     for i in $(seq 1 20); do [ -z "$(pids)" ] && { echo stopped; exit 0; }; sleep 1; done
     echo "still running: $(pids)"; exit 1 ;;
   status)
-    curl -s -m 2 localhost:$PORT/v1/models >/dev/null && echo "UP :$PORT pids $(pids | tr '\n' ' ')" || echo DOWN ;;
+    curl -sf -m 2 localhost:$PORT/health >/dev/null && echo "UP :$PORT pids $(pids | tr '\n' ' ')" || { echo DOWN; exit 1; } ;;
   smoke)
-    curl -s -m 120 localhost:$PORT/v1/chat/completions -H 'content-type: application/json' \
+    if [ -n "${DANKATTN_API_KEY:-}" ]; then
+      set -- -H "Authorization: Bearer $DANKATTN_API_KEY"
+    else
+      set --
+    fi
+    curl -s -m 120 localhost:$PORT/v1/chat/completions -H 'content-type: application/json' "$@" \
       -d '{"messages":[{"role":"user","content":"What is 19*17? Reply with the number only."}],"max_tokens":64,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
       | "$PY" -c 'import sys,json;d=json.load(sys.stdin);print(d["choices"][0]["message"]["content"], d["usage"]["dankattn"])' ;;
   *) echo "usage: $0 start|stop|status|smoke"; exit 64 ;;

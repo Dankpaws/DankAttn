@@ -20,9 +20,10 @@ from fastapi.responses import Response, StreamingResponse
 import uvicorn
 
 from engine_frontend import (
-    BadRequest, ClientGone, EngineProc, PrefixSplicer, Unavailable, Watch,
-    api_error, bad_request, error_response, json_body, make_jinja_env,
-    normalize_messages, num, register_common_routes, unavailable,
+    BadRequest, ClientGone, EngineProc, PayloadTooLarge, PrefixSplicer, Unavailable, Watch,
+    add_security_args, api_error, bad_request, error_response, install_security_middleware,
+    json_body, make_jinja_env, normalize_messages, num, payload_too_large,
+    register_common_routes, safe_template_kwargs, unavailable,
 )
 
 ap = argparse.ArgumentParser()
@@ -43,6 +44,7 @@ ap.add_argument("--no-eco-draft", action="store_true",
                 help="keep speed-maximizing DSpark draft lengths even in eco/battery mode (INK_ECO_DRAFT=0)")
 ap.add_argument("--idle-unload", type=float, default=float(os.environ.get("DANKATTN_IDLE_UNLOAD", "0")),
                 help="unload engine after N seconds idle (saves Lane 0 to pcache, wakes on next request; 0: off)")
+add_security_args(ap)
 args = ap.parse_args()
 
 tok = Tokenizer.from_file(os.path.join(args.pack, "tokenizer.json"))
@@ -79,10 +81,7 @@ splicer = PrefixSplicer(tok, max_held=16)
 
 
 def render(body):
-    kw = body.get("chat_template_kwargs") or {}
-    if not isinstance(kw, dict):
-        raise BadRequest("chat_template_kwargs must be an object")
-    kw = dict(kw)
+    kw = safe_template_kwargs(body)
     eff = body.get("reasoning_effort")
     if eff is not None and "reasoning_effort" not in kw:
         if eff not in EFFORTS:
@@ -185,6 +184,7 @@ class InkParser:
 
 
 app = FastAPI()
+install_security_middleware(app, allow_hosts=args.allow_host, api_key=args.api_key, max_body_mb=args.max_body_mb)
 register_common_routes(app, eng, args.model_id, args.cap, lambda: args.lanes, render, tok)
 
 _FPR_ALIAS_RE = re.compile(r":(\d+)x-(select|genselect|synth|fast)$")
@@ -258,9 +258,16 @@ async def _collect_fpr_candidates(ids, max_new, temp, top_p, top_k, seed, budget
     opts = mode_code | ((0 if mode_code == 2 else fpr["prune"]) << 4)
     quorum = fpr["lanes"] if mode_code == 2 else fpr["quorum"]
     cb = eng.metered(lambda item: loop.call_soon_threadsafe(q.put_nowait, item))
-    eid = eng.submit(ids, max_new, not args.no_spec, temp, top_p, top_k, seed, cb,
-                     group=(fpr["lanes"], quorum, opts),
-                     think_budget=budget, min_p=min_p, extra_stops=extra_stops, fpr_suffixes=fpr_suffixes)
+    try:
+        eid = eng.submit(ids, max_new, not args.no_spec, temp, top_p, top_k, seed, cb,
+                         group=(fpr["lanes"], quorum, opts),
+                         think_budget=budget, min_p=min_p, extra_stops=extra_stops, fpr_suffixes=fpr_suffixes)
+    except Unavailable:
+        cb({"error": "unavailable"})
+        raise
+    except struct.error as e:
+        cb({"error": str(e)})
+        raise BadRequest(f"request does not fit the engine protocol: {e}")
     watch = Watch(q, request)
     cands = []
     cur = None
@@ -286,7 +293,10 @@ async def _collect_fpr_candidates(ids, max_new, temp, top_p, top_k, seed, budget
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    body = await json_body(request)
+    try:
+        body = await json_body(request)
+    except PayloadTooLarge as e:
+        return payload_too_large(str(e))
     if body is None:
         return bad_request("the request body must be JSON")
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
@@ -348,8 +358,15 @@ async def chat(request: Request):
         loop = asyncio.get_running_loop()
         oq: asyncio.Queue = asyncio.Queue()
         ocb = eng.metered(lambda item: loop.call_soon_threadsafe(oq.put_nowait, item))
-        oeid = eng.submit(outline_ids, 1024, not args.no_spec, 0.0, 1.0, 0, seed, ocb,
-                          think_budget=0, min_p=min_p, extra_stops=[END_MSG] + extra_stops)
+        try:
+            oeid = eng.submit(outline_ids, 1024, not args.no_spec, 0.0, 1.0, 0, seed, ocb,
+                              think_budget=0, min_p=min_p, extra_stops=[END_MSG] + extra_stops)
+        except Unavailable as e:
+            ocb({"error": str(e)})
+            return unavailable(str(e))
+        except struct.error as e:
+            ocb({"error": str(e)})
+            return bad_request(f"request does not fit the engine protocol: {e}")
         owatch = Watch(oq, request)
         otoks, st_out = [], {}
         try:
@@ -365,6 +382,9 @@ async def chat(request: Request):
         except ClientGone:
             eng.cancel(oeid)
             return Response(status_code=499)
+        except asyncio.CancelledError:
+            eng.cancel(oeid)
+            raise
         outline_ms = (time.perf_counter() - t_fast0) * 1000.0
         raw_json = '{"sections":[' + tok.decode(otoks, skip_special_tokens=True).strip()
         sections = []
@@ -410,6 +430,9 @@ async def chat(request: Request):
                 except Unavailable as e:
                     fcb({"error": str(e)})
                     return unavailable(str(e))
+                except struct.error as e:
+                    fcb({"error": str(e)})
+                    return bad_request(f"request does not fit the engine protocol: {e}")
 
                 async def gen_fast_live():
                     def ch(delta, finish=None, u=None):
@@ -505,6 +528,8 @@ async def chat(request: Request):
                     shared_ids, per_sec_max, temp, top_p, top_k, seed, 0, min_p, [END_MSG] + extra_stops,
                     fpr_fill, request, mode_code=2, fpr_suffixes=suffixes
                 )
+            except BadRequest as e:
+                return bad_request(str(e))
             except Unavailable as e:
                 return unavailable(str(e))
             except ClientGone:
@@ -545,6 +570,8 @@ async def chat(request: Request):
             cands, st1 = await _collect_fpr_candidates(
                 ids, max_new, temp, top_p, top_k, seed, budget, min_p, extra_stops, fpr, request
             )
+        except BadRequest as e:
+            return bad_request(str(e))
         except Unavailable as e:
             return unavailable(str(e))
         except ClientGone:
@@ -611,8 +638,15 @@ async def chat(request: Request):
             loop = asyncio.get_running_loop()
             jq: asyncio.Queue = asyncio.Queue()
             jcb = eng.metered(lambda item: loop.call_soon_threadsafe(jq.put_nowait, item))
-            jeid = eng.submit(judge_ids, 512, not args.no_spec, 0.0, 1.0, 0, seed ^ 0x9E3779B9, jcb,
-                              think_budget=budget, min_p=min_p, extra_stops=extra_stops)
+            try:
+                jeid = eng.submit(judge_ids, 512, not args.no_spec, 0.0, 1.0, 0, seed ^ 0x9E3779B9, jcb,
+                                  think_budget=budget, min_p=min_p, extra_stops=extra_stops)
+            except Unavailable as e:
+                jcb({"error": str(e)})
+                return unavailable(str(e))
+            except struct.error as e:
+                jcb({"error": str(e)})
+                return bad_request(f"request does not fit the engine protocol: {e}")
             jps = InkParser()
             jwatch = Watch(jq, request)
             st2 = {}
@@ -628,6 +662,9 @@ async def chat(request: Request):
             except ClientGone:
                 eng.cancel(jeid)
                 return Response(status_code=499)
+            except asyncio.CancelledError:
+                eng.cancel(jeid)
+                raise
             jps._close()
             bm = _BOXED_RE.findall(jps.content or jps.reasoning)
             pick = 0

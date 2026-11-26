@@ -16,7 +16,7 @@ bits, gs = int(bits), int(gs)
 rx = re.compile(pat)
 man = json.load(open(os.path.join(base, "manifest.json")))
 idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
-P.IMP = torch.load(calib)
+P.IMP = torch.load(calib, weights_only=True)
 tc = man["config"]
 handles = {}
 

@@ -1,8 +1,9 @@
 """OpenAI-compatible HTTP front end for DankAttn ERNIE-5.5-Flash-Preview (Mac Studio).
 
 Uses server/engine_frontend.py for engine supervision, binary framing, prefix splicing, and common routes;
-uses Baidu's official encoding_ernie.py and decoding_ernie.py from the pack directory for exact chat
-rendering, reasoning_effort (low | medium | high), <ernie:think> splitting, and <ernie:tool_call> parsing.
+uses vendored server/ernie_chat/ (from Baidu's official encoding_ernie.py and decoding_ernie.py; pass
+--trust-remote-code to load from the pack directory instead) for exact chat rendering, reasoning_effort
+(low | medium | high), <ernie:think> splitting, and <ernie:tool_call> parsing.
 
   python3 server/ernie55_server.py --pack ~/pack-ernie55-w2-gptq --port 8343
 """
@@ -19,9 +20,9 @@ from fastapi.responses import Response, StreamingResponse
 import uvicorn
 
 from engine_frontend import (
-    BadRequest, ClientGone, EngineProc, Unavailable, Watch,
-    api_error, bad_request, error_response, json_body,
-    normalize_messages, num, register_common_routes, unavailable,
+    BadRequest, ClientGone, EngineProc, PayloadTooLarge, Unavailable, Watch,
+    add_security_args, api_error, bad_request, error_response, install_security_middleware,
+    json_body, normalize_messages, num, payload_too_large, register_common_routes, unavailable,
 )
 
 ap = argparse.ArgumentParser()
@@ -34,21 +35,27 @@ ap.add_argument("--no-spec", action="store_true")
 ap.add_argument("--thinking-budget", type=int,
                 default=int(os.environ.get("E5_THINK_BUDGET", "0")),
                 help="default cap on thinking tokens (0: none); a request's thinking_budget overrides it")
+ap.add_argument("--trust-remote-code", action="store_true",
+                help="load encoding_ernie.py / decoding_ernie.py from --pack instead of the vendored copies (off by default)")
+add_security_args(ap)
 args = ap.parse_args()
 
-# Import official ERNIE-5.5 chat encoder/decoder bundled with the pack (handles relative import)
-import importlib.util, types
-_pkg = types.ModuleType("ernie_chat")
-_pkg.__path__ = [args.pack]
-sys.modules["ernie_chat"] = _pkg
-def _load_mod(name):
-    spec = importlib.util.spec_from_file_location(f"ernie_chat.{name}", os.path.join(args.pack, f"{name}.py"))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[f"ernie_chat.{name}"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-E_ENC = _load_mod("encoding_ernie")
-E_DEC = _load_mod("decoding_ernie")
+# Use vendored ERNIE-5.5 chat encoder/decoder by default so untrusted model packs cannot execute arbitrary Python.
+if args.trust_remote_code:
+    import importlib.util, types
+    _pkg = types.ModuleType("ernie_chat")
+    _pkg.__path__ = [args.pack]
+    sys.modules["ernie_chat"] = _pkg
+    def _load_mod(name):
+        spec = importlib.util.spec_from_file_location(f"ernie_chat.{name}", os.path.join(args.pack, f"{name}.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[f"ernie_chat.{name}"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    E_ENC = _load_mod("encoding_ernie")
+    E_DEC = _load_mod("decoding_ernie")
+else:
+    from ernie_chat import encoding_ernie as E_ENC, decoding_ernie as E_DEC
 
 tok = Tokenizer.from_file(os.path.join(args.pack, "tokenizer.json"))
 IM_END = "<|ernie:im_end|>"
@@ -282,12 +289,18 @@ def render(body):
     if not isinstance(kw, dict):
         raise BadRequest("chat_template_kwargs must be an object")
     msgs = normalize_messages(body, keep_vision=False)
-    enable_thinking = kw.get("enable_thinking", None)
-    eff = body.get("reasoning_effort", kw.get("reasoning_effort", E_ENC.MISSING))
-    if eff == "no_think" or eff == "none":
+    et_kw = kw.get("enable_thinking", None)
+    et_top = body.get("enable_thinking", None)
+    enable_thinking = et_kw if et_kw is not None else et_top
+    eff = body.get("reasoning_effort", None)
+    if eff is None:
+        eff = kw.get("reasoning_effort", None)
+    if eff is None:
+        eff = E_ENC.MISSING
+    elif eff in ("no_think", "none", "off"):
         enable_thinking = False
         eff = E_ENC.MISSING
-    elif eff not in EFFORTS and eff is not E_ENC.MISSING:
+    elif eff not in EFFORTS:
         eff = "medium"
     return E_ENC.render_chat(
         msgs,
@@ -356,12 +369,16 @@ class _CommonTokShim:
 
 
 app = FastAPI()
+install_security_middleware(app, allow_hosts=args.allow_host, api_key=args.api_key, max_body_mb=args.max_body_mb)
 register_common_routes(app, eng, args.model_id, args.cap, lambda: 1, render, _CommonTokShim())
 
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    body = await json_body(request)
+    try:
+        body = await json_body(request)
+    except PayloadTooLarge as e:
+        return payload_too_large(str(e))
     if body is None:
         return bad_request("the request body must be JSON")
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:

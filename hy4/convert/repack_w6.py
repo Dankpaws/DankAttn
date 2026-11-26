@@ -36,7 +36,7 @@ def main(ckpt, src_pack, dst_pack, stats=None):
     tc = src_man["config"]
     idx = json.load(open(os.path.join(ckpt, "model.safetensors.index.json")))["weight_map"]
     if stats:
-        P.IMP = torch.load(stats)
+        P.IMP = torch.load(stats, weights_only=True)
         print("importance stats:", len(P.IMP["s"]), "sets", flush=True)
 
     dbits = int(os.environ.get("HY4_DENSE_BITS", "6"))

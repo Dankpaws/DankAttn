@@ -1,5 +1,5 @@
 """Shared engine supervision, binary framing, prefix splicing, and OpenAI HTTP helpers for DankAttn front ends."""
-import asyncio, itertools, json, os, re, struct, subprocess, sys, threading, time, uuid
+import asyncio, hmac, itertools, json, os, re, struct, subprocess, sys, threading, time, urllib.parse, uuid
 
 import jinja2
 import numpy as np
@@ -445,11 +445,136 @@ def bad_request(msg):
     )
 
 
+class PayloadTooLarge(Exception):
+    pass
+
+
+DEFAULT_MAX_BODY_MB = 128
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_RESERVED_TEMPLATE_KWARGS = frozenset({"messages", "tools", "add_generation_prompt"})
+
+
+def add_security_args(ap):
+    """Register shared HTTP security CLI flags on an ArgumentParser."""
+    ap.add_argument(
+        "--allow-host", action="append", default=[],
+        help="additional allowed Host/Origin hostname for reverse proxies (repeatable, or '*' to disable; env DANKATTN_ALLOW_HOSTS)",
+    )
+    ap.add_argument(
+        "--api-key", default=os.environ.get("DANKATTN_API_KEY", ""),
+        help="require Authorization: Bearer <key> on API routes (env DANKATTN_API_KEY; default: off)",
+    )
+    ap.add_argument(
+        "--max-body-mb", type=int, default=int(os.environ.get("DANKATTN_MAX_BODY_MB", str(DEFAULT_MAX_BODY_MB))),
+        help=f"maximum HTTP request body size in MiB (default: {DEFAULT_MAX_BODY_MB}; env DANKATTN_MAX_BODY_MB)",
+    )
+
+
+def _normalize_host(raw: str) -> str:
+    h = (raw or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        end = h.find("]")
+        return h[1:end] if end > 0 else h
+    if ":" in h:
+        return h.rsplit(":", 1)[0]
+    return h
+
+
+def _parse_allow_hosts(cli_hosts) -> set[str]:
+    out = set(_LOCAL_HOSTS)
+    env_val = os.environ.get("DANKATTN_ALLOW_HOSTS", "")
+    for item in list(cli_hosts or ()) + env_val.split(","):
+        tok = _normalize_host(item)
+        if tok:
+            out.add(tok)
+    return out
+
+
+def install_security_middleware(app, allow_hosts=(), api_key="", max_body_mb=DEFAULT_MAX_BODY_MB):
+    """Enforce Host/Origin checks (DNS rebinding & CSRF), Content-Type on POST, optional Bearer auth, and body size cap."""
+    allowed = _parse_allow_hosts(allow_hosts)
+    allow_any_host = "*" in allowed
+    max_mb = max(1, int(max_body_mb))
+    max_bytes = max_mb * 1024 * 1024
+    app.state.max_body_bytes = max_bytes
+
+    @app.middleware("http")
+    async def _security_mw(request: Request, call_next):
+        if not allow_any_host:
+            host = _normalize_host(request.headers.get("host", ""))
+            if host not in allowed:
+                return JSONResponse(
+                    {"error": {"message": "forbidden Host header (pass --allow-host or DANKATTN_ALLOW_HOSTS for reverse proxies)",
+                               "type": "invalid_request_error", "param": None, "code": "invalid_host"}},
+                    status_code=403,
+                )
+            origin = request.headers.get("origin")
+            if origin:
+                ohost = (urllib.parse.urlparse(origin).hostname or "").lower()
+                if ohost not in allowed:
+                    return JSONResponse(
+                        {"error": {"message": "forbidden Origin header",
+                                   "type": "invalid_request_error", "param": None, "code": "invalid_origin"}},
+                        status_code=403,
+                    )
+
+        if api_key and request.url.path != "/health":
+            auth = request.headers.get("authorization", "")
+            if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], api_key):
+                return JSONResponse(
+                    {"error": {"message": "invalid or missing API key",
+                               "type": "authentication_error", "param": None, "code": "invalid_api_key"}},
+                    status_code=401, headers={"WWW-Authenticate": "Bearer"},
+                )
+
+        if request.method == "POST":
+            ctype = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                return JSONResponse(
+                    {"error": {"message": "Content-Type must be application/json",
+                               "type": "invalid_request_error", "param": None, "code": "unsupported_media_type"}},
+                    status_code=415,
+                )
+            cl = (request.headers.get("content-length") or "").strip()
+            if cl and cl.isdigit() and int(cl) > max_bytes:
+                return JSONResponse(
+                    {"error": {"message": f"request body exceeds {max_mb} MiB limit",
+                               "type": "invalid_request_error", "param": None, "code": "payload_too_large"}},
+                    status_code=413,
+                )
+
+        return await call_next(request)
+
+
+def safe_template_kwargs(body):
+    kw = body.get("chat_template_kwargs") or {}
+    if not isinstance(kw, dict):
+        raise BadRequest("chat_template_kwargs must be an object")
+    return {k: v for k, v in kw.items() if k not in _RESERVED_TEMPLATE_KWARGS}
+
+
 async def json_body(request: Request):
+    max_bytes = getattr(getattr(request.app, "state", None), "max_body_bytes", DEFAULT_MAX_BODY_MB * 1024 * 1024)
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise PayloadTooLarge(f"request body exceeds {max_bytes // (1024 * 1024)} MiB limit")
+        chunks.append(chunk)
     try:
-        return await request.json()
+        return json.loads(b"".join(chunks))
     except ValueError:
         return None
+
+
+def payload_too_large(msg):
+    return JSONResponse(
+        {"error": {"message": msg, "type": "invalid_request_error", "param": None, "code": "payload_too_large"}},
+        status_code=413,
+    )
 
 
 def num(body, key, kind, default, lo=None, hi=None):
@@ -513,7 +638,10 @@ def register_common_routes(app, eng: EngineProc, model_id: str, cap: int, lanes_
 
     @app.post("/tokenize")
     async def tokenize(request: Request):
-        body = await json_body(request)
+        try:
+            body = await json_body(request)
+        except PayloadTooLarge as e:
+            return payload_too_large(str(e))
         if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
             return bad_request("messages must be a non-empty list")
         try:

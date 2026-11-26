@@ -55,7 +55,8 @@ struct PrefixCache {
     budget = size_t(std::max(0.0, gb) * 1e9);
     reserve = size_t(std::max(0.0, fgb) * 1e9);
     if (!on) return;
-    mkdir(dir.c_str(), 0755);
+    mkdir(dir.c_str(), 0700);
+    chmod(dir.c_str(), 0700);
     DIR* d = opendir(dir.c_str());
     if (!d) { on = false; fprintf(stderr, "inkling2: pcache: cannot open %s, off\n", dir.c_str()); return; }
     std::vector<std::pair<double, Entry>> found;

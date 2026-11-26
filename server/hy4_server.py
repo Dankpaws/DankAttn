@@ -1,7 +1,7 @@
 """OpenAI-compatible HTTP front end for DankAttn Hy4 (Hy4-flash on DankAttn, Mac Studio).
 
 Uses server/engine_frontend.py for engine supervision, binary framing, prefix splicing, and common routes;
-this module carries Hy4's chat template (reasoning_effort max | high | no_think), <think:opensource> reasoning
+this module carries Hy4's chat template (reasoning_effort high | no_think; max -> high, enable_thinking: false -> no_think), <think:opensource> reasoning
 split, <tool_call:opensource> tool parsing, and user stop sequences.
 
   python3 server/hy4_server.py --pack ./pack-g64-gptq-v3 --port 8341
@@ -18,11 +18,12 @@ from fastapi.responses import Response, StreamingResponse
 import uvicorn
 
 from engine_frontend import (
-    BadRequest, ClientGone, EngineProc, PrefixSplicer, Splitter, Unavailable, Watch,
-    api_error, bad_request, error_response, json_body, make_jinja_env,
-    normalize_messages, num, register_common_routes, unavailable,
+    BadRequest, ClientGone, EngineProc, PayloadTooLarge, PrefixSplicer, Splitter, Unavailable, Watch,
+    add_security_args, api_error, bad_request, error_response, install_security_middleware,
+    json_body, make_jinja_env, normalize_messages, num, payload_too_large,
+    register_common_routes, safe_template_kwargs, unavailable,
 )
-from vision_preproc import extract_image_urls, preprocess_image
+from vision_preproc import MAX_IMAGES, extract_image_urls, preprocess_image
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--pack", required=True)
@@ -34,6 +35,12 @@ ap.add_argument("--no-spec", action="store_true")
 ap.add_argument("--thinking-budget", type=int,
                 default=int(os.environ.get("DANKATTN_THINK_BUDGET", os.environ.get("OPUS_THINK_BUDGET", "0"))),
                 help="default cap on thinking tokens (0: none); a request's thinking_budget overrides it")
+ap.add_argument("--idle-unload", type=float,
+                default=float(os.environ.get("DANKATTN_IDLE_UNLOAD", "0")),
+                help="stop engine to release GPU RAM after N idle seconds (0: stay loaded; wakes via pcache)")
+ap.add_argument("--allow-local-media", default=os.environ.get("DANKATTN_ALLOW_LOCAL_MEDIA", ""),
+                help="optional directory from which file:// or local image paths may be loaded (default: disabled)")
+add_security_args(ap)
 args = ap.parse_args()
 
 tok = Tokenizer.from_file(os.path.join(args.pack, "tokenizer.json"))
@@ -45,7 +52,9 @@ STOPS = [tok.token_to_id(HY_END)]
 IMAGE_PAD_ID = tok.token_to_id(IMAGE_PAD)
 THINK_END = tok.token_to_id(THINK_CLOSE)
 THINK_FORCE = tok.encode("\n\n" + THINK_CLOSE, add_special_tokens=False).ids
-EFFORTS = ("max", "high", "no_think")
+# Upstream tencent/Hy4-flash (b2498eba, 2026-11-19) dropped 'max' from chat_template.jinja;
+# map legacy 'max' -> 'high' and OpenAI-style 'none'/'off' -> 'no_think'.
+EFFORT_MAP = {"max": "high", "high": "high", "no_think": "no_think", "none": "no_think", "off": "no_think"}
 
 eng = EngineProc(
     [args.engine, args.pack, "serve"],
@@ -53,19 +62,26 @@ eng = EngineProc(
     default_stops=STOPS,
     think_end=THINK_END,
     think_force=THINK_FORCE,
+    idle_unload_s=args.idle_unload,
 )
 splicer = PrefixSplicer(tok, max_held=16)
 
 
 def render(body):
-    kw = body.get("chat_template_kwargs") or {}
-    if not isinstance(kw, dict):
-        raise BadRequest("chat_template_kwargs must be an object")
+    kw = safe_template_kwargs(body)
     msgs = normalize_messages(body, keep_vision=True)
-    kw = dict(kw)
-    eff = body.get("reasoning_effort")
-    if eff in EFFORTS and "reasoning_effort" not in kw:
-        kw["reasoning_effort"] = eff
+    et_kw = kw.pop("enable_thinking", None)
+    et_top = body.get("enable_thinking", None)
+    et = et_kw if et_kw is not None else et_top
+    if "reasoning_effort" in kw:
+        if kw["reasoning_effort"] in EFFORT_MAP:
+            kw["reasoning_effort"] = EFFORT_MAP[kw["reasoning_effort"]]
+    else:
+        eff = body.get("reasoning_effort")
+        if eff in EFFORT_MAP:
+            kw["reasoning_effort"] = EFFORT_MAP[eff]
+    if et is False and "reasoning_effort" not in kw:
+        kw["reasoning_effort"] = "no_think"
     return template.render(messages=msgs, tools=body.get("tools"), add_generation_prompt=True, **kw)
 
 
@@ -99,12 +115,16 @@ def _hy4_lanes():
 
 
 app = FastAPI()
+install_security_middleware(app, allow_hosts=args.allow_host, api_key=args.api_key, max_body_mb=args.max_body_mb)
 register_common_routes(app, eng, args.model_id, args.cap, _hy4_lanes, render, tok)
 
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    body = await json_body(request)
+    try:
+        body = await json_body(request)
+    except PayloadTooLarge as e:
+        return payload_too_large(str(e))
     if body is None:
         return bad_request("the request body must be JSON")
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
@@ -138,11 +158,19 @@ async def chat(request: Request):
         return bad_request(f"chat template: {e}")
     vision_imgs = None
     if img_urls:
+        if len(img_urls) > MAX_IMAGES:
+            return bad_request(f"too many images ({len(img_urls)} > {MAX_IMAGES})")
         try:
-            vision_imgs = await asyncio.to_thread(lambda: [preprocess_image(u) for u in img_urls])
+            vision_imgs = await asyncio.to_thread(
+                lambda: [preprocess_image(u, allow_local_media=args.allow_local_media) for u in img_urls]
+            )
         except Exception as e:
             return bad_request(f"image preprocessing failed: {e}")
     raw_ids = await asyncio.to_thread(splicer.splice, prompt)
+    try:
+        await asyncio.to_thread(eng.ensure_awake)
+    except Unavailable as e:
+        return unavailable(str(e))
     if vision_imgs:
         ids = []
         img_i = 0

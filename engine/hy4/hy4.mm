@@ -77,8 +77,9 @@ struct Rec {
 };
 
 // Per-tensor overrides {N, K, gs, grouped, sgs, ksplit}; HY4_SPLITS="N:K:gs:grouped:sgs:ksplit,..." adds
-// (and wins over) rows of the table, HY4_SPLIT_TAB=0 drops the table. Fixed per tensor, never by M.
-static std::vector<std::array<uint32_t, 6>> split_rows() {
+// (and wins over) rows of the table. HY4_SPLIT_TAB defaults to auto (on for Ultra/Max, off for Base/Pro);
+// 0/1 overrides. Fixed per tensor, never by M.
+static std::vector<std::array<uint32_t, 6>> split_rows(bool use_split_tab) {
   std::vector<std::array<uint32_t, 6>> t;
   if (!cfg().splits.empty()) {
     const std::string& s = cfg().splits;
@@ -90,7 +91,7 @@ static std::vector<std::array<uint32_t, 6>> split_rows() {
       p = q + 1;
     }
   }
-  if (cfg().split_tab)
+  if (use_split_tab)
     for (auto& r : std::vector<std::array<uint32_t, 6>>{
              // measured end to end (bench, 3k context, 2026-11-18, M5 Ultra): moe.in, moe.out, routed down;
              // the three together 22.69/32.08 -> 21.72/31.62 ms at 1/5 rows. Other dense shapes moved < 0.2 ms.
@@ -109,9 +110,9 @@ static std::vector<std::array<uint32_t, 6>> split_rows() {
   return t;
 }
 
-static void pick_split(uint32_t N, uint32_t K, uint32_t gs, uint32_t slots, uint32_t& sgs, uint32_t& ksplit) {
+static void pick_split(uint32_t N, uint32_t K, uint32_t gs, uint32_t slots,
+                       const std::vector<std::array<uint32_t, 6>>& tab, uint32_t& sgs, uint32_t& ksplit) {
   const uint32_t G = K / gs, nf = N / 32 * slots;
-  static const auto tab = split_rows();
   for (auto& r : tab)
     if (r[0] == N && r[1] == K && r[2] == gs && (r[3] != 0) == (slots > 1) && G % (r[4] * r[5]) == 0 && r[5] <= 16) {
       sgs = r[4]; ksplit = r[5];
@@ -167,6 +168,8 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   hc_mag = [cfg[@"hc_magnitude"] floatValue];
   rscale = [cfg[@"routed_scaling_factor"] floatValue];
   swiglu = [cfg[@"swiglu_limit"] floatValue];
+  moe_dn_had = [man[@"layout"][@"moe_dn_had"] unsignedIntValue];
+  if (moe_dn_had != 0 && moe_dn_had != 128) mtl::die("unsupported moe_dn_had (expected 0 or 128)");
   NSDictionary* rp = cfg[@"rope_parameters"];
   base_swa = [rp[@"sliding_attention"][@"rope_theta"] doubleValue];
   base_dsa = [rp[@"deepseek_sparse_attention"][@"rope_theta"] doubleValue];
@@ -199,7 +202,9 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   }
   uint32_t fi = 0;
   for (NSString* f in man[@"files"]) {
-    std::string p = dir + "/" + [f UTF8String];
+    std::string fn = [f UTF8String];
+    mtl::check_pack_filename(fn);
+    std::string p = dir + "/" + fn;
     int fd = open(p.c_str(), O_RDONLY);
     if (fd < 0) mtl::die(("open " + p).c_str());
     struct stat st;
@@ -221,15 +226,20 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   [rs requestResidency];
   [C.q addResidencySet:rs];
 
+  NSString* dname = [C.dev name];
+  const bool big_gpu = dname && ([dname containsString:@"Ultra"] || [dname containsString:@"Max"]);
+  const bool use_split_tab = hy4::cfg().split_tab < 0 ? big_gpu : (hy4::cfg().split_tab != 0);
+  const auto stab = split_rows(use_split_tab);
+
   NSDictionary* T = man[@"tensors"];
   auto lin = [&](const std::string& name, uint32_t slots = 1) {
     NSDictionary* t = T[@(name.c_str())];
     if (!t) mtl::die(("missing tensor " + name).c_str());
     Lin l;
-    l.w = files[[t[@"file"] unsignedIntValue]];
     l.woff = [t[@"off"] unsignedLongLongValue];
-    l.s = files[[t[@"sfile"] unsignedIntValue]];
+    l.w = mtl::checked_file(files, [t[@"file"] unsignedIntValue], l.woff, 0, name);
     l.soff = [t[@"soff"] unsignedLongLongValue];
+    l.s = mtl::checked_file(files, [t[@"sfile"] unsignedIntValue], l.soff, 0, name + ".scales");
     l.N = [t[@"N"] unsignedIntValue];
     l.K = [t[@"K"] unsignedIntValue];
     l.bits = [t[@"bits"] unsignedIntValue];
@@ -237,7 +247,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     l.experts = [t[@"experts"] unsignedIntValue];
     NSDictionary* rows = t[@"rows"];
     for (NSString* k in rows) l.rows[[k UTF8String]] = {[rows[k][0] unsignedIntValue], [rows[k][1] unsignedIntValue]};
-    pick_split(l.N, l.K, l.gs, slots, l.sgs, l.ksplit);
+    pick_split(l.N, l.K, l.gs, slots, stab, l.sgs, l.ksplit);
     if (hy4::cfg().split_dump) {
       static std::set<std::string> seen;
       char b[160];
@@ -250,9 +260,9 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     NSDictionary* t = T[@(name.c_str())];
     if (!t) mtl::die(("missing tensor " + name).c_str());
     Raw r;
-    r.b = files[[t[@"file"] unsignedIntValue]];
     r.off = [t[@"off"] unsignedLongLongValue];
     r.bytes = [t[@"bytes"] unsignedLongLongValue];
+    r.b = mtl::checked_file(files, [t[@"file"] unsignedIntValue], r.off, r.bytes, name);
     return r;
   };
   NSArray* lt = cfg[@"layer_types"];
@@ -406,20 +416,36 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     if (p[0] != '/') p = dir + "/" + p;
     const size_t off = [et[@"offset"] unsignedLongLongValue];
     eng_rows = [et[@"rows"] unsignedLongLongValue];
+    NSString* dt = et[@"dtype"];
+    eng_q4 = dt && [dt isEqualToString:@"u4_g32"];
+    eng_row_bytes = eng_q4 ? 60u : 96u;
     int fd = open(p.c_str(), O_RDONLY);
     if (fd < 0) mtl::die(("open " + p).c_str());
     const size_t pg = off & ~size_t(16383);
-    const size_t len = off - pg + eng_rows * eng_dim;
+    const size_t len = off - pg + eng_rows * eng_row_bytes;
     void* m = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, pg);
     close(fd);
     if (m == MAP_FAILED) mtl::die(("mmap " + p).c_str());
     madvise(m, len, MADV_RANDOM);
     eng_tab = (const uint8_t*)m + (off - pg);
     eng_fd = open(p.c_str(), O_RDONLY);
-    // rows are 96 random bytes: no readahead around them (HY4_ENG_RDAHEAD=1 keeps the default)
+    // rows are random bytes: no readahead around them (HY4_ENG_RDAHEAD=1 keeps the default)
     if (!hy4::cfg().eng_rdahead) fcntl(eng_fd, F_RDAHEAD, 0);
+    // Separate F_NOCACHE fd for prefill chunks (M > MAXM) so tens of thousands of random Engram reads
+    // don't evict wired/hot model pages from the OS page cache during long prefills.
+    eng_fd_pf = open(p.c_str(), O_RDONLY);
+    if (!hy4::cfg().eng_rdahead) fcntl(eng_fd_pf, F_RDAHEAD, 0);
+    if (hy4::cfg().eng_pf_nocache) fcntl(eng_fd_pf, F_NOCACHE, 1);
     eng_off = off;
-    eng_seen.reset(new std::atomic<uint8_t>[(off + eng_rows * eng_dim) / 16384 + 2]());
+    eng_seen.reset(new std::atomic<uint8_t>[(off + eng_rows * eng_row_bytes) / 16384 + 2]());
+    if (hy4::cfg().eng_cache_mb > 0) {
+      eng_cache_stride = 8 + eng_row_bytes;  // uint32_t seq + uint32_t row + eng_row_bytes (4B-aligned)
+      const size_t max_bytes = size_t(hy4::cfg().eng_cache_mb) * 1024 * 1024;
+      size_t slots = 1024;
+      while (slots * 2 * eng_cache_stride <= max_bytes) slots *= 2;
+      eng_cache_mask = slots - 1;
+      eng_cache_buf.reset(new uint8_t[slots * eng_cache_stride]());
+    }
   }
 
   // kernels: compile only the mm2/mmp/mmpg (bits, gs) variants actually used by this pack's tensors
@@ -427,7 +453,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   const std::string mm2 = mtl::slurp(kdir + "mm2.metal"), hk = mtl::slurp(kdir + "hy4.metal");
   const std::string lim = std::to_string(int(swiglu));
   const std::string mnf = std::to_string(mmp_nf_), gch = std::to_string(gch_), gnf = std::to_string(grpmmp_nf_);
-  std::set<std::pair<uint32_t, uint32_t>> need_dec, need_dec_epi3, need_grp, need_grp_epi3, need_grp_epi3_nc, need_mmp, need_mmp_epi3, need_grpmmp, need_grpmmp_epi3;
+  std::set<std::pair<uint32_t, uint32_t>> need_dec, need_dec_epi3, need_grp, need_grp_epi3, need_grp_epi3_nc, need_grp_epi5, need_mmp, need_mmp_epi3, need_grpmmp, need_grpmmp_epi3, need_grpmmp_cx_epi5;
   auto reg = [&](const Lin& w, bool grp, bool pf, bool epi3) {
     auto bg = std::make_pair(w.bits, w.gs);
     if (grp) {
@@ -442,6 +468,8 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   for (const auto& l : L) {
     reg(l.in, false, true, false); reg(l.gate, false, true, false); reg(l.qb, false, true, false); reg(l.o, false, true, false);
     reg(l.kb, true, true, false); reg(l.vb, true, true, false);
+    need_grp_epi5.insert({l.vb.bits, l.vb.gs});
+    need_grpmmp_cx_epi5.insert({l.vb.bits, l.vb.gs});
     if (l.dense) { reg(l.mlp_gu, false, true, true); reg(l.mlp_dn, false, true, false); }
     else { reg(l.moe_in, false, true, false); reg(l.moe_gu, true, true, true); reg(l.moe_dn, true, true, false); reg(l.moe_out, false, true, false); }
     if (l.eng) reg(l.eng_kv, false, true, false);
@@ -451,6 +479,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     for (const auto& d : D) {
       reg(d.in, false, false, false); reg(d.gate, false, false, false); reg(d.qb, false, false, false); reg(d.o, false, false, false);
       reg(d.kb, true, false, false); reg(d.vb, true, false, false);
+      need_grp_epi5.insert({d.vb.bits, d.vb.gs});
       reg(d.gu, false, false, false); need_dec_epi3.insert({d.gu.bits, d.gu.gs}); reg(d.dn, false, false, false);
     }
     reg(df_eh, false, false, false);
@@ -478,6 +507,8 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     P[mk(bg) + "grp_epi3"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}, {"SWIGLU_LIMIT", lim}});
   for (auto bg : need_grp_epi3_nc)
     P[mk(bg) + "grp_epi3_nc"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}});
+  for (auto bg : need_grp_epi5)
+    P[mk(bg) + "grp_epi5"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "5"}});
   for (auto bg : need_mmp)
     P[mk(bg) + "mmp"] = C.pipe(mm2, "mmp", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"MMP_FAST", "1"}, {"MMP_NF", mnf}});
   for (auto bg : need_mmp_epi3)
@@ -486,11 +517,28 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     P[mk(bg) + "grpmmp"] = C.pipe(mm2, "mmpg", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"MMP_CH", gch}, {"MMP_FAST", "1"}, {"MMP_NF", gnf}});
     P[mk(bg) + "grpmmp_cx"] = C.pipe(mm2, "mmpg", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"CONTIG_X", "1"}, {"MMP_CH", "8"}, {"MMP_FAST", "1"}, {"MMP_NF", "2"}});
   }
+  for (auto bg : need_grpmmp_cx_epi5)
+    P[mk(bg) + "grpmmp_cx_epi5"] = C.pipe(mm2, "mmpg", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"CONTIG_X", "1"}, {"MMP_CH", "8"}, {"MMP_FAST", "1"}, {"MMP_NF", "2"}, {"EPI", "5"}});
+  if (hy4::cfg().mm1 || hy4::cfg().mm1_draft) {
+    auto add_mm1 = [&](std::pair<uint32_t, uint32_t> bg, const char* suf, std::map<std::string, std::string> defs) {
+      if (bg.first != 4 && bg.first != 8) return;
+      defs["WBITS"] = std::to_string(bg.first);
+      defs["GS"] = std::to_string(bg.second);
+      P[mk(bg) + suf] = C.pipe(mm2, "mm1", defs);
+    };
+    for (auto bg : need_dec) add_mm1(bg, "mm1", {});
+    for (auto bg : need_dec_epi3) add_mm1(bg, "mm1_f3", {{"FUSE", "3"}});
+    for (auto bg : need_grp) add_mm1(bg, "mm1grp", {{"GROUPED", "1"}, {"MM1_GATED", "1"}});
+    for (auto bg : need_grp_epi3) add_mm1(bg, "mm1grp_f3", {{"GROUPED", "1"}, {"MM1_GATED", "1"}, {"FUSE", "3"}, {"SWIGLU_LIMIT", lim}});
+    for (auto bg : need_grp_epi3_nc) add_mm1(bg, "mm1grp_f3_nc", {{"GROUPED", "1"}, {"MM1_GATED", "1"}, {"FUSE", "3"}});
+    for (auto bg : need_grp_epi5) add_mm1(bg, "mm1grp_f1", {{"GROUPED", "1"}, {"MM1_GATED", "1"}, {"FUSE", "1"}});
+  }
   for (auto bg : need_grpmmp_epi3)
     P[mk(bg) + "grpmmp_epi3"] = C.pipe(mm2, "mmpg", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}, {"SWIGLU_LIMIT", lim}, {"MMP_CH", gch}, {"MMP_FAST", "1"}, {"MMP_NF", gnf}});
   for (const char* k : {"h4_embed", "h4_embed_vis", "h4_hc_1pass", "h4_hc_part", "h4_hc_fin", "h4_rms", "h4_attn_in", "h4_q_prep", "h4_idx_pool",
                         "h4_idx_topk", "h4_attn_merge", "h4_gate", "h4_route", "h4_plan", "h4_combine",
-                        "h4_eng_rows", "h4_eng_mix", "h4_argmax", "h4_plan_lists", "h4_combine_c",
+                        "h4_eng_rows", "h4_eng_rows_q4", "h4_eng_mix", "h4_argmax", "h4_plan_lists", "h4_combine_c",
+                        "h4_wht128_pf", "h4_wht128_dec",
                         "h4_add", "h4_dsel", "h4_add_frag", "h4_d_post_add_ln", "h4_draft_hc_in",
                         "h4_sample", "h4_pick_p", "h4_idx_score_mma", "h4_dgate"})
     P[k] = C.pipe(hk, k);
@@ -595,7 +643,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   scores = HBuf(sz_scores, off_slotB);
   mark = HBuf(sz_mark, off_slotB + A16(sz_scores));
   ofrag = HBuf(sz_ofrag, off_slotB);
-  gfrag = HBuf(sz_gfrag, off_slotB);
+  gfrag = HBuf(sz_gfrag, hy4::cfg().fuse_gate ? off_slotA : off_slotB);
   qn_frag = HBuf(sz_qn_frag, off_qn);
   qr = HBuf(sz_qr, off_qr);
   iq = HBuf(sz_iq, off_iq);
@@ -628,8 +676,8 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   nslots = B(16);
   slot_of = B(E * 4);
   rmask = B(E * 4 * 4);
-  eng_rows_b = B(size_t(std::max(n_eng, 1u)) * MRp * 16 * 96);
-  eng_rows_pf = B(size_t(std::max(n_eng, 1u)) * MRp * 16 * 96);
+  eng_rows_b = B(size_t(std::max(n_eng, 1u)) * MRp * 16 * eng_row_bytes);
+  eng_rows_pf = B(size_t(std::max(n_eng, 1u)) * MRp * 16 * eng_row_bytes);
   eng_live_pf = B(MRp * 4);
   eng_live = B(MRp * 4);
   logits = B(size_t(MAXM) * lm_head.N * 4);
@@ -732,17 +780,19 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
 
 void Model::mm(Rec& rc, const char* tag, const Lin& w, id<MTLBuffer> X, id<MTLBuffer> Y, uint32_t M,
                id<MTLBuffer> sl, id<MTLBuffer> ns, uint32_t nz, uint32_t xstride, uint32_t ystride, bool epi3,
-               id<MTLBuffer> e0, uint32_t epiR, uint32_t ldx, bool rm, bool barrier) {
+               id<MTLBuffer> e0, uint32_t epiR, uint32_t ldx, bool rm, bool barrier, id<MTLBuffer> e1) {
   const bool grouped = sl != nil;
+  const bool epi5 = !epi3 && e1 != nil;
   if (M > MAXM) {
     // prefill: mmp (dense) / mmpg (grouped over row lists; CONTIG_X + CH=8 for per-head kb/vb)
     const bool contig_x = grouped && !rm && ldx == 1 && !epi3;
     std::string k = "w" + std::to_string(w.bits) + "g" + std::to_string(w.gs) +
-                    (contig_x ? "grpmmp_cx" : (grouped ? "grpmmp" : "mmp")) + (epi3 ? "_epi3" : "");
+                    (contig_x ? "grpmmp_cx" : (grouped ? "grpmmp" : "mmp")) +
+                    (epi3 ? "_epi3" : (epi5 ? "_epi5" : ""));
     const uint32_t CH = (grouped && !contig_x) ? gch_ : 8, rows = M;
     const uint32_t nf_tg = (grouped && !contig_x) ? grpmmp_nf_ : mmp_nf_;
     const uint32_t gx = (w.N / 32 + nf_tg - 1) / nf_tg;
-    MmArgs a{w.N, w.K, M, w.ksplit, 0, 0, xstride, 0, 0, w.sgs, ldx, 1.0f, 0, epiR, H, HC};
+    MmArgs a{w.N, w.K, M, w.ksplit, 0, 0, xstride, 0, 0, w.sgs, ldx, 1.0f, 0, epiR, epi5 ? epiR : H, epi5 ? 0u : HC};
     a.rm = (grouped && rm) ? 1u : 0u;
     if (grouped) {
       const uint32_t wunit = w.bits == 6 ? 8u : 16u;
@@ -761,7 +811,7 @@ void Model::mm(Rec& rc, const char* tag, const Lin& w, id<MTLBuffer> X, id<MTLBu
     [e setBuffer:(grouped ? ns : nslots) offset:0 atIndex:7];
     [e setBuffer:counters offset:0 atIndex:8];
     [e setBuffer:(e0 ? e0 : mmpart) offset:0 atIndex:9];
-    [e setBuffer:mmpart offset:0 atIndex:10];
+    [e setBuffer:(e1 ? e1 : mmpart) offset:0 atIndex:10];
     [e setBuffer:mmpart offset:0 atIndex:11];
     [e setBuffer:roff offset:0 atIndex:12];
     [e setBuffer:rcnt offset:0 atIndex:13];
@@ -776,13 +826,53 @@ void Model::mm(Rec& rc, const char* tag, const Lin& w, id<MTLBuffer> X, id<MTLBu
     }
     return;
   }
+  const bool is_draft_m1 = (tag[0] == 'd' && tag[1] == '_');
+  const bool use_mm1 = (M == 1u) && (w.bits == 4u || w.bits == 8u) &&
+                       (is_draft_m1 ? cfg().mm1_draft : cfg().mm1);
+  if (use_mm1) {
+    std::string k = "w" + std::to_string(w.bits) + "g" + std::to_string(w.gs) + "mm1" + (grouped ? "grp" : "") +
+                    (epi3 ? (grouped && ldx == 3 ? "_f3_nc" : "_f3") : (epi5 ? "_f1" : ""));
+    const uint32_t G = w.K / w.gs;
+    const uint32_t nf_tot = (w.N / 32u) * (grouped ? nz : 1u);
+    uint32_t sgs1 = 1u;
+    if (nf_tot >= 2048u) sgs1 = 1u;
+    else if (nf_tot <= 128u && G % 16u == 0) sgs1 = 16u;
+    else if (nf_tot < 256u && G % 8u == 0) sgs1 = 8u;
+    else if (nf_tot < 1024u && G % 4u == 0) sgs1 = 4u;
+    else if (nf_tot < 2048u && G % 2u == 0) sgs1 = 2u;
+    MmArgs a{};
+    a.N = w.N;
+    a.K = w.K;
+    a.M = 1u;
+    a.ksplit = 1u;
+    if (grouped) {
+      a.wstride = uint32_t(size_t(w.N) * w.K * w.bits / 8 / 16u);
+      a.sstride = uint32_t(size_t(w.N) * G);
+    }
+    a.xstride = xstride;
+    a.ystride = epi5 ? w.N : (epi3 ? 16u * epiR : ystride);
+    a.sgs = sgs1;
+    id<MTLComputeCommandEncoder> e = rc.op(tag, barrier);
+    [e setComputePipelineState:pipe(k)];
+    [e setBuffer:w.w offset:w.woff atIndex:0];
+    [e setBuffer:w.s offset:w.soff atIndex:1];
+    [e setBuffer:X offset:0 atIndex:2];
+    [e setBuffer:((epi3 || epi5) ? e0 : Y) offset:0 atIndex:3];
+    [e setBytes:&a length:sizeof a atIndex:4];
+    [e setBuffer:(grouped ? sl : slots) offset:0 atIndex:5];
+    if (epi5) [e setBuffer:e1 offset:0 atIndex:6];
+    if (grouped) [e setBuffer:ns offset:0 atIndex:7];
+    [e dispatchThreadgroups:MTLSizeMake(w.N / 32u, 1, grouped ? nz : 1)
+      threadsPerThreadgroup:MTLSizeMake(32u * sgs1, 1, 1)];
+    return;
+  }
   std::string k = "w" + std::to_string(w.bits) + "g" + std::to_string(w.gs) + (grouped ? "grp" : "") +
-                  (epi3 ? (grouped && ldx == 3 ? "_epi3_nc" : "_epi3") : "");
+                  (epi3 ? (grouped && ldx == 3 ? "_epi3_nc" : "_epi3") : (epi5 ? "_epi5" : ""));
   id<MTLComputePipelineState> p = pipe(k);
   const uint32_t RB = grouped ? 1 : (M + 15) / 16;
   const uint32_t NZ = grouped ? nz : RB;
   MmArgs a{w.N, w.K, M, w.ksplit, 0, 0, xstride, w.ksplit * M * w.N, ystride, w.sgs, 0, 1.0f,
-           grouped ? M * w.N : RB * 16 * w.N, epiR, H, HC};
+           grouped ? M * w.N : RB * 16 * w.N, epiR, epi5 ? epiR : H, epi5 ? 0u : HC};
   a.rm = (grouped && rm) ? 1u : 0u;
   if (grouped) {
     const uint32_t wunit = w.bits == 6 ? 8u : 16u;
@@ -802,7 +892,7 @@ void Model::mm(Rec& rc, const char* tag, const Lin& w, id<MTLBuffer> X, id<MTLBu
   [e setBuffer:(grouped ? ns : nslots) offset:0 atIndex:7];
   [e setBuffer:counters offset:0 atIndex:8];
   [e setBuffer:(e0 ? e0 : mmpart) offset:0 atIndex:9];
-  [e setBuffer:mmpart offset:0 atIndex:10];
+  [e setBuffer:(e1 ? e1 : mmpart) offset:0 atIndex:10];
   [e setBuffer:mmpart offset:0 atIndex:11];
   [e setBuffer:mmpart offset:0 atIndex:12];
   [e setBuffer:counters offset:0 atIndex:13];
@@ -890,45 +980,129 @@ struct IoPool {
   }
 };
 
+static inline size_t eng_cache_bucket(uint64_t row, size_t mask) {
+  uint64_t h = row * 0x9e3779b97f4a7c15ull;
+  h ^= h >> 32;
+  return size_t(h) & mask;
+}
+
+bool Model::eng_cache_get(uint64_t row, uint8_t* dst) const {
+  if (!eng_cache_mask) return false;
+  const uint8_t* slot = eng_cache_buf.get() + eng_cache_bucket(row, eng_cache_mask) * eng_cache_stride;
+  auto* seq = reinterpret_cast<const std::atomic<uint32_t>*>(slot);
+  const uint32_t s1 = seq->load(std::memory_order_acquire);
+  if ((s1 & 1u) || s1 == 0) return false;
+  uint32_t tag;
+  memcpy(&tag, slot + 4, 4);
+  if (tag != uint32_t(row)) return false;
+  memcpy(dst, slot + 8, eng_row_bytes);
+  std::atomic_thread_fence(std::memory_order_acquire);
+  return seq->load(std::memory_order_relaxed) == s1;
+}
+
+void Model::eng_cache_put(uint64_t row, const uint8_t* src) {
+  if (!eng_cache_mask) return;
+  uint8_t* slot = eng_cache_buf.get() + eng_cache_bucket(row, eng_cache_mask) * eng_cache_stride;
+  auto* seq = reinterpret_cast<std::atomic<uint32_t>*>(slot);
+  uint32_t s = seq->load(std::memory_order_relaxed);
+  if (s & 1u) return;
+  if (!seq->compare_exchange_strong(s, s + 1, std::memory_order_acquire, std::memory_order_relaxed)) return;
+  const uint32_t tag = uint32_t(row);
+  memcpy(slot + 4, &tag, 4);
+  memcpy(slot + 8, src, eng_row_bytes);
+  uint32_t next = s + 2;
+  if (next == 0) next = 2;  // reserve 0 for empty slot
+  seq->store(next, std::memory_order_release);
+}
+
 void Model::engram_read_rows(const std::vector<uint64_t>& rows, uint32_t M, uint8_t* dst, uint32_t dst_r0, bool allow_warm,
                              const uint32_t* dst_rows) {
   // rows[] is [engram layer][row][16], the upload buffer's order. The table sits on SSD and every row is
   // its own page read, so throughput is queue depth: many threads each pread their share.
+  const size_t rb = eng_row_bytes;
   auto at = [&](size_t i) {
     const size_t e = i / (size_t(M) * 16), rk = i % (size_t(M) * 16);
     const size_t dr = dst_rows ? size_t(dst_rows[rk / 16]) : (size_t(dst_r0) + rk / 16);
-    return dst + (e * MR * 16 + dr * 16 + (rk % 16)) * 96;
+    return dst + (e * MR * 16 + dr * 16 + (rk % 16)) * rb;
   };
   // decode / verify steps: rows on pages read in the last ~8 s are copied now, the rest (idx) go through pread.
   // Not for prefill chunks: tens of thousands of rows copied serially through the mapping (first-touch faults)
   // made 64k prefill 1,147 -> 757 tok/s (2026-11-19); their parallel preads are faster.
   const bool wp = eng_warm && allow_warm;
   const uint8_t cur = uint8_t(1 + (mtl::now_s() / 2) % 255);
-  auto pg = [&](size_t i, int end) { return (eng_off + rows[i] * eng_dim + (end ? eng_dim - 1 : 0)) >> 14; };
+  auto pg = [&](size_t i, int end) { return (eng_off + rows[i] * rb + (end ? rb - 1 : 0)) >> 14; };
   auto warm = [&](size_t p) { const uint8_t v = eng_seen[p].load(std::memory_order_relaxed); return v && (cur + 255 - v) % 255 < 4; };
-  std::vector<uint32_t> idx;
-  idx.reserve(rows.size());
+  struct Miss { uint64_t row; uint32_t i; };
+  std::vector<Miss> misses;
+  misses.reserve(rows.size());
   for (size_t i = 0; i < rows.size(); i++) {
-    if (wp && warm(pg(i, 0)) && warm(pg(i, 1))) memcpy(at(i), eng_tab + rows[i] * eng_dim, 96);
-    else idx.push_back(uint32_t(i));
-  }
-  if (eng_warm)
-    for (size_t i = 0; i < rows.size(); i++) {
-      eng_seen[pg(i, 0)].store(cur, std::memory_order_relaxed);
-      eng_seen[pg(i, 1)].store(cur, std::memory_order_relaxed);
-    }
-  const size_t n = idx.size();
-  auto one = [&](size_t j) {
-    const size_t i = idx[j];
     uint8_t* d = at(i);
-    if (pread(eng_fd, d, 96, off_t(eng_off + rows[i] * eng_dim)) != 96) memcpy(d, eng_tab + rows[i] * eng_dim, 96);
+    if (eng_cache_get(rows[i], d)) continue;
+    if (wp && warm(pg(i, 0)) && warm(pg(i, 1))) {
+      memcpy(d, eng_tab + rows[i] * rb, rb);
+      eng_cache_put(rows[i], d);
+    } else {
+      misses.push_back({rows[i], uint32_t(i)});
+    }
+  }
+  const int rfd = (!allow_warm && eng_fd_pf >= 0) ? eng_fd_pf : eng_fd;
+  if (eng_warm && allow_warm && !misses.empty()) {
+    for (const auto& m : misses) {
+      eng_seen[pg(m.i, 0)].store(cur, std::memory_order_relaxed);
+      eng_seen[pg(m.i, 1)].store(cur, std::memory_order_relaxed);
+    }
+  }
+  if (misses.empty()) return;
+
+  if (cfg().eng_dedup) {
+    // Sort misses by file offset and deduplicate identical row IDs so each unique cold row is pread once.
+    std::sort(misses.begin(), misses.end(), [](const Miss& a, const Miss& b) { return a.row < b.row; });
+    struct Group { uint64_t row; uint32_t start, count; };
+    std::vector<Group> groups;
+    groups.reserve(misses.size());
+    for (size_t k = 0; k < misses.size();) {
+      size_t j = k + 1;
+      while (j < misses.size() && misses[j].row == misses[k].row) j++;
+      groups.push_back({misses[k].row, uint32_t(k), uint32_t(j - k)});
+      k = j;
+    }
+    const size_t ng = groups.size();
+    auto do_group = [&](size_t g) {
+      const auto& gr = groups[g];
+      uint8_t* d0 = at(misses[gr.start].i);
+      if (pread(rfd, d0, rb, off_t(eng_off + gr.row * rb)) != ssize_t(rb)) memcpy(d0, eng_tab + gr.row * rb, rb);
+      eng_cache_put(gr.row, d0);
+      for (uint32_t k = 1; k < gr.count; k++) memcpy(at(misses[gr.start + k].i), d0, rb);
+    };
+    const size_t maxth = cfg().io_threads;
+    const size_t th = std::min(maxth, std::max<size_t>(1, ng / 16));
+    if (th <= 1) { for (size_t g = 0; g < ng; g++) do_group(g); return; }
+    if (ng <= 2048) {
+      static IoPool& pool = *new IoPool(cfg().io_pool);
+      static std::mutex pool_mu;
+      std::lock_guard<std::mutex> g(pool_mu);
+      pool.run(ng, [&](size_t i) { do_group(i); });
+      return;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> ws;
+    for (size_t t = 0; t < th; t++)
+      ws.emplace_back([&] { for (size_t i; (i = next.fetch_add(16)) < ng;) for (size_t k = i; k < std::min(ng, i + 16); k++) do_group(k); });
+    for (auto& w : ws) w.join();
+    return;
+  }
+
+  const size_t n = misses.size();
+  auto one = [&](size_t j) {
+    const size_t i = misses[j].i;
+    uint8_t* d = at(i);
+    if (pread(rfd, d, rb, off_t(eng_off + rows[i] * rb)) != ssize_t(rb)) memcpy(d, eng_tab + rows[i] * rb, rb);
+    eng_cache_put(rows[i], d);
   };
   const size_t maxth = cfg().io_threads;
   const size_t th = std::min(maxth, std::max<size_t>(1, n / 16));
   if (th <= 1) { for (size_t i = 0; i < n; i++) one(i); return; }
   if (n <= 2048) {
-    // decode / verify (<= 32 rows): the single shared persistent pool, one read per task
-    // never destroyed: its threads never end, and destroying joinable threads at exit is std::terminate
     static IoPool& pool = *new IoPool(cfg().io_pool);
     static std::mutex pool_mu;
     std::lock_guard<std::mutex> g(pool_mu);
@@ -953,7 +1127,7 @@ void Model::engram_fetch(const std::vector<uint32_t>& ctx, size_t p0, uint32_t M
   s1 = std::min(s1, n_eng);
   std::vector<uint64_t> rows;
   rows.reserve(size_t(s1 - s0) * M * 16);
-  dst += size_t(s0) * MR * 16 * 96;
+  dst += size_t(s0) * MR * 16 * eng_row_bytes;
   for (auto& l : L) {
     if (!l.eng || l.eng_slot < s0 || l.eng_slot >= s1) continue;
     const auto cid = [&](int64_t t) -> uint64_t {
@@ -1043,7 +1217,7 @@ void Model::engram_rows(uint32_t M, const uint32_t* toks) {
       uint8_t* dst = (uint8_t*)eng_rows_b.contents;
       const uint8_t* src = (const uint8_t*)eng_rows_pf.contents;
       for (uint32_t e = 0; e < n_eng; e++)
-        memcpy(dst + size_t(e) * MR * 16 * 96, src + size_t(e) * MR * 16 * 96, 16 * 96);
+        memcpy(dst + size_t(e) * MR * 16 * eng_row_bytes, src + size_t(e) * MR * 16 * eng_row_bytes, 16 * eng_row_bytes);
       ((uint32_t*)eng_live.contents)[0] = ((const uint32_t*)eng_live_pf.contents)[0];
       have_anchor = true;
     }
@@ -1054,7 +1228,7 @@ void Model::engram_rows(uint32_t M, const uint32_t* toks) {
   const uint32_t nM = M - r0;
   if (n_eng > 1 && M <= MAXM && !cfg().eng_sync) {
     // decode / verify: the first Engram layer's rows now, the later layers' rows behind the GPU's next
-    // layers (eng_rest, waited for before the second Engram layer is encoded)
+    // layers in one parallel SSD wave (eng_rest, waited for before the second Engram layer is encoded)
     engram_fetch(history, p0 + r0, nM, (uint8_t*)eng_rows_b.contents, (uint32_t*)eng_live.contents, 0, 1, r0);
     uint8_t* d = (uint8_t*)eng_rows_b.contents;
     eng_rest = std::async(std::launch::async, [this, p0, r0, nM, d] {
@@ -1218,7 +1392,7 @@ bool Model::save_prefix_snap(const PrefixSnap& snap, const std::string& path, do
   for (size_t li = 0; li < L.size(); li++)
     h.state_bytes += L[li].sparse ? size_t(h.nt) * 512 + size_t(sp) * lat_row(L[li]) + size_t((sp + 3) / 4) * 256 : size_t(h.nw) * 1152;
   const std::string tmp = path + ".tmp";
-  int fd = open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  int fd = open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
   if (fd < 0) return false;
   fcntl(fd, F_NOCACHE, 1);  // a cache file must not push the Engram table out of the page cache
   off_t off = 0;
@@ -1417,6 +1591,7 @@ struct GateArgs { uint32_t M, nh, rs; };
 struct RouteArgs { uint32_t M, E, topk, Nin, lat, I; float scale; };
 struct PlanArgs { uint32_t M, topk, E; };
 struct CombArgs { uint32_t M, topk, lat, ystride; };
+struct WhtArgs { uint32_t M, I; };
 struct EngRowArgs { uint32_t M; float eps; };
 struct EngMixArgs { uint32_t M, H; float eps; };
 struct ArgArgs { uint32_t M, N; };
@@ -1516,7 +1691,7 @@ void Model::engram_fetch_lanes(const std::vector<const std::vector<uint32_t>*>& 
   s1 = std::min(s1, n_eng);
   std::vector<uint64_t> rows;
   rows.reserve(size_t(s1 - s0) * M * 16);
-  dst += size_t(s0) * MR * 16 * 96;
+  dst += size_t(s0) * MR * 16 * eng_row_bytes;
   for (auto& l : L) {
     if (!l.eng || l.eng_slot < s0 || l.eng_slot >= s1) continue;
     const auto cid = [&](int64_t t) -> uint64_t {
@@ -1566,8 +1741,8 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
     if (!first) hc(l.ahc_fn, l.ahc_base, l.ahc_scale, l.attn_norm, post_f, post_a, 1, 2, "hc_inject");
     EngRowArgs ra{M, feps};
     e = rc.op("eng_rows");
-    [e setComputePipelineState:pipe("h4_eng_rows")];
-    [e setBuffer:eng_rows_b offset:size_t(l.eng_slot) * MR * 16 * 96 atIndex:0];
+    [e setComputePipelineState:pipe(eng_q4 ? "h4_eng_rows_q4" : "h4_eng_rows")];
+    [e setBuffer:eng_rows_b offset:size_t(l.eng_slot) * MR * 16 * eng_row_bytes atIndex:0];
     setb(e, l.eng_lnorm, 1);
     [e setBuffer:eng_frag offset:0 atIndex:2];
     [e setBytes:&ra length:sizeof ra atIndex:3];
@@ -1730,16 +1905,20 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
     [e dispatchThreadgroups:MTLSizeMake(l.nh, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
   }
-  mm(rc, "mm.vb", l.vb, ofrag, yv, M, head_slots, nsh, l.nh, rsf * 512 / 8, rsy * 256);
-  {
-    GateArgs a{M, l.nh, rsy};
-    e = rc.op("gate");
-    [e setComputePipelineState:pipe("h4_gate")];
-    [e setBuffer:yv offset:0 atIndex:0];
-    [e setBuffer:Yg offset:0 atIndex:1];
-    [e setBuffer:gfrag offset:0 atIndex:2];
-    [e setBytes:&a length:sizeof a atIndex:3];
-    [e dispatchThreads:MTLSizeMake(l.nh * 256, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (cfg().fuse_gate) {
+    mm(rc, "mm.vb", l.vb, ofrag, yv, M, head_slots, nsh, l.nh, rsf * 512 / 8, rsy * 256, false, gfrag, l.nh * 256, 1, false, true, Yg);
+  } else {
+    mm(rc, "mm.vb", l.vb, ofrag, yv, M, head_slots, nsh, l.nh, rsf * 512 / 8, rsy * 256);
+    {
+      GateArgs a{M, l.nh, rsy};
+      e = rc.op("gate");
+      [e setComputePipelineState:pipe("h4_gate")];
+      [e setBuffer:yv offset:0 atIndex:0];
+      [e setBuffer:Yg offset:0 atIndex:1];
+      [e setBuffer:gfrag offset:0 atIndex:2];
+      [e setBytes:&a length:sizeof a atIndex:3];
+      [e dispatchThreads:MTLSizeMake(l.nh * 256, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
   }
   mm(rc, "mm.o", l.o, gfrag, Yo, M);
   rms(Yo, l.post_norm, y, H, H, 0, "attn_post_norm");
@@ -1797,8 +1976,16 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
     }
   }
   if (pf) {
-    // experts over per-expert row lists: gate|up (clamped SwiGLU into compact frags), then down
+    // experts over per-expert row lists: gate|up (clamped SwiGLU into compact frags), optional WHT128, then down
     mm(rc, "mm.moe_gu", l.moe_gu, lat_frag, Ygu, M, slots, nslots, E, 0, 0, true, act, I, 0, true);
+    if (moe_dn_had == 128) {
+      WhtArgs wa{M * topk, I};
+      e = rc.op("wht128");
+      [e setComputePipelineState:pipe("h4_wht128_pf")];
+      [e setBuffer:act offset:0 atIndex:0];
+      [e setBytes:&wa length:sizeof wa atIndex:1];
+      [e dispatchThreadgroups:MTLSizeMake(I / 128, (M * topk + 3u) / 4u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
     mm(rc, "mm.moe_dn", l.moe_dn, act, yd, M, slots, nslots, E, 0, 0, false, nil, 0, 2, true);
     CombCArgs a{M, topk, LAT};
     e = rc.op("combine");
@@ -1812,6 +1999,16 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
   } else {
     const uint32_t smax = std::min(E, M * topk);
     mm(rc, "mm.moe_gu", l.moe_gu, lat_frag, Ygu, M, slots, nslots, smax, 0, 16 * 2 * I, true, act, I, 1, true);
+    if (moe_dn_had == 128) {
+      WhtArgs wa{M, I};
+      e = rc.op("wht128");
+      [e setComputePipelineState:pipe("h4_wht128_dec")];
+      [e setBuffer:act offset:0 atIndex:0];
+      [e setBuffer:nslots offset:0 atIndex:1];
+      [e setBuffer:rmask offset:0 atIndex:2];
+      [e setBytes:&wa length:sizeof wa atIndex:3];
+      [e dispatchThreadgroups:MTLSizeMake(I / 128, smax, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
     mm(rc, "mm.moe_dn", l.moe_dn, act, yd, M, slots, nslots, smax, (I / 32) * 64, 16 * LAT, false, nil, 0, 1, true);
     CombArgs a{M, topk, LAT, 16 * LAT};
     e = rc.op("combine");
@@ -2091,8 +2288,8 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<LaneBatch>& batches, d
           }
           if (hit >= 0) {
             for (uint32_t e = 0; e < n_eng; e++)
-              memcpy(dst + (size_t(e) * MR * 16 + size_t(r) * 16) * 96,
-                     src + (size_t(e) * MR * 16 + size_t(hit) * 16) * 96, 16 * 96);
+              memcpy(dst + (size_t(e) * MR * 16 + size_t(r) * 16) * eng_row_bytes,
+                     src + (size_t(e) * MR * 16 + size_t(hit) * 16) * eng_row_bytes, 16 * eng_row_bytes);
             dlv[r] = slv[hit];
           } else {
             miss_hist.push_back(rhist[r]);
@@ -2292,16 +2489,20 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       [e setBytes:&ma length:sizeof ma atIndex:3];
       [e dispatchThreadgroups:MTLSizeMake(d.nh, W, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
-    mm(rc, "d_vb", d.vb, ofrag, yv, W, head_slots, nsh, d.nh, 16 * 512 / 8, 16 * 256);
-    {
-      GateArgs a{W, d.nh, 16};
-      e = rc.op("d_gate_mul");
-      [e setComputePipelineState:pipe("h4_gate")];
-      [e setBuffer:yv offset:0 atIndex:0];
-      [e setBuffer:Yg offset:0 atIndex:1];
-      [e setBuffer:gfrag offset:0 atIndex:2];
-      [e setBytes:&a length:sizeof a atIndex:3];
-      [e dispatchThreads:MTLSizeMake(d.nh * 256, W, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (cfg().fuse_gate) {
+      mm(rc, "d_vb", d.vb, ofrag, yv, W, head_slots, nsh, d.nh, 16 * 512 / 8, 16 * 256, false, gfrag, d.nh * 256, 1, false, true, Yg);
+    } else {
+      mm(rc, "d_vb", d.vb, ofrag, yv, W, head_slots, nsh, d.nh, 16 * 512 / 8, 16 * 256);
+      {
+        GateArgs a{W, d.nh, 16};
+        e = rc.op("d_gate_mul");
+        [e setComputePipelineState:pipe("h4_gate")];
+        [e setBuffer:yv offset:0 atIndex:0];
+        [e setBuffer:Yg offset:0 atIndex:1];
+        [e setBuffer:gfrag offset:0 atIndex:2];
+        [e setBytes:&a length:sizeof a atIndex:3];
+        [e dispatchThreads:MTLSizeMake(d.nh * 256, W, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
     }
     mm(rc, "d_o", d.o, gfrag, Yo, W);
     {
@@ -2394,12 +2595,18 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
   memcpy(out.data(), dout.contents, (W - 1) * 4);
   last_probs.assign((const float*)dprob.contents, (const float*)dprob.contents + (W - 1));
   last_pmax.assign((const float*)dpmax.contents, (const float*)dpmax.contents + (W - 1));
-  // verify only the drafts whose cumulative probability stays above draft_cut (at least one)
-  if (cut && draft_cut > 0) {
-    float c = 1.0f;  // f32 in h4_dgate's order, so the host verifies exactly the drafts the GPU finished
-    size_t k = 0;
-    while (k < out.size() && c * last_probs[k] >= draft_cut) { c *= last_probs[k]; k++; }
-    out.resize(std::max<size_t>(k, 1));
+  // verify only the drafts whose cumulative probability stays above draft_cut (at least one),
+  // then optionally trim unprofitable tail drafts via the fan-out-aware tok/ms selector.
+  if (cut) {
+    size_t k_gpu = out.size();
+    if (draft_cut > 0) {
+      float c = 1.0f;  // f32 in h4_dgate's order, so the host verifies only drafts the GPU finished
+      size_t k = 0;
+      while (k < out.size() && c * last_probs[k] >= draft_cut) { c *= last_probs[k]; k++; }
+      k_gpu = std::max<size_t>(k, 1);
+    }
+    const size_t keep = select_draft_k(last_probs, k_gpu, 1);
+    out.resize(keep);
   }
   return out;
 }
@@ -2616,16 +2823,20 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       [e setBytes:&ma length:sizeof ma atIndex:3];
       [e dispatchThreadgroups:MTLSizeMake(d.nh, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
-    mm(rc, "dl_vb", d.vb, ofrag, yv, M, head_slots, nsh, d.nh, 16 * 512 / 8, 16 * 256);
-    {
-      GateArgs a{M, d.nh, 16};
-      e = rc.op("dl_gate_mul");
-      [e setComputePipelineState:pipe("h4_gate")];
-      [e setBuffer:yv offset:0 atIndex:0];
-      [e setBuffer:Yg offset:0 atIndex:1];
-      [e setBuffer:gfrag offset:0 atIndex:2];
-      [e setBytes:&a length:sizeof a atIndex:3];
-      [e dispatchThreads:MTLSizeMake(d.nh * 256, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (cfg().fuse_gate) {
+      mm(rc, "dl_vb", d.vb, ofrag, yv, M, head_slots, nsh, d.nh, 16 * 512 / 8, 16 * 256, false, gfrag, d.nh * 256, 1, false, true, Yg);
+    } else {
+      mm(rc, "dl_vb", d.vb, ofrag, yv, M, head_slots, nsh, d.nh, 16 * 512 / 8, 16 * 256);
+      {
+        GateArgs a{M, d.nh, 16};
+        e = rc.op("dl_gate_mul");
+        [e setComputePipelineState:pipe("h4_gate")];
+        [e setBuffer:yv offset:0 atIndex:0];
+        [e setBuffer:Yg offset:0 atIndex:1];
+        [e setBuffer:gfrag offset:0 atIndex:2];
+        [e setBytes:&a length:sizeof a atIndex:3];
+        [e dispatchThreads:MTLSizeMake(d.nh * 256, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
     }
     mm(rc, "dl_o", d.o, gfrag, Yo, M);
     {
@@ -2731,11 +2942,15 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       res[j].probs[s2] = pp[s2 * MAXM + j];
       res[j].pmax[s2] = pm[s2 * MAXM + j];
     }
-    if (cut && draft_cut > 0 && md > 0) {
-      float c = 1.0f;
-      size_t k = 0;
-      while (k < md && c * res[j].probs[k] >= draft_cut) { c *= res[j].probs[k]; k++; }
-      const size_t keep = std::max<size_t>(k, 1);
+    if (cut && md > 0) {
+      size_t k_gpu = md;
+      if (draft_cut > 0) {
+        float c = 1.0f;
+        size_t k = 0;
+        while (k < md && c * res[j].probs[k] >= draft_cut) { c *= res[j].probs[k]; k++; }
+        k_gpu = std::max<size_t>(k, 1);
+      }
+      const size_t keep = select_draft_k(res[j].probs, k_gpu, n);
       res[j].toks.resize(keep);
       res[j].probs.resize(keep);
       res[j].pmax.resize(keep);

@@ -359,26 +359,28 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   NSArray* flist = man[@"files"];
   files.reserve([flist count]);
   for (NSString* fn in flist) {
-    files.push_back(mmap_file(C.dev, dir + "/" + [fn UTF8String], mapped_bytes));
+    std::string s = [fn UTF8String];
+    mtl::check_pack_filename(s);
+    files.push_back(mmap_file(C.dev, dir + "/" + s, mapped_bytes));
   }
 
   auto load_raw_from = [&](NSDictionary* tens, const std::vector<id<MTLBuffer>>& fvec, const std::string& name) -> Raw {
     NSDictionary* d = tens[@(name.c_str())];
     if (!d) mtl::die(("missing raw tensor " + name).c_str());
     Raw r;
-    r.b = fvec[[d[@"file"] unsignedIntValue]];
     r.off = [d[@"off"] unsignedLongLongValue];
     r.bytes = [d[@"bytes"] unsignedLongLongValue];
+    r.b = mtl::checked_file(fvec, [d[@"file"] unsignedIntValue], r.off, r.bytes, name);
     return r;
   };
   auto load_lin_from = [&](NSDictionary* tens, const std::vector<id<MTLBuffer>>& fvec, const std::string& name) -> Lin {
     NSDictionary* d = tens[@(name.c_str())];
     if (!d) mtl::die(("missing linear tensor " + name).c_str());
     Lin ln;
-    ln.w = fvec[[d[@"file"] unsignedIntValue]];
     ln.woff = [d[@"off"] unsignedLongLongValue];
-    ln.s = fvec[[d[@"sfile"] unsignedIntValue]];
+    ln.w = mtl::checked_file(fvec, [d[@"file"] unsignedIntValue], ln.woff, 0, name);
     ln.soff = [d[@"soff"] unsignedLongLongValue];
+    ln.s = mtl::checked_file(fvec, [d[@"sfile"] unsignedIntValue], ln.soff, 0, name + ".scales");
     ln.N = [d[@"N"] unsignedIntValue];
     ln.K = [d[@"K"] unsignedIntValue];
     ln.bits = [d[@"bits"] unsignedIntValue];
@@ -629,7 +631,9 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
 
       NSArray* mflist = mman[@"files"];
       for (NSString* fn in mflist) {
-        mtp_files.push_back(mmap_file(C.dev, dir + "/" + [fn UTF8String], mapped_bytes));
+        std::string s = [fn UTF8String];
+        mtl::check_pack_filename(s);
+        mtp_files.push_back(mmap_file(C.dev, dir + "/" + s, mapped_bytes));
       }
       NSDictionary* mtens = mman[@"tensors"];
       auto mraw = [&](const std::string& n) { return load_raw_from(mtens, mtp_files, n); };
@@ -3201,8 +3205,10 @@ bool Model::save_prefix(const std::string& path, const std::vector<uint32_t>& hi
   if (pos == 0 || fork_pos != 0 || history.size() < pos) return false;
   const double t0 = CFAbsoluteTimeGetCurrent();
   const std::string tmp = path + ".tmp";
-  FILE* f = fopen(tmp.c_str(), "wb");
-  if (!f) return false;
+  int fd = open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
+  if (fd < 0) return false;
+  FILE* f = fdopen(fd, "wb");
+  if (!f) { close(fd); return false; }
 
   InkPrefixHdr hdr{kInkPrefixMagic, kInkPrefixVer, fingerprint, pos, uint32_t(S.size()),
                    use_kv8 ? 1u : 0u, has_mtp ? 1u : 0u, mtp_ctx_pos, window};

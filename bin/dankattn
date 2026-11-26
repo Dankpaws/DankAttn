@@ -69,7 +69,15 @@ model_meta() {
       M_BUILD_SCRIPT="$ROOT/inkling2/build_inkling2.sh"
       M_DEFAULT_PORT="8342"
       ;;
-    hy4|hy4-flash)
+    hy4|hy4-flash|hy4-v4)
+      M_NAME="hy4"
+      M_HF_REPO="Dankpaws/Hy4-flash-DankAttn-v4-h128-w6"
+      M_PACK_DIRNAME="pack-v4-h128-w6"
+      M_BIN="$ROOT/build/dankattn-hy4"
+      M_BUILD_SCRIPT="$ROOT/hy4/build_hy4.sh"
+      M_DEFAULT_PORT="8341"
+      ;;
+    hy4-v3)
       M_NAME="hy4"
       M_HF_REPO="Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3"
       M_PACK_DIRNAME="pack-g64-gptq-v3"
@@ -227,6 +235,8 @@ parse_serve_opts() {
   OPT_SIDE_CAP=""
   OPT_POWER=""
   OPT_IDLE_UNLOAD=""
+  OPT_ALLOW_HOSTS="${DANKATTN_ALLOW_HOSTS:-}"
+  OPT_API_KEY="${DANKATTN_API_KEY:-}"
   OPT_NO_ECO_DRAFT=0
   OPT_PULL=0
 
@@ -239,11 +249,15 @@ parse_serve_opts() {
       --side-cap)    [ $# -ge 2 ] || die "--side-cap requires a number"; OPT_SIDE_CAP="$2"; shift 2 ;;
       --power)       [ $# -ge 2 ] || die "--power requires auto|performance|eco"; OPT_POWER="$2"; shift 2 ;;
       --idle-unload) [ $# -ge 2 ] || die "--idle-unload requires seconds"; OPT_IDLE_UNLOAD="$2"; shift 2 ;;
+      --allow-host)  [ $# -ge 2 ] || die "--allow-host requires a hostname"; OPT_ALLOW_HOSTS="${OPT_ALLOW_HOSTS:+$OPT_ALLOW_HOSTS,}$2"; shift 2 ;;
+      --api-key)     [ $# -ge 2 ] || die "--api-key requires a value"; OPT_API_KEY="$2"; shift 2 ;;
       --no-eco-draft) OPT_NO_ECO_DRAFT=1; shift ;;
       --pull)        OPT_PULL=1; shift ;;
       *) die "Unknown option: $1" ;;
     esac
   done
+  if [ -n "$OPT_ALLOW_HOSTS" ]; then export DANKATTN_ALLOW_HOSTS="$OPT_ALLOW_HOSTS"; fi
+  if [ -n "$OPT_API_KEY" ]; then export DANKATTN_API_KEY="$OPT_API_KEY"; fi
 }
 
 cmd_run() {
@@ -286,13 +300,14 @@ cmd_run() {
   elif [ "$M_NAME" = "hy4" ]; then
     resolve_hy4_profile
     check_wired_limit 90112
+    idle="${OPT_IDLE_UNLOAD:-${DANKATTN_IDLE_UNLOAD:-0}}"
     say "Hardware: $chip (${ram} GB RAM) -> $P_TIER_NOTE"
-    say "Config:   port=$port cap=$P_CAP mp=$P_MP side_lanes=$P_SIDE_LANES side_cap=$P_SIDE_CAP"
-    say "Override: pass --cap/--lanes/--side-cap/--port or HY4_* env vars"
+    say "Config:   port=$port cap=$P_CAP mp=$P_MP side_lanes=$P_SIDE_LANES side_cap=$P_SIDE_CAP idle_unload=${idle}s"
+    say "Override: pass --cap/--lanes/--side-cap/--port/--idle-unload or HY4_* env vars"
     export HY4_CAP="$P_CAP" HY4_MP="$P_MP" HY4_SIDE_LANES="$P_SIDE_LANES" HY4_SIDE_CAP="$P_SIDE_CAP"
     cd "$ROOT"
     exec "$py" server/hy4_server.py \
-      --pack "$pack" --engine "$M_BIN" --port "$port" --cap "$P_CAP"
+      --pack "$pack" --engine "$M_BIN" --port "$port" --cap "$P_CAP" --idle-unload "$idle"
   else
     resolve_ernie55_profile
     check_wired_limit 90112
@@ -361,9 +376,10 @@ cmd_serve() {
       ensure_binary
       resolve_hy4_profile
       check_wired_limit 90112
+      idle="${OPT_IDLE_UNLOAD:-${DANKATTN_IDLE_UNLOAD:-0}}"
       say "Hardware: $(detect_chip) ($(detect_ram_gb) GB RAM) -> $P_TIER_NOTE"
-      say "Config:   port=$port cap=$P_CAP mp=$P_MP side_lanes=$P_SIDE_LANES side_cap=$P_SIDE_CAP"
-      export HY4_PACK="$pack" HY4_CAP="$P_CAP" HY4_MP="$P_MP" HY4_SIDE_LANES="$P_SIDE_LANES" HY4_SIDE_CAP="$P_SIDE_CAP"
+      say "Config:   port=$port cap=$P_CAP mp=$P_MP side_lanes=$P_SIDE_LANES side_cap=$P_SIDE_CAP idle_unload=${idle}s"
+      export HY4_PACK="$pack" HY4_CAP="$P_CAP" HY4_MP="$P_MP" HY4_SIDE_LANES="$P_SIDE_LANES" HY4_SIDE_CAP="$P_SIDE_CAP" DANKATTN_IDLE_UNLOAD="$idle"
     fi
     exec sh "$ROOT/hy4/serve_hy4.sh" "$action"
   else
@@ -487,7 +503,9 @@ Options for run / serve:
   --lanes <n>            Concurrent lanes / side lanes (overrides auto-size)
   --side-cap <tokens>    Side-lane suffix capacity (overrides auto-size)
   --power <mode>         auto | performance | eco (inkling2, default: auto)
-  --idle-unload <sec>    Unload engine after N idle seconds; wakes via pcache (inkling2)
+  --idle-unload <sec>    Unload engine after N idle seconds; wakes via pcache (inkling2, hy4)
+  --allow-host <host>    Allow additional Host/Origin header (for reverse proxies; repeatable; env DANKATTN_ALLOW_HOSTS)
+  --api-key <key>        Require Authorization: Bearer <key> on API routes (env DANKATTN_API_KEY)
   --no-eco-draft         Keep speed-maximizing DSpark drafts on battery (inkling2)
   --pull                 Auto-download model if missing (run only)
 

@@ -155,4 +155,23 @@ inline void check_wired_limit(size_t need_bytes, id<MTLDevice> dev) {
   }
 }
 
+inline void check_pack_filename(const std::string& fn) {
+  if (fn.empty() || fn == "." || fn == ".." || fn.find('/') != std::string::npos ||
+      fn.find('\\') != std::string::npos || fn.find("..") != std::string::npos) {
+    die(("invalid manifest filename: " + fn).c_str());
+  }
+  for (unsigned char c : fn) {
+    if (c < 0x20 || c == 0x7f) die(("invalid control char in manifest filename: " + fn).c_str());
+  }
+}
+
+inline id<MTLBuffer> checked_file(const std::vector<id<MTLBuffer>>& files, uint32_t idx,
+                                  uint64_t off, uint64_t bytes, const std::string& name) {
+  if (idx >= files.size()) die(("manifest file index out of range for " + name).c_str());
+  id<MTLBuffer> b = files[idx];
+  const uint64_t len = uint64_t(b.length);
+  if (off > len || bytes > len - off) die(("manifest tensor offset out of range for " + name).c_str());
+  return b;
+}
+
 }  // namespace mtl

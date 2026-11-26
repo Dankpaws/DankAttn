@@ -8,7 +8,7 @@ It currently targets four architectures:
 
 - **Inkling-2-Mini (`engine/inkling2/`)**: `thinkingmachines/Inkling-2-Mini` (`Inkling2LoopForConditionalGeneration`): 26.4B total / 3.4B physical active / 5.4B effective active via a 3-pass looped core (24 physical -> 48 logical layers: 40 SWA-1024 + 8 `kv8` global, native lossless NVFP4/MXFP8 MoE, DankAttn W8 attention/unembed, DSpark MTP drafter + 3-gram lookup). Fits in **32 GB Apple Silicon** (`~21.1 GB` total at 32k context; `~22.9 GB` at 128k).
 - **ERNIE-5.5-Flash-Preview (`engine/ernie55/`)**: `ERNIE-5.5-Flash-Preview` (`ernie5_5_moe`): 43 layers (37 HCA sliding-window + C128 compressed-KV layers + 6 sparse DSA `kv8` latent layers, 4-stream Sinkhorn mHC residual mixing, 512-expert top-10 MoE in W2-g32 NF2 GPTQ + W4-g64 L1 + W8-g128 dense/attention/unembed, MultiMax head, 3-gram PLD speculation). Fits **256k context** in **96 GB Apple Silicon** (`85.51 GiB` mapped weights + `2.03 GiB` GPU state).
-- **Hy4 (`engine/hy4/`)**: `tencent/Hy4-flash` (`HYV4FlashForCausalLM`): 42 layers (30 sliding-window MLA in bf16, 12 sparse DSA with `kv8` latent caches, 512-expert MoE, 4 SSD-offloaded FP8 Engram layers, and a 5-layer DFly2 drafter).
+- **Hy4 (`engine/hy4/`)**: `tencent/Hy4-flash` (`HYV4FlashForCausalLM`): 42 layers (30 sliding-window MLA in bf16, 12 sparse DSA with `kv8` latent caches, 512-expert MoE in W4g64 `gu` + W4g128/W6g128 `H128` `dn`, 4 SSD-offloaded `u4_g32` Engram layers with a 128 MB lock-free row cache, SigLIP2 vision, and a 5-layer DFly2 drafter).
 - **Flash-Next (`engine/`)**: `qwen4_exp` (GDN + sparse attention + MoE + PLE n-gram tables + MTP drafter).
 
 Everything runs directly on Apple Silicon Metal without PyTorch, MLX, or llama.cpp in the inference path. Kernels compile from source at startup with `MTLMathModeSafe` and `MTLMathFloatingPointFunctionsPrecise` so decode, verify, multi-lane batching, and speculation remain bit-identical.
@@ -59,7 +59,7 @@ Useful commands:
 - **OS & toolchain**: macOS with Metal 4.0 support and Xcode Command Line Tools (`clang++` with C++20 and Objective-C++ ARC).
 - **Memory**:
   - For **Inkling-2-Mini (`pack-inkling2-mini-w8`)**: ~19.91 GB mapped weights (including DSpark overlay) plus ~1.33 GB GPU state at `cap=32k` (~3.37 GB at `cap=128k`), fitting comfortably on a **32 GB MacBook Pro**.
-  - For **Hy4 (`pack-g64-gptq-v3`)**: ~87.3 GB mapped weights plus ~6.5 GB wired GPU state for 4 concurrent lanes (512k main slot + 3x 32k side lanes), plus fast local NVMe for the 63 GB FP8 Engram table.
+  - For **Hy4 (`pack-v4-h128-w6`)**: ~87.4 GB mapped weights plus ~6.5 GB wired GPU state for 4 concurrent lanes (512k main slot + 3x 32k side lanes), plus fast local NVMe for the 36.9 GiB `u4_g32` Engram table (~119 GB total on disk; legacy `pack-g64-gptq-v3` with 59.0 GiB FP8 Engram remains available as `hy4-v3`).
   - For **ERNIE-5.5-Flash-Preview (`pack-ernie55-w2-g32-w8attn`)**: `85.51 GiB` mapped weights plus `2.03 GiB` wired GPU state at `cap=262144` (`87.54 GiB` total; requires `iogpu.wired_limit_mb=90112` on 96 GB Apple Silicon).
 - **Wired memory limit**: macOS defaults can cap wired GPU memory below what a 90+ GB model needs. The engine checks `iogpu.wired_limit_mb` at startup and prints the exact `sysctl` command if your limit is too low:
   ```sh
@@ -67,26 +67,28 @@ Useful commands:
   ```
 - **Python (front end only)**: Python 3.11+ with the packages in `requirements.txt`.
 
-## Benchmarks (M5 Ultra, Hy4 `pack-g64-gptq-v3`)
+## Benchmarks (M5 Ultra, Hy4 `pack-v4-h128-w6`)
 
-Pre-packed weights are available on Hugging Face: [`Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3).
+Pre-packed weights are available on Hugging Face: [`Dankpaws/Hy4-flash-DankAttn-v4-h128-w6`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-v4-h128-w6) (119 GB; legacy FP8-Engram `v3` remains at [`Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3) with an optional `u4-engram` revision).
 
-Measured at 12,272-token context (`pack-g64-gptq-v3`, `kv8` on sparse layers, W4g64 GPTQ experts, W8 dense/attention projections):
+Measured on M5 Ultra (`pack-v4-h128-w6`, `kv8` on sparse layers, W4g64 `gu` + W4g128/W6g128 `H128` `dn` GPTQ experts, `u4_g32` Engram with 128 MB row cache + `F_NOCACHE` prefill fd, W8 dense/attention projections):
 
 | Workload | Result | Notes |
 | :--- | ---: | :--- |
-| Prefill (12,272 tok) | 1,700 tok/s GPU (1,694 wall) | `mmp` / `mmpg` indirect-dispatch MoE |
-| Decode 1 row | 19.08 ms GPU (52.4 tok/s) | Plain single-lane |
-| Verify 5 / 8 / 16 rows | 27.61 / 33.24 / 44.76 ms GPU | Bit-identical to 1-row decode |
-| Multi-lane decode (`btest`, 16 lanes) | 376.3 tok/s GPU (42.52 ms/step) | 7.38x over 1 lane |
-| Speculation (`ids12k`, 400 tok) | 128.1 tok/s wall | 400/400 exact greedy match |
-| Speculation (`chat_code_no_think`, 400 tok) | 116.9 tok/s wall | 400/400 exact greedy match |
-| Speculation (`edit_spec`, 400 tok) | 357.3 tok/s wall | 400/400 exact greedy match |
-| 4-lane joint speculation (`jtest`, greedy) | 199.9 tok/s wall (1.30x) | 0 tokens differ vs single-lane |
+| Prefill (12,272 tok) | **1,718 tok/s GPU** (1,711 wall) | `mmp` / `mmpg` indirect-dispatch MoE; `wht128` 3.08 ms (0.5%) |
+| Prefill (65,520 tok, `HY4_CAP=131072`) | **1,707 tok/s GPU** (**1,704 wall**) | +3.2% via dedicated `F_NOCACHE` prefill Engram fd |
+| Decode 1 row (12k / 64k) | 19.85 / 20.28 ms GPU | Plain single-lane |
+| Verify 5 / 8 / 16 rows (12k) | 28.30 / 33.74 / 44.94 ms GPU | Bit-identical to 1-row decode |
+| Verify 5 / 8 / 16 rows (64k) | 28.00 / 32.58 / 42.14 ms GPU | Bit-identical to 1-row decode |
+| Speculation (`ids12k`, 400 tok) | **157.1 tok/s wall** | 400/400 exact greedy match; 0.61 ms/rd Engram wait |
+| Speculation (`chat_code_no_think`, 400 tok) | **120.1 tok/s wall** | 400/400 exact greedy match; 0.95 ms/rd Engram wait |
+| Speculation (`edit_spec`, 400 tok) | **358.7 tok/s wall** | 400/400 exact greedy match; 0.72 ms/rd Engram wait |
+| Speculation (`qa_doc`, 400 tok) | **163.7 tok/s wall** | 400/400 exact greedy match; 0.58 ms/rd Engram wait |
+| 4-lane joint speculation (`jtest`, greedy) | **211.3 tok/s wall** (`1.41x`) | 0 tokens differ vs single-lane |
 | Wired GPU state (512k + 3x 32k lanes) | 6.49 GB | Phase-aliased `MTLHeap` scratch |
 | Cold shader-compile startup | 0.7 - 1.0 s | `MTLLibrary` cache in `mtl.h` |
 
-Quality of `pack-g64-gptq-v3` against the bf16 reference: `wikitext-2` (24x 512-token cold-start chunks) KL `0.287` / top-1 `81.9%`; `-28.8%` held-out KL vs uncalibrated RTN (`calib2048` single-document KL `~0.103`); `kv8` vs bf16 KV cache `97.4% - 98.4%` top-1.
+Quality of `pack-v4-h128-w6` against the bf16 reference: `wikitext-2` (24x 512-token cold-start chunks) KL `0.293` (median `0.071`) / top-1 `81.9%` (parity with `v3`'s `0.287` / `81.9%`); `ids96` KL `0.0481` / `92.7%` top-1; `calib2048` KL `0.0730` / `89.9%` top-1.
 
 See [hy4/ARCHITECTURE_AND_PERF.md](hy4/ARCHITECTURE_AND_PERF.md) for per-op profiles, optimization history, and experiments that were tested and rejected.
 

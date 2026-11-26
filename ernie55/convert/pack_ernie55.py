@@ -126,7 +126,7 @@ def main():
         else:
             w2_gs32.add(int(part))
     w2_bits_tag = 2 if args.w2_mode == "nf2" else 20  # mm2.metal WBITS=2 (NF2) or 20 (SYM2)
-    gptq_cal = torch.load(args.gptq, map_location="cpu")["layers"] if args.gptq else None
+    gptq_cal = torch.load(args.gptq, map_location="cpu", weights_only=True)["layers"] if args.gptq else None
 
     W = P.Writer(args.out)
 

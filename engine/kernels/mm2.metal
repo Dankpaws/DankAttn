@@ -572,6 +572,15 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       const uint live = a.rm ? rmask[tg.z * 4 + t] : 0xFFFFu;
 #if EPI == 3
       epi3_regs(acc[t], nb, Mloc[t], row0 + 16 * t, n0, m0, E0, a, live);
+#elif EPI == 5
+      for (int i = 0; i < 16; i++) {
+        const uint m = m0 + 8 * ((i >> 2) & 1), n = nb + n0 + (i & 3) + 16 * (i >> 3);
+        if (m < Mloc[t] && ((live >> m) & 1u)) {
+          const uint col = tg.z * a.N + n;
+          const float gv = E1[size_t(row0 + 16 * t + m) * a.H + a.HC + col];
+          E0[frag_off(row0 + 16 * t + m, col, a.R)] = bfloat(acc[t][i] * esigm(gv));
+        }
+      }
 #else
       device float* Yt = Y + size_t(t) * 16 * a.N;
       for (int i = 0; i < 16; i++) {
@@ -580,8 +589,6 @@ kernel void mm2(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       }
 #if EPI == 4
       epilogue(Yt, a.N, nb, Mloc[t], row0 + 16 * t, l, E0, E1, E2, a, live, e3_buf, e4_buf, e5_buf);
-#elif EPI == 5
-      epilogue(Yt, a.N, nb, Mloc[t], row0 + 16 * t, l, E0, E1, E2, a, live, tg.z);
 #else
       epilogue(Yt, a.N, nb, Mloc[t], row0 + 16 * t, l, E0, E1, E2, a, live);
 #endif
@@ -1351,10 +1358,19 @@ static inline float mm1_situ(float g, float u, float beta, float lbeta) {
   return ga * ua;
 }
 
+static inline float mm1_h4_swiglu(float g, float u) {
+#ifdef SWIGLU_LIMIT
+  return xsilu(min(g, float(SWIGLU_LIMIT))) * clamp(u, -float(SWIGLU_LIMIT), float(SWIGLU_LIMIT));
+#else
+  return xsilu(g) * u;
+#endif
+}
+
 // ==================================================================
 // mm1: Dedicated M=1 SIMD matvec directly on register-direct W2/W4/W8 weights
 // and row-0 bf16 frags. Zero matmul2d padding, zero mmpart/atomics, 100% coalesced!
-// FUSE: 0=plain f32 Y, 1=wo_a gate*sigm + bf16 frag_a, 2=moe_gu SiTU-GLU + bf16 frag_b.
+// FUSE: 0=plain f32 Y, 1=wo_a/vb gate*sigm + bf16 frag_a, 2=moe_gu SiTU-GLU + bf16 frag_b,
+//       3=Hy4 SwiGLU (+ optional SWIGLU_LIMIT) + bf16 frag.
 // Grid: (N / 32 / nft, 1, grouped ? nz : 1), TG: (32 * sgs * nft, 1, 1).
 // ==================================================================
 kernel void mm1(device const WLOAD* W [[buffer(0)]], device const half* S [[buffer(1)]],
@@ -1365,10 +1381,16 @@ kernel void mm1(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
 #elif defined(FUSE) && FUSE == 2
                 constant float2& situ_p [[buffer(6)]],
 #endif
+#ifdef MM1_GATED
+                device const uint* nslots [[buffer(7)]],
+#endif
                 uint3 tg [[threadgroup_position_in_grid]],
                 ushort sg [[simdgroup_index_in_threadgroup]],
                 ushort l [[thread_index_in_simdgroup]],
                 ushort sgs_tg [[simdgroups_per_threadgroup]]) {
+#ifdef MM1_GATED
+  if (tg.z >= nslots[0]) return;
+#endif
   threadgroup float sh[32][32]; // up to sgs*nft=32 (4 KB)
   const uint nft = sgs_tg / a.sgs;
   const uint fi = sg / a.sgs;
@@ -1472,6 +1494,44 @@ kernel void mm1(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       acc3 = fma(c3, s3, acc3);
     }
   }
+#elif WBITS == 4
+  // Continuous cross-group software-pipelined W4 matvec
+  if (gper > 0u) {
+    uint4 v0 = Wp[size_t(ks0) * 32u];
+    const uint ks_end = ks0 + gper * KPG;
+    auto dec4_lo = [](uint w) -> float4 {
+      return float4(int(w & 15u) - 8, int((w >> 8) & 15u) - 8, int((w >> 16) & 15u) - 8, int((w >> 24) & 15u) - 8);
+    };
+    auto dec4_hi = [](uint w) -> float4 {
+      return float4(int((w >> 4) & 15u) - 8, int((w >> 12) & 15u) - 8, int((w >> 20) & 15u) - 8, int((w >> 28) & 15u) - 8);
+    };
+    for (uint g = 0; g < gper; g++) {
+      float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+      const uint ks_g = ks0 + g * KPG;
+      device const half* sp = Sp + (g0 + g) * 32u;
+      float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+#pragma clang loop unroll(full)
+      for (uint u = 0; u < KPG; u++) {
+        const uint ks = ks_g + u;
+        uint4 nv0;
+        if (ks + 1u < ks_end) nv0 = Wp[size_t(ks + 1u) * 32u];
+        if (u == KPG - 1u) {
+          s0 = float(sp[n_base + 0u]); s1 = float(sp[n_base + 8u]);
+          s2 = float(sp[n_base + 16u]); s3 = float(sp[n_base + 24u]);
+        }
+        device const bfloat* xp = Xbf + size_t(ks) * 512u + l_x * 16u;
+        const float4 x0 = float4(*(device const bfloat4*)(xp));
+        const float4 x1 = float4(*(device const bfloat4*)(xp + 8u));
+        c0 += dot(dec4_lo(v0.x), x0) + dot(dec4_lo(v0.z), x1);
+        c1 += dot(dec4_hi(v0.x), x0) + dot(dec4_hi(v0.z), x1);
+        c2 += dot(dec4_lo(v0.y), x0) + dot(dec4_lo(v0.w), x1);
+        c3 += dot(dec4_hi(v0.y), x0) + dot(dec4_hi(v0.w), x1);
+        if (ks + 1u < ks_end) v0 = nv0;
+      }
+      acc0 = fma(c0, s0, acc0); acc1 = fma(c1, s1, acc1);
+      acc2 = fma(c2, s2, acc2); acc3 = fma(c3, s3, acc3);
+    }
+  }
 #else
   for (uint g = 0; g < gper; g++) {
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
@@ -1533,6 +1593,15 @@ kernel void mm1(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       const uint c0_i = nf * 16u + n_base;
       Ybf[mm1_frag_off_m0(c0_i + 0u)] = bfloat(mm1_situ(acc0, acc2, situ_p.x, situ_p.y));
       Ybf[mm1_frag_off_m0(c0_i + 8u)] = bfloat(mm1_situ(acc1, acc3, situ_p.x, situ_p.y));
+#elif defined(FUSE) && FUSE == 3
+      device bfloat* Ybf = (device bfloat*)Y
+#ifdef GROUPED
+          + size_t(z) * a.ystride
+#endif
+          ;
+      const uint c0_i = nf * 16u + n_base;
+      Ybf[mm1_frag_off_m0(c0_i + 0u)] = bfloat(mm1_h4_swiglu(acc0, acc2));
+      Ybf[mm1_frag_off_m0(c0_i + 8u)] = bfloat(mm1_h4_swiglu(acc1, acc3));
 #else
       device float* Yo = Y + nf * 32u;
       Yo[n_base + 0u] = acc0;
@@ -1565,6 +1634,16 @@ kernel void mm1(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
   if (l < 16u) {
     device bfloat* Ybf = (device bfloat*)Y + size_t(z) * a.ystride;
     Ybf[mm1_frag_off_m0(nf * 16u + l)] = bfloat(mm1_situ(sum, uv, situ_p.x, situ_p.y));
+  }
+#elif defined(FUSE) && FUSE == 3
+  const float uv = simd_shuffle_xor(sum, 16);
+  if (l < 16u) {
+    device bfloat* Ybf = (device bfloat*)Y
+#ifdef GROUPED
+        + size_t(z) * a.ystride
+#endif
+        ;
+    Ybf[mm1_frag_off_m0(nf * 16u + l)] = bfloat(mm1_h4_swiglu(sum, uv));
   }
 #else
   Y[nf * 32u + l] = sum;

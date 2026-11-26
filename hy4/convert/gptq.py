@@ -39,11 +39,11 @@ def prepare_hinv(H: torch.Tensor, damp: float = 0.01):
 
 def _group_scale(w_blk: torch.Tensor, bits: int, clip: bool, imp_blk: torch.Tensor | None):
     """Importance-weighted clip-searched f16 group scale matching convert/pack.py."""
-    qmax, qmin = (7, -8) if bits == 4 else (127, -128)
+    qmax, qmin = (1 << (bits - 1)) - 1, -(1 << (bits - 1))
     amax = w_blk.abs().amax(-1).clamp_min(1e-12)
     best = amax / qmax
     if clip:
-        clips = P.CLIPS_V1 if bits == 4 else P.CLIPS_V1_W8
+        clips = P.CLIPS_V1 if bits <= 4 else P.CLIPS_V1_W8
         berr = None
         for r in clips:
             s = (amax * r / qmax).half().float()
@@ -76,7 +76,7 @@ def gptq_quant(
     Returns (q int8 [N, K], scales f32 [N, K // gs]).
     """
     N, K = w.shape
-    qmax, qmin = (7, -8) if bits == 4 else (127, -128)
+    qmax, qmin = (1 << (bits - 1)) - 1, -(1 << (bits - 1))
     if Hinv is None:
         assert H is not None, "gptq_quant needs H or precomputed Hinv"
         Hinv, hdiag = prepare_hinv(H, damp=damp)

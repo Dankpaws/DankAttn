@@ -196,7 +196,9 @@ Model::Model(const std::string& pack_dir, uint32_t capacity, const Model* share)
     if (!rs) mtl::die("residency set", e);
   }
   for (NSString* f in man[@"files"]) {
-    std::string p = dir + "/" + [f UTF8String];
+    std::string fn = [f UTF8String];
+    mtl::check_pack_filename(fn);
+    std::string p = dir + "/" + fn;
     int fd = open(p.c_str(), O_RDONLY);
     if (fd < 0) mtl::die(("open " + p).c_str());
     struct stat st;
@@ -235,10 +237,10 @@ Model::Model(const std::string& pack_dir, uint32_t capacity, const Model* share)
     NSDictionary* t = T[@(name.c_str())];
     if (!t) mtl::die(("missing tensor " + name).c_str());
     Lin l;
-    l.w = files[[t[@"file"] unsignedIntValue]];
     l.woff = [t[@"off"] unsignedLongLongValue];
-    l.s = files[[t[@"sfile"] unsignedIntValue]];
+    l.w = mtl::checked_file(files, [t[@"file"] unsignedIntValue], l.woff, 0, name);
     l.soff = [t[@"soff"] unsignedLongLongValue];
+    l.s = mtl::checked_file(files, [t[@"sfile"] unsignedIntValue], l.soff, 0, name + ".scales");
     l.N = [t[@"N"] unsignedIntValue];
     l.K = [t[@"K"] unsignedIntValue];
     l.bits = [t[@"bits"] unsignedIntValue];
@@ -253,9 +255,9 @@ Model::Model(const std::string& pack_dir, uint32_t capacity, const Model* share)
     NSDictionary* t = T[@(name.c_str())];
     if (!t) mtl::die(("missing tensor " + name).c_str());
     Raw r;
-    r.b = files[[t[@"file"] unsignedIntValue]];
     r.off = [t[@"off"] unsignedLongLongValue];
     r.bytes = [t[@"bytes"] unsignedLongLongValue];
+    r.b = mtl::checked_file(files, [t[@"file"] unsignedIntValue], r.off, r.bytes, name);
     return r;
   };
   NSArray* lt = cfg[@"layer_types"];

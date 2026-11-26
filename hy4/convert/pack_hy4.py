@@ -57,30 +57,51 @@ def main(src, out, stats=None):
     cfg = json.load(open(os.path.join(src, "config.json")))
     tc = cfg["text_config"]
     if stats:
-        P.IMP = torch.load(stats)
+        P.IMP = torch.load(stats, weights_only=True)
         print("importance stats:", len(P.IMP["s"]), "sets", flush=True)
     gptq_path = os.environ.get("HY4_GPTQ")
     gptq_cal = None
     gptq_mode = os.environ.get("HY4_GPTQ_MODE", "both")
     gptq_damp = float(os.environ.get("HY4_GPTQ_DAMP", "0.01"))
     gptq_damp_dn = float(os.environ.get("HY4_GPTQ_DAMP_DN", "0.05"))
+    moe_dn_had = int(os.environ.get("HY4_MOE_DN_HAD", "0"))
+    assert moe_dn_had in (0, 128), f"HY4_MOE_DN_HAD must be 0 or 128, got {moe_dn_had}"
+    H128 = None
+    if moe_dn_had == 128:
+        H128 = torch.tensor([[1.0]], dtype=torch.float32)
+        while H128.shape[0] < 128:
+            H128 = torch.cat([torch.cat([H128, H128], 1), torch.cat([H128, -H128], 1)], 0)
+        H128 = H128 * (1.0 / math.sqrt(128.0))
+        print("moe.dn block-128 Hadamard rotation enabled", flush=True)
+
+    def had128_right(w):
+        s = w.shape
+        return (w.view(*s[:-1], s[-1] // 128, 128) @ H128).reshape(s)
+
+    def had128_hess(H):
+        nb = H.shape[0] // 128
+        t = H.view(nb, 128, nb, 128)
+        t = torch.einsum("ij,ajbk->aibk", H128, t)
+        t = torch.einsum("aibk,kl->aibl", t, H128)
+        return t.reshape(H.shape)
+
     if gptq_path:
-        gptq_cal = torch.load(gptq_path, map_location="cpu")["layers"]
+        gptq_cal = torch.load(gptq_path, map_location="cpu", weights_only=True)["layers"]
         print(f"GPTQ calib: {gptq_path} ({len(gptq_cal)} MoE layers, mode={gptq_mode}, damp={gptq_damp}/{gptq_damp_dn})", flush=True)
 
-    def pack_experts_gptq(layer_idx, d_pfx, gu3, dn3, bits, gs):
-        """Pack routed experts (moe.gu, moe.dn) with GPTQ. Returns (rel_gu, rel_dn)."""
+    def pack_experts_gptq(layer_idx, d_pfx, gu3, dn3, gu_bits, gu_gs, dn_bits, dn_gs):
+        """Pack routed experts (moe.gu, moe.dn) with GPTQ (+ optional H128 on moe.dn). Returns (rel_gu, rel_dn)."""
         E_, N_gu, K_gu = gu3.shape
         _, N_dn, K_dn = dn3.shape
         I_ = N_gu // 2
-        cb_gu = N_gu * K_gu * bits // 8
-        cb_dn = N_dn * K_dn * bits // 8
+        cb_gu = N_gu * K_gu * gu_bits // 8
+        cb_dn = N_dn * K_dn * dn_bits // 8
         cal = gptq_cal[layer_idx]
         Hinv_gu, hdiag_gu = GQ.prepare_hinv(cal["H_gu"], damp=gptq_damp)
         do_dn = gptq_mode == "both" and "lat" in cal and "top" in cal
         cal_lat = cal["lat"].float() if do_dn else None
         cal_top = cal["top"].long() if do_dn else None
-        imp_dn_all = P.importance(d_pfx + ".moe.dn", K_dn, experts=E_)
+        imp_dn_all = P.importance(d_pfx + ".moe.dn", K_dn, experts=E_) if moe_dn_had == 0 else None
         limit = tc["swiglu_limit"]
 
         # 1. Quantize + pack moe.gu in chunks of 16 experts (shares Hinv_gu across the chunk)
@@ -93,11 +114,11 @@ def main(src, out, stats=None):
         for e0 in range(0, E_, chunk):
             ce = min(chunk, E_ - e0)
             w = gu3[e0:e0 + ce].float().reshape(-1, K_gu)
-            q, s = GQ.gptq_quant(w, bits=bits, gs=gs, clip=True, Hinv=Hinv_gu, hdiag=hdiag_gu)
-            f, o = W.put(pack_codes(q.numpy(), bits).tobytes())
+            q, s = GQ.gptq_quant(w, bits=gu_bits, gs=gu_gs, clip=True, Hinv=Hinv_gu, hdiag=hdiag_gu)
+            f, o = W.put(pack_codes(q.numpy(), gu_bits).tobytes())
             first_gu = (f, o) if first_gu is None else first_gu
             scs_gu.append(pack_scales(s.numpy()))
-            wq = (q.float().reshape(-1, K_gu // gs, gs) * s[..., None]).reshape(-1, K_gu)
+            wq = (q.float().reshape(-1, K_gu // gu_gs, gu_gs) * s[..., None]).reshape(-1, K_gu)
             err = wq - w
             num_gu += float(err.pow(2).sum())
             den_gu += float(w.pow(2).sum())
@@ -107,14 +128,15 @@ def main(src, out, stats=None):
                     wgu_deq[e0 + j] = wq3[j].half()
         sc_gu = np.concatenate(scs_gu)
         fs, os_ = W.put(sc_gu.tobytes())
-        W.tensors[d_pfx + ".moe.gu"] = dict(kind="w", N=N_gu, K=K_gu, bits=bits, gs=gs, experts=E_,
+        W.tensors[d_pfx + ".moe.gu"] = dict(kind="w", N=N_gu, K=K_gu, bits=gu_bits, gs=gu_gs, experts=E_,
                                             file=first_gu[0], off=first_gu[1], bytes=E_ * cb_gu,
                                             sfile=fs, soff=os_, sbytes=sc_gu.nbytes, rows={})
         rel_gu = num_gu / max(den_gu, 1e-30)
 
-        # 2. Quantize + pack moe.dn (sequential GPTQ if do_dn, else RTN)
+        # 2. Quantize + pack moe.dn (sequential GPTQ if do_dn, else RTN; optional H128 rotation)
         if not do_dn:
-            rel_dn = W.linear_experts(d_pfx + ".moe.dn", dn3, bits, gs)
+            dn_in = had128_right(dn3.float()).bfloat16() if moe_dn_had == 128 else dn3
+            rel_dn = W.linear_experts(d_pfx + ".moe.dn", dn_in, dn_bits, dn_gs)
             return rel_gu, rel_dn
         if W.cur is None or W.size + E_ * cb_dn + P.PAGE > W.max_file:
             W._open()
@@ -126,6 +148,8 @@ def main(src, out, stats=None):
             for j in range(ce):
                 e = e0 + j
                 w = dn3[e].float()
+                if moe_dn_had == 128:
+                    w = had128_right(w)
                 crows, _ = torch.where(cal_top == e)
                 if crows.numel() >= 8:
                     # wgu_deq[e] has rows interleaved by 16: [16 gate | 16 up] per block
@@ -135,24 +159,26 @@ def main(src, out, stats=None):
                     cu = cgu_v[:, :, 1, :].reshape(-1, I_).clamp(-limit, limit)
                     ca = torch.nn.functional.silu(cg) * cu
                     H_dn = (ca.double().T @ ca.double()) / crows.numel()
-                    q, s = GQ.gptq_quant(w, H=H_dn, bits=bits, gs=gs, damp=gptq_damp_dn, clip=True)
+                    if moe_dn_had == 128:
+                        H_dn = had128_hess(H_dn.float())
+                    q, s = GQ.gptq_quant(w, H=H_dn, bits=dn_bits, gs=dn_gs, damp=gptq_damp_dn, clip=True)
                 else:
                     imp = None if imp_dn_all is None else imp_dn_all[e]
-                    q, s = P.tquant(w, bits, gs, clip=True, imp=imp)
+                    q, s = P.tquant(w, dn_bits, dn_gs, clip=True, imp=imp)
                 wgu_deq[e] = None
                 qs.append(q)
                 ss.append(s)
-                err = (q.float().reshape(N_dn, K_dn // gs, gs) * s[..., None]).reshape(N_dn, K_dn) - w
+                err = (q.float().reshape(N_dn, K_dn // dn_gs, dn_gs) * s[..., None]).reshape(N_dn, K_dn) - w
                 num_dn += float(err.pow(2).sum())
                 den_dn += float(w.pow(2).sum())
             q_cat = torch.cat(qs, 0)
             s_cat = torch.cat(ss, 0)
-            f, o = W.put(pack_codes(q_cat.numpy(), bits).tobytes())
+            f, o = W.put(pack_codes(q_cat.numpy(), dn_bits).tobytes())
             first_dn = (f, o) if first_dn is None else first_dn
             scs_dn.append(pack_scales(s_cat.numpy()))
         sc_dn = np.concatenate(scs_dn)
         fs, os_ = W.put(sc_dn.tobytes())
-        W.tensors[d_pfx + ".moe.dn"] = dict(kind="w", N=N_dn, K=K_dn, bits=bits, gs=gs, experts=E_,
+        W.tensors[d_pfx + ".moe.dn"] = dict(kind="w", N=N_dn, K=K_dn, bits=dn_bits, gs=dn_gs, experts=E_,
                                             file=first_dn[0], off=first_dn[1], bytes=E_ * cb_dn,
                                             sfile=fs, soff=os_, sbytes=sc_dn.nbytes, rows={})
         return rel_gu, num_dn / max(den_dn, 1e-30)
@@ -174,6 +200,9 @@ def main(src, out, stats=None):
     nope, rope, vd, kvr = tc["qk_nope_head_dim"], tc["qk_rope_head_dim"], tc["v_head_dim"], tc["kv_lora_rank"]
     ebits = int(os.environ.get("HY4_EXPERT_BITS", "4"))
     egs = int(os.environ.get("HY4_EXPERT_GS", "128"))
+    dn_bits_def = int(os.environ.get("HY4_DN_BITS", str(ebits)))
+    dn_gs_def = int(os.environ.get("HY4_DN_GS", str(egs)))
+    dn_w6_layers = {int(x) for x in os.environ.get("HY4_DN_W6_LAYERS", "").split(",") if x.strip()}
     dbits = int(os.environ.get("HY4_DENSE_BITS", "8"))
     gbits = int(os.environ.get("HY4_GATE_BITS", str(dbits)))
     obits = int(os.environ.get("HY4_O_BITS", str(dbits)))
@@ -258,11 +287,14 @@ def main(src, out, stats=None):
             W.raw(d + ".moe.bias", T(m + "gate.e_score_correction_bias").numpy())
             gu3 = T(m + "experts.gate_up_proj", torch.bfloat16)[:, P.gu_rows(I)]
             dn3 = T(m + "experts.down_proj", torch.bfloat16)
+            dn_b = 6 if L in dn_w6_layers else dn_bits_def
+            dn_g = 128 if L in dn_w6_layers else dn_gs_def
             if gptq_cal is not None and L in gptq_cal:
-                rel[d + ".moe.gu"], rel[d + ".moe.dn"] = pack_experts_gptq(L, d, gu3, dn3, ebits, egs)
+                rel[d + ".moe.gu"], rel[d + ".moe.dn"] = pack_experts_gptq(L, d, gu3, dn3, ebits, egs, dn_b, dn_g)
             else:
                 rel[d + ".moe.gu"] = W.linear_experts(d + ".moe.gu", gu3, ebits, egs)
-                rel[d + ".moe.dn"] = W.linear_experts(d + ".moe.dn", dn3, ebits, egs)
+                dn_in = had128_right(dn3.float()).bfloat16() if moe_dn_had == 128 else dn3
+                rel[d + ".moe.dn"] = W.linear_experts(d + ".moe.dn", dn_in, dn_b, dn_g)
             del gu3, dn3
             mo = torch.cat([T(m + "routed_expert_up_proj.weight"), T(m + "shared_experts.down_proj.weight")], 1)
             if P.IMP is not None and (d + ".moe.lup") in P.IMP["s"]:
@@ -298,10 +330,14 @@ def main(src, out, stats=None):
     lin("lm_head", T("lm_head.weight"), bits=lm_bits, imp="lm_head")
     W.close()
     qdesc = f"GPTQ({gptq_mode})" if gptq_cal is not None else "importance-weighted clip search"
+    layout_meta = {"gu": "gate_up_interleaved_16", "moe_out": "routed_up|shared_down along K"}
+    if moe_dn_had:
+        layout_meta["moe_dn_had"] = moe_dn_had
+    dn_desc = f"dn W{dn_bits_def}g{dn_gs_def}" + (f"+W6g128@{sorted(dn_w6_layers)}" if dn_w6_layers else "") + (f" H{moe_dn_had}" if moe_dn_had else "")
     man = dict(format="opus-hy4-pack-v0", source=dict(repo="tencent/Hy4-flash", revision="d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"),
-               precision=f"experts W{ebits}g{egs} {qdesc}; attn gate W{gbits}, o W{obits}; dense W{dbits}g128; lm_head W{lm_bits}; embed bf16; vectors f32",
+               precision=f"experts gu W{ebits}g{egs} {dn_desc} {qdesc}; attn gate W{gbits}, o W{obits}; dense W{dbits}g128; lm_head W{lm_bits}; embed bf16; vectors f32",
                config=tc, files=W.files, tensors=W.tensors, rel_mse=rel, engram=eng_meta,
-               layout={"gu": "gate_up_interleaved_16", "moe_out": "routed_up|shared_down along K"})
+               layout=layout_meta)
     json.dump(man, open(os.path.join(out, "manifest.json"), "w"), indent=1)
     print("done", time.time() - t0, "s")
 

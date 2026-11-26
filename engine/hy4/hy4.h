@@ -4,6 +4,7 @@
 #pragma once
 #include "../mtl.h"
 #include "config.h"
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -17,6 +18,35 @@
 namespace hy4 {
 
 constexpr uint32_t MAXM = 16;     // rows of a decode / verify step (mm2); more rows go through mmp / mmpg
+
+// Fan-out-aware expected-tok/ms draft length selector (exactness-preserving: only trims k in 0..max_k).
+// Models Hy4's 512-expert top-16 MoE verify cost T(M) = t0 + c_moe * (1 - (496/512)^M) + t_draft
+// fitted to M5 Ultra 12k measurements (1/5/8/16 rows: 19.08/27.61/33.26/44.76 ms, draft 3.22 ms).
+// Set HY4_DRAFT_ADAPT=0 to keep the legacy cumulative draft_cut length max_k.
+inline size_t select_draft_k(const std::vector<float>& probs, size_t max_k, uint32_t active_lanes = 1) {
+  const size_t lim = std::min(max_k, probs.size());
+  if (!cfg().draft_adapt || lim == 0) return lim;
+  constexpr double kMiss = 496.0 / 512.0;  // 31/32
+  const double t0 = 16.9;
+  const double c_moe = 70.0 / (active_lanes > 1 ? (1.0 + 0.35 * double(active_lanes - 1)) : 1.0);
+  const double t_draft = 3.22 / double(active_lanes > 0 ? active_lanes : 1);
+  const double p_scale = cfg().draft_pscale;
+  double best_rate = 1.0 / (t_draft + t0 + c_moe * (1.0 - kMiss));
+  size_t best_k = 0;
+  double cum_p = 1.0, exp_tok = 1.0, miss = kMiss;
+  for (size_t k = 0; k < lim; k++) {
+    const double pk = std::min(1.0, std::max(0.0, double(probs[k]) * p_scale));
+    cum_p *= pk;
+    exp_tok += cum_p;
+    miss *= kMiss;
+    const double rate = exp_tok / (t_draft + t0 + c_moe * (1.0 - miss));
+    if (rate > best_rate) {
+      best_rate = rate;
+      best_k = k + 1;
+    }
+  }
+  return best_k;
+}
 constexpr uint32_t RING = 4096;   // sliding-window latent ring (window 512 + a prefill chunk + rollback slack)
 constexpr uint32_t SELMAX = 2048; // tokens a sparse layer attends past the dense range
 constexpr uint32_t TOKR = 4096;   // indexer token-key ring (positions); kernels/hy4.metal TOKR
@@ -94,11 +124,12 @@ struct Model {
   std::vector<Layer> L;
   Raw embed, hch_fn, hch_base, hch_scale, norm;
   Lin lm_head;
-  // Engram table (fp8 rows of 96), mapped from the pack or a GGUF
+  // Engram table (fp8 or u4_g32 rows of 96), mapped from the pack or a GGUF
   const uint8_t* eng_tab = nullptr;
   size_t eng_rows = 0;
-  uint32_t eng_dim = 96, n_eng = 0;
-  int eng_fd = -1;
+  uint32_t eng_dim = 96, eng_row_bytes = 96, n_eng = 0, moe_dn_had = 0;
+  bool eng_q4 = false;
+  int eng_fd = -1, eng_fd_pf = -1;
   size_t eng_off = 0;  // byte offset of row 0 in the table file
   // Pages of the table this process read lately (2 s epoch of the last read per 16 KB page, 0 never): in decode
   // and verify steps their rows are copied from the mapping on the calling thread (~0.01 us a row) instead of a
@@ -106,6 +137,13 @@ struct Model {
   // through the pool. Pages older than ~8 s may have been evicted and go through pread. HY4_ENG_WARM=0 off.
   std::unique_ptr<std::atomic<uint8_t>[]> eng_seen;
   bool eng_warm = cfg().eng_warm;
+  // Userspace lock-free direct-mapped Engram row cache (seqlock per slot, 0 = disabled via HY4_ENG_CACHE_MB=0).
+  // Stride is 68 B for u4_g32 (seq + row + 60 B) or 104 B for fp8 (seq + row + 96 B).
+  std::unique_ptr<uint8_t[]> eng_cache_buf;
+  size_t eng_cache_mask = 0;    // (power-of-2 slots) - 1; 0 when disabled
+  size_t eng_cache_stride = 0;
+  bool eng_cache_get(uint64_t row, uint8_t* dst) const;
+  void eng_cache_put(uint64_t row, const uint8_t* src);
   // Prefill: the next chunk's rows are fetched while the GPU runs this one. A caller that knows the next
   // chunk sets next_hint before step(); the step after uses the prefetched rows if its tokens match.
   std::vector<uint32_t> next_hint;
@@ -309,7 +347,7 @@ struct Model {
   void mm(Rec& rc, const char* tag, const Lin& w, id<MTLBuffer> X, id<MTLBuffer> Y, uint32_t M,
           id<MTLBuffer> slots = nil, id<MTLBuffer> nslots = nil, uint32_t nz = 0, uint32_t xstride = 0,
           uint32_t ystride = 0, bool epi3 = false, id<MTLBuffer> e0 = nil, uint32_t epiR = 0, uint32_t ldx = 1,
-          bool rm = false, bool barrier = true);
+          bool rm = false, bool barrier = true, id<MTLBuffer> e1 = nil);
   void engram_rows(uint32_t M, const uint32_t* toks);
   // row ids of tokens ctx[p0 .. p0 + M) (ctx holds every earlier token too), fetched into dst / live
   // engram layer slots [s0, s1) only (live may be null: rows' pad flags already written)

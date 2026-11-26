@@ -1,13 +1,18 @@
 // DankAttn (ERNIE-5.5): Metal 4 engine implementation.
 #include "ernie55.h"
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <chrono>
+
+extern char** environ;
 
 namespace ernie55 {
 
@@ -15,44 +20,79 @@ static bool is_http(const std::string& s) {
   return s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0;
 }
 
+static FILE* spawn_curl(const std::vector<std::string>& args, pid_t& out_pid) {
+  int pfd[2];
+  if (pipe(pfd) != 0) mtl::die("pipe for curl");
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addclose(&fa, pfd[0]);
+  posix_spawn_file_actions_adddup2(&fa, pfd[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addclose(&fa, pfd[1]);
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  int rc = posix_spawn(&pid, "/usr/bin/curl", &fa, nullptr, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(pfd[1]);
+  if (rc != 0) {
+    close(pfd[0]);
+    mtl::die("posix_spawn /usr/bin/curl");
+  }
+  FILE* fp = fdopen(pfd[0], "r");
+  if (!fp) {
+    close(pfd[0]);
+    waitpid(pid, nullptr, 0);
+    mtl::die("fdopen curl pipe");
+  }
+  out_pid = pid;
+  return fp;
+}
+
+static int finish_curl(FILE* fp, pid_t pid) {
+  fclose(fp);
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
 static std::string http_get_string(const std::string& url) {
-  std::string cmd = "curl -fsSL '" + url + "'";
-  FILE* fp = popen(cmd.c_str(), "r");
-  if (!fp) mtl::die(("popen curl " + url).c_str());
+  pid_t pid = 0;
+  FILE* fp = spawn_curl({"curl", "-fsSL", "--", url}, pid);
   std::string out;
   char buf[65536];
   size_t n;
   while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) out.append(buf, n);
-  int rc = pclose(fp);
-  if (rc != 0) mtl::die(("curl failed " + url).c_str());
+  if (finish_curl(fp, pid) != 0) mtl::die(("curl failed " + url).c_str());
   return out;
 }
 
 static id<MTLBuffer> http_get_buffer(id<MTLDevice> dev, const std::string& url, size_t& out_len) {
-  // Query Content-Length via HEAD
-  std::string hcmd = "curl -fsSI '" + url + "' | grep -i '^content-length:' | awk '{print $2}' | tr -d '\\r\\n'";
-  FILE* hfp = popen(hcmd.c_str(), "r");
-  if (!hfp) mtl::die(("curl HEAD " + url).c_str());
-  char lbuf[64] = {};
-  fgets(lbuf, sizeof(lbuf), hfp);
-  pclose(hfp);
-  size_t sz = strtoull(lbuf, nullptr, 10);
-  if (sz == 0) mtl::die(("zero content-length for " + url).c_str());
+  // Query Content-Length via HEAD without invoking a shell
+  pid_t hpid = 0;
+  FILE* hfp = spawn_curl({"curl", "-fsSIL", "--", url}, hpid);
+  size_t sz = 0;
+  char lbuf[1024];
+  while (fgets(lbuf, sizeof(lbuf), hfp)) {
+    if (strncasecmp(lbuf, "content-length:", 15) == 0) {
+      sz = strtoull(lbuf + 15, nullptr, 10);
+    }
+  }
+  if (finish_curl(hfp, hpid) != 0 || sz == 0) mtl::die(("zero content-length for " + url).c_str());
   size_t aligned = (sz + 16383) & ~size_t(16383);
   id<MTLBuffer> b = [dev newBufferWithLength:aligned options:MTLResourceStorageModeShared];
   if (!b) mtl::die(("alloc buffer for " + url).c_str());
   uint8_t* dst = (uint8_t*)[b contents];
-  std::string cmd = "curl -fsSL '" + url + "'";
-  FILE* fp = popen(cmd.c_str(), "r");
-  if (!fp) mtl::die(("curl GET " + url).c_str());
+  pid_t pid = 0;
+  FILE* fp = spawn_curl({"curl", "-fsSL", "--", url}, pid);
   size_t got = 0;
   while (got < sz) {
     size_t n = fread(dst + got, 1, std::min<size_t>(1 << 20, sz - got), fp);
     if (n == 0) break;
     got += n;
   }
-  int rc = pclose(fp);
-  if (rc != 0 || got != sz) mtl::die(("short read " + url).c_str());
+  if (finish_curl(fp, pid) != 0 || got != sz) mtl::die(("short read " + url).c_str());
   out_len = aligned;
   return b;
 }
@@ -142,6 +182,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   uint32_t fi = 0;
   for (NSString* f in flist) {
     std::string fn = [f UTF8String];
+    mtl::check_pack_filename(fn);
     size_t len = 0;
     id<MTLBuffer> b = nil;
     if (remote) {
@@ -175,10 +216,10 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     NSDictionary* t = T[@(name.c_str())];
     if (!t) mtl::die(("missing tensor " + name).c_str());
     Lin l;
-    l.w = files[[t[@"file"] unsignedIntValue]];
     l.woff = [t[@"off"] unsignedLongLongValue];
-    l.s = files[[t[@"sfile"] unsignedIntValue]];
+    l.w = mtl::checked_file(files, [t[@"file"] unsignedIntValue], l.woff, 0, name);
     l.soff = [t[@"soff"] unsignedLongLongValue];
+    l.s = mtl::checked_file(files, [t[@"sfile"] unsignedIntValue], l.soff, 0, name + ".scales");
     l.N = [t[@"N"] unsignedIntValue];
     l.K = [t[@"K"] unsignedIntValue];
     l.bits = [t[@"bits"] unsignedIntValue];
@@ -191,9 +232,9 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     NSDictionary* t = T[@(name.c_str())];
     if (!t) mtl::die(("missing tensor " + name).c_str());
     Raw r;
-    r.b = files[[t[@"file"] unsignedIntValue]];
     r.off = [t[@"off"] unsignedLongLongValue];
     r.bytes = [t[@"bytes"] unsignedLongLongValue];
+    r.b = mtl::checked_file(files, [t[@"file"] unsignedIntValue], r.off, r.bytes, name);
     return r;
   };
 

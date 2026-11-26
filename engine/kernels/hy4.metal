@@ -963,6 +963,57 @@ kernel void h4_combine(device const float* yd [[buffer(0)]], device const uint* 
   mo_frag[frag_off(m, c, 2 * a.lat)] = bfloat(s);
 }
 
+// ------------------------------------------------------------------ Block-128 WHT on MoE act frags
+struct WhtArgs { uint M, I; };
+static inline void wht128_inplace(device bfloat* base, uint row, uint k0, uint I, ushort l) {
+  // k0 is a multiple of 128, so (k0 + 4*l) is 4-aligned and frag_off(+0..+3) are 4 contiguous 8B-aligned bfloats.
+  device bfloat4* p = (device bfloat4*)(base + frag_off(row, k0 + 4u * l, I));
+  const bfloat4 v = *p;
+  float a0 = float(v.x), a1 = float(v.y), a2 = float(v.z), a3 = float(v.w);
+  // Stages 1 & 2 (strides 1, 2 in registers)
+  { float t0 = a0 + a1, t1 = a0 - a1, t2 = a2 + a3, t3 = a2 - a3; a0 = t0; a1 = t1; a2 = t2; a3 = t3; }
+  { float t0 = a0 + a2, t2 = a0 - a2, t1 = a1 + a3, t3 = a1 - a3; a0 = t0; a1 = t1; a2 = t2; a3 = t3; }
+  // Stages 3..7 (strides 4, 8, 16, 32, 64 across the 32-lane simdgroup)
+#pragma clang loop unroll(full)
+  for (ushort mask = 1; mask <= 16; mask <<= 1) {
+    const float sgn = (l & mask) ? -1.0f : 1.0f;
+    const float b0 = simd_shuffle_xor(a0, mask);
+    const float b1 = simd_shuffle_xor(a1, mask);
+    const float b2 = simd_shuffle_xor(a2, mask);
+    const float b3 = simd_shuffle_xor(a3, mask);
+    a0 = fma(sgn, a0, b0);
+    a1 = fma(sgn, a1, b1);
+    a2 = fma(sgn, a2, b2);
+    a3 = fma(sgn, a3, b3);
+  }
+  const float inv = 0.08838834764831845f;  // 1 / sqrt(128)
+  *p = bfloat4(bfloat(a0 * inv), bfloat(a1 * inv), bfloat(a2 * inv), bfloat(a3 * inv));
+}
+// Prefill: act is compact frag_off(row, c, I) over row in [0, M*topk). 4 SGs (128 threads) = 4 rows/TG.
+// Grid (I/128, ceil(M*topk / 4)), 128 threads.
+kernel void h4_wht128_pf(device bfloat* act [[buffer(0)]], constant WhtArgs& a [[buffer(1)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         ushort sg [[simdgroup_index_in_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
+  const uint row = tg.y * 4u + sg;
+  if (row < a.M) wht128_inplace(act, row, tg.x * 128u, a.I, l);
+}
+// Decode/verify: act is [smax][16 * I] frags; 1 SG per (block128, active slot) walks only set bits of rmask.
+// Grid (I/128, smax), 32 threads.
+kernel void h4_wht128_dec(device bfloat* act [[buffer(0)]], device const uint* nslots [[buffer(1)]],
+                          device const uint* rmask [[buffer(2)]], constant WhtArgs& a [[buffer(3)]],
+                          uint2 tg [[threadgroup_position_in_grid]], ushort l [[thread_index_in_threadgroup]]) {
+  const uint sl = tg.y;
+  if (sl >= *nslots) return;
+  uint mask = rmask[sl * 4u] & ((a.M >= 32u) ? 0xFFFFFFFFu : ((1u << a.M) - 1u));
+  device bfloat* base = act + size_t(sl) * (a.I >> 5) * 512u;
+  const uint k0 = tg.x * 128u;
+  while (mask) {
+    const uint m = ctz(mask);
+    mask &= mask - 1u;
+    wht128_inplace(base, m, k0, a.I, l);
+  }
+}
+
 // ------------------------------------------------------------------ Engram
 static inline float fp8_e4m3(uchar b) {
   const uint s = b >> 7, e = (b >> 3) & 15u, mnt = b & 7u;
@@ -980,6 +1031,20 @@ kernel void h4_eng_rows(device const uchar* rows [[buffer(0)]], device const flo
   threadgroup float sh[32];
   const uint hh = tg.x, m = tg.y;
   const float v = fp8_e4m3(rows[(size_t(m) * 16 + hh) * 96 + tid]);
+  const float r = rsqrt(tg_sum(v * v, sh, tid, 96) / 96.0f + a.eps);
+  frag[frag_off(m, hh * 96 + tid, 1536)] = bfloat(v * r * lnorm[hh * 96 + tid]);
+}
+// rows [M][16][60] affine u4_g32 (48B packed nibbles + 3 x half2(scale, bias)) -> per-head rms * w -> frag [M][1536].
+kernel void h4_eng_rows_q4(device const uchar* rows [[buffer(0)]], device const float* lnorm [[buffer(1)]],
+                           device bfloat* frag [[buffer(2)]], constant EngRowArgs& a [[buffer(3)]],
+                           uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+  threadgroup float sh[32];
+  const uint hh = tg.x, m = tg.y;
+  device const uchar* rp = rows + (size_t(m) * 16 + hh) * 60;
+  const uchar b = rp[tid >> 1];
+  const uint code = (tid & 1) ? (b >> 4) : (b & 15u);
+  const half2 sb = ((device const half2*)(rp + 48))[tid >> 5];
+  const float v = fma(float(code), float(sb.x), float(sb.y));
   const float r = rsqrt(tg_sum(v * v, sh, tid, 96) / 96.0f + a.eps);
   frag[frag_off(m, hh * 96 + tid, 1536)] = bfloat(v * r * lnorm[hh * 96 + tid]);
 }

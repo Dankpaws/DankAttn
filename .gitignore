@@ -1,5 +1,8 @@
 build/
 src
 server.log
+*-server.log
+.venv/
+pcache/
 __pycache__/
 *.pyc

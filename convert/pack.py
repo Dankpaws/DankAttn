@@ -214,7 +214,7 @@ def main(src, out):
 
     if len(sys.argv) > 3:
         global IMP
-        IMP = torch.load(sys.argv[3])
+        IMP = torch.load(sys.argv[3], weights_only=True)
         print("importance stats:", len(IMP["s"]), "sets", flush=True)
 
     E = T(pre + "embed_tokens.weight", torch.bfloat16)
