@@ -9,7 +9,7 @@ tags:
   - metal
   - moe
   - 2-bit
-  - gptq
+  - nf2
   - speculative-decoding
   - dankattn
 ---
@@ -26,14 +26,15 @@ Includes the 43-layer hybrid architecture (37 HCA sliding-window + C128 compress
 
 Mixed-precision quantization tailored to fit the full 43-layer 512-expert MoE + **256k context** inside **96 GB Apple Silicon unified memory** (`85.51 GiB` mapped weights + `2.03 GiB` wired GPU state):
 
-- **Routed MoE experts, layers 2–42 (512 experts, top-10)**: DankAttn **W2-g32 NF2** (2-bit NormalFloat codebook, group size 32 aligned 1:1 with upstream MXFP4 blocks, GPTQ-calibrated)
+- **Routed MoE experts, layers 2–21 (512 experts, top-10)**: DankAttn **W2-g32 NF2** (2-bit NormalFloat codebook, group size 32 aligned 1:1 with upstream MXFP4 blocks, 13-clip RTN)
+- **Routed MoE experts, layers 22–42 (512 experts, top-10)**: DankAttn **W2-g64 NF2** (2-bit NormalFloat codebook, group size 64, 13-clip RTN)
 - **Routed MoE experts, layer 1**: DankAttn **W4-g64** (4-bit higher-precision first MoE layer)
 - **Dense L0 MLP (`mlp_gu`, `mlp_dn`), all attention projections (`attn_in`, `attn_qb`, `wo_a`, `wo_b`, `kb`, `vb`, `attn_o`), `moe_in`, `moe_out`, & `lm_head`**: DankAttn **W8-g128**
 - **Embeddings & small projections (`embed`, `vha_m`, norms)**: BF16 / f32
 - **mHC Sinkhorn mixing & MultiMax head**: f32
 - **KV caches**: runtime `bf16` HCA SWA-1024 + C128 compressed KV (37 layers) and `kv8` (int8 symmetric per-64-dim latent + bf16 RoPE) on the 6 DSA layers
 
-> **Why W2-g32 NF2?** Only the routed MoE experts on layers 2–42 are 2-bit; every attention projection, dense L0 MLP, router, shared expert path, and `lm_head` stays at **W8-g128** (and L1 MoE experts stay at **W4-g64**). Group size 32 with FP16 scales (~2.5 effective bpw) aligns 1:1 with upstream MXFP4 blocks and uses an NF2 codebook with Hessian-weighted GPTQ calibration so the full 512-expert model + **256k context** fits cleanly inside **96 GB unified memory**. Users on 192–512 GB Macs can also pack higher-bit experts (W4-g64) with `ernie55/convert/pack_ernie55.py`.
+> **Why hybrid W2-g32 / W2-g64 NF2?** Only the routed MoE experts on layers 2–42 are 2-bit; every attention projection, dense L0 MLP, router, shared expert path, and `lm_head` stays at **W8-g128** (and L1 MoE experts stay at **W4-g64**). Layers 2–21 use group size 32 (aligned 1:1 with upstream MXFP4 blocks) and layers 22–42 use group size 64, both quantized with a 13-clip NF2 RTN codebook (empirical sweeps showed clipped NF2 RTN outperformed 2-bit MoE GPTQ on held-out PPL) so the full 512-expert model + **256k context** fits cleanly inside **96 GB unified memory**. Users on 192–512 GB Macs can also pack higher-bit experts (W4-g64) with `ernie55/convert/pack_ernie55.py`.
 
 ### Quality & Determinism
 
@@ -84,4 +85,4 @@ Measured on `pack-ernie55-w2-g32-w8attn` (`cap=262144`, `85.51 GiB` mapped weigh
 
 ## Attribution & License
 
-Derived from `ERNIE-5.5-Flash-Preview`, repacked into DankAttn mixed-precision format (W2-g32 NF2 GPTQ routed experts L2–42, W4-g64 L1, W8-g128 dense/attention/unembed). Licensed under **Apache 2.0** (matching upstream). The DankAttn engine itself is MIT-licensed.
+Derived from `ERNIE-5.5-Flash-Preview`, repacked into DankAttn mixed-precision format (W2-g32 NF2 RTN routed experts L2–21, W2-g64 NF2 RTN L22–42, W4-g64 L1, W8-g128 dense/attention/unembed). Licensed under **Apache 2.0** (matching upstream). The DankAttn engine itself is MIT-licensed.

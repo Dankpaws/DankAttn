@@ -7,7 +7,7 @@ DankAttn is a from-scratch Metal 4 inference engine for Apple Silicon, written i
 It currently targets four architectures:
 
 - **Inkling-2-Mini (`engine/inkling2/`)**: `thinkingmachines/Inkling-2-Mini` (`Inkling2LoopForConditionalGeneration`): 26.4B total / 3.4B physical active / 5.4B effective active via a 3-pass looped core (24 physical -> 48 logical layers: 40 SWA-1024 + 8 `kv8` global, native lossless NVFP4/MXFP8 MoE, DankAttn W8 attention/unembed, **DFlash2** block-diffusion or DSpark MTP drafter + 3-gram lookup). Fits in **32 GB Apple Silicon** (`~21.4 GB` total at 32k context; `~23.4 GB` at 128k).
-- **ERNIE-5.5-Flash-Preview (`engine/ernie55/`)**: `ERNIE-5.5-Flash-Preview` (`ernie5_5_moe`): 43 layers (37 HCA sliding-window + C128 compressed-KV layers + 6 sparse DSA `kv8` latent layers, 4-stream Sinkhorn mHC residual mixing, 512-expert top-10 MoE in W2-g32 NF2 GPTQ + W4-g64 L1 + W8-g128 dense/attention/unembed, MultiMax head, 3-gram PLD speculation). Fits **256k context** in **96 GB Apple Silicon** (`85.51 GiB` mapped weights + `2.03 GiB` GPU state).
+- **ERNIE-5.5-Flash-Preview (`engine/ernie55/`)**: `ERNIE-5.5-Flash-Preview` (`ernie5_5_moe`): 43 layers (37 HCA sliding-window + C128 compressed-KV layers + 6 sparse DSA `kv8` latent layers, 4-stream Sinkhorn mHC residual mixing, 512-expert top-10 MoE in hybrid W2-g32 L2–21 / W2-g64 L22–42 NF2 RTN + W4-g64 L1 + W8-g128 dense/attention/unembed, MultiMax head, 3-gram PLD speculation). Fits **256k context** in **96 GB Apple Silicon** (`85.51 GiB` mapped weights + `2.03 GiB` GPU state).
 - **Hy4 (`engine/hy4/`)**: `tencent/Hy4-flash` (`HYV4FlashForCausalLM`): 42 layers (30 sliding-window MLA in bf16, 12 sparse DSA with `kv8` latent caches, 512-expert MoE in W4g64 `gu` + W4g128/W6g128 `H128` `dn`, 4 SSD-offloaded `u4_g32` Engram layers with a 128 MB lock-free row cache, SigLIP2 vision, and a 5-layer DFly2 / optional `dfly2-b6` W6 drafter).
 - **Flash-Next (`engine/`)**: `qwen4_exp` (GDN + sparse attention + MoE + PLE n-gram tables + MTP drafter).
 
@@ -122,7 +122,7 @@ See [inkling2/ARCHITECTURE_AND_PERF.md](inkling2/ARCHITECTURE_AND_PERF.md) for a
 
 Pre-packed weights are available on Hugging Face: [`Dankpaws/ERNIE-5.5-Flash-Preview-DankAttn-w2-g32`](https://huggingface.co/Dankpaws/ERNIE-5.5-Flash-Preview-DankAttn-w2-g32).
 
-Measured on **M5 Ultra Mac Studio (96 GB)** at `cap=262144` (`85.51 GiB` mapped weights + `2.03 GiB` GPU state; W2-g32 NF2 GPTQ routed experts L2–42, W4-g64 L1, W8-g128 dense/attention/unembed):
+Measured on **M5 Ultra Mac Studio (96 GB)** at `cap=262144` (`85.51 GiB` mapped weights + `2.03 GiB` GPU state; hybrid W2-g32 L2–21 / W2-g64 L22–42 NF2 RTN routed experts, W4-g64 L1, W8-g128 dense/attention/unembed):
 
 | Workload | Result (GPU) | Result (Wall) | Notes |
 | :--- | :---: | :---: | :--- |
@@ -200,7 +200,7 @@ ernie55/
   ARCHITECTURE_AND_PERF.md  ERNIE-5.5-Flash architecture, benchmarks, M5 Ultra roofline, and CLI reference
   HF_MODEL_CARD.md      Hugging Face model card for Dankpaws/ERNIE-5.5-Flash-Preview-DankAttn-w2-g32
   build_ernie55.sh      Build script for build/dankattn-ernie55
-  convert/              GPTQ W2-g32 calibration (collect_gptq.py, gptq_w2.py) & packer (pack_ernie55.py)
+  convert/              Hybrid W2-g32/W2-g64 NF2 packer (pack_ernie55.py) & experimental GPTQ scripts (collect_gptq.py, gptq_w2.py)
   ref/                  Standalone PyTorch golden reference (ernie55_golden.py) & quantization sweep
 hy4/
   build_hy4.sh          Build script for build/dankattn-hy4

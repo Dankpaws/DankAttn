@@ -10,7 +10,7 @@ This document covers the Metal 4 implementation, memory budget, measured M5 Ultr
 - **FFN / MoE**:
   - **L0**: Dense SiTU-GLU MLP (`I=14336`, W8-g128).
   - **L1–L42**: 512 routed experts (top-10, `moe_I=2048`, `moe_lat=2048`) + shared SiTU-GLU expert (`beta=4.0`, `lbeta=25.0`).
-  - L1 experts are W4-g64; L2–L42 experts are W2-g32 NF2 (GPTQ-calibrated).
+  - L1 experts are W4-g64; L2–L21 experts are W2-g32 NF2 and L22–L42 experts are W2-g64 NF2 (13-clip NF2 RTN).
 - **Output head**: `lm_head` (`vocab=201216`, W8-g128) + MultiMax quadratic head.
 - **Speculative decoding**: 3-gram prompt-lookup decoding (PLD, `k_draft=7`) is enabled by default in `server/ernie55_server.py` (disable with `--no-spec`; enable in CLI `gen`/`suite` with `E5_SPEC=1`).
 
@@ -18,7 +18,7 @@ This document covers the Metal 4 implementation, memory budget, measured M5 Ultr
 
 | Component | Size | Notes |
 | :--- | ---: | :--- |
-| Mapped weights (`pack-ernie55-w2-g32-w8attn`) | **85.51 GiB** | W2-g32 NF2 MoE (L2–42) + W4-g64 (L1) + W8-g128 dense/attn/unembed |
+| Mapped weights (`pack-ernie55-w2-g32-w8attn`) | **85.51 GiB** | W2-g32 NF2 MoE (L2–21) + W2-g64 NF2 MoE (L22–42) + W4-g64 (L1) + W8-g128 dense/attn/unembed |
 | Wired GPU state (`PREFILL_M=1024`, `cap=262144`) | **2.03 GiB** | Compact `COMP_RING=256` + shared prefill scratch + phase-aliased `iq_h`/`mmpart` |
 | **Total** | **87.54 GiB** | Fits under `iogpu.wired_limit_mb=90112` (88.0 GiB) on 96 GB Apple Silicon |
 
