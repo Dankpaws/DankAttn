@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <chrono>
+#include <mach/mach_time.h>
 #include <atomic>
 #include <thread>
 #include <array>
@@ -39,6 +40,13 @@ static id<MTLCounterSampleBuffer> new_sample_buffer(id<MTLDevice> dev) {
   return sb;
 }
 
+// host clock in seconds on the base of MTLCommandBuffer GPUStartTime / GPUEndTime (CACurrentMediaTime's)
+static double host_now() {
+  static mach_timebase_info_data_t tb;
+  if (!tb.denom) mach_timebase_info(&tb);
+  return double(mach_absolute_time()) * tb.numer / tb.denom / 1e9;
+}
+
 struct Rec {
   id<MTLCommandBuffer> cb;
   id<MTLComputeCommandEncoder> e = nil;
@@ -47,6 +55,15 @@ struct Rec {
   std::vector<id<MTLCounterSampleBuffer>> pool;
   std::vector<std::string> names;
   id<MTLComputeCommandEncoder> op(const char* name, bool barrier = true) {
+    // timing ablation: HY4_SKIP=<op>[,<op>...] encodes those ops into a buffer that never runs (values go stale:
+    // bench / prof only; ops that steer routing or indexer selection can mislead)
+    static const std::string skip = getenv("HY4_SKIP") ? "," + std::string(getenv("HY4_SKIP")) + "," : "";
+    if (!skip.empty() && !prof && skip.find("," + std::string(name) + ",") != std::string::npos) {
+      static id<MTLCommandBuffer> dcb = nil;
+      static id<MTLComputeCommandEncoder> de = nil;
+      if (!de) { dcb = [cb.commandQueue commandBuffer]; de = [dcb computeCommandEncoder]; }
+      return de;
+    }
     if (!prof) {
       if (!e) {
         e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
@@ -188,14 +205,22 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     rs = [C.dev newResidencySetWithDescriptor:d error:&e];
     if (!rs) mtl::die("residency set", e);
   }
-  // Identify files referenced ONLY by vision tensors (V.* / V{i}.*) so they stay mmap'd in page cache
-  // without consuming permanent iogpu.wired_limit_mb residency during text decode/prefill.
+  // Identify files referenced ONLY by vision tensors (V.* / V{i}.*) — and optionally DFly2 tensors when
+  // HY4_DFLY_UNWIRED=1 — so they stay mmap'd in unified page cache without pushing permanent wired residency.
+  const bool is_moe_dfly = man[@"dfly"] && man[@"dfly"][@"mlp_type"] && [man[@"dfly"][@"mlp_type"] isEqualToString:@"moe"];
+  const bool dfly_unwired = hy4::cfg().dfly_unwired >= 0 ? (hy4::cfg().dfly_unwired != 0) : is_moe_dfly;
   std::set<uint32_t> text_files;
   NSDictionary* ts_map = man[@"tensors"];
   for (NSString* k in ts_map) {
     const std::string ks = [k UTF8String];
     const bool is_vis = ks.size() >= 2 && ks[0] == 'V' && (ks[1] == '.' || (ks[1] >= '0' && ks[1] <= '9'));
     if (is_vis) continue;
+    if (dfly_unwired) {
+      const bool is_df = (ks.size() >= 3 && ks[0] == 'D' && ks[1] == 'F' && ks[2] == '.') ||
+                         (ks.size() >= 2 && ks[0] == 'D' && ks[1] >= '0' && ks[1] <= '9') ||
+                         ks == "lm_head_w4";
+      if (is_df) continue;
+    }
     NSDictionary* td = ts_map[k];
     if (td[@"file"]) text_files.insert([td[@"file"] unsignedIntValue]);
     if (td[@"sfile"]) text_files.insert([td[@"sfile"] unsignedIntValue]);
@@ -345,23 +370,44 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   NSDictionary* dfm = man[@"dfly"];
   if (dfm && !hy4::cfg().no_dfly) {
     has_dfly = true;
+    df_moe = dfm[@"mlp_type"] && [dfm[@"mlp_type"] isEqualToString:@"moe"];
+    df_has_ac = [dfm[@"attentive_correction"] boolValue];
+    df_ac_gated = [dfm[@"ac_block_gated"] boolValue];
     dblock = [dfm[@"block"] unsignedIntValue];
-    // 8 rather than the trained 6 (7 drafts per call): measured 2026-11-19 with lookup on, greedy and T 0.9:
-    // code / quoting +1-15%, prose -1%; drafts only, so output is unchanged. HY4_DBLOCK overrides.
-    dblock = std::min<uint32_t>(MAXM, hy4::cfg().dblock ? hy4::cfg().dblock : std::max(dblock, 8u));
+    // For the built-in 5-layer dense DFly2, 8 rather than 6 gives +1-15% on code/quoting.
+    // For block-gated AttentiveCorrection (trained for exact block=6), keep trained block unless HY4_DBLOCK overrides.
+    if (hy4::cfg().dblock) dblock = std::min<uint32_t>(MAXM, hy4::cfg().dblock);
+    else if (!df_has_ac) dblock = std::min<uint32_t>(MAXM, std::max(dblock, 8u));
     mask_id = [dfm[@"mask_token_id"] unsignedIntValue];
     dff = [dfm[@"intermediate"] unsignedIntValue];
     dhci = [dfm[@"correction_intermediate"] unsignedIntValue];
+    if (df_moe) {
+      d_E = [dfm[@"num_experts"] unsignedIntValue];
+      d_topk = [dfm[@"num_experts_per_tok"] unsignedIntValue];
+      d_I = dff;
+      d_LAT = dfm[@"moe_latent"] ? [dfm[@"moe_latent"] unsignedIntValue] : LAT;
+      d_rscale = dfm[@"router_scaling_factor"] ? [dfm[@"router_scaling_factor"] floatValue] : rscale;
+    }
     NSArray* tls = dfm[@"target_layers"];
     D.resize([dfm[@"layers"] unsignedIntValue]);
     for (uint32_t i = 0; i < D.size(); i++) {
       DLayer& d = D[i];
       const std::string n = "D" + std::to_string(i);
       d.tl = [tls[i] unsignedIntValue];
+      d.moe = df_moe;
       d.in = lin(n + ".attn.in"); d.gate = lin(n + ".attn.gate"); d.qb = lin(n + ".attn.qb"); d.o = lin(n + ".attn.o");
       d.nh = d.gate.N / 256;
       d.kb = lin(n + ".attn.kb", d.nh); d.vb = lin(n + ".attn.vb", d.nh);
-      d.gu = lin(n + ".mlp.gu"); d.dn = lin(n + ".mlp.dn");
+      if (d.moe) {
+        d.moe_in = lin(n + ".moe.in");
+        d.moe_gu = lin(n + ".moe.gu", d_topk);
+        d.moe_dn = lin(n + ".moe.dn", d_topk);
+        d.moe_out = lin(n + ".moe.out");
+        d.moe_bias = raw(n + ".moe.bias");
+        d.moe_norm = raw(n + ".moe.norm");
+      } else {
+        d.gu = lin(n + ".mlp.gu"); d.dn = lin(n + ".mlp.dn");
+      }
       d.qa_norm = raw(n + ".attn.qa_norm"); d.kva_norm = raw(n + ".attn.kva_norm"); d.sinks = raw(n + ".attn.sinks");
       d.post_norm = raw(n + ".attn.post_norm"); d.in_norm = raw(n + ".in_norm"); d.post_ln = raw(n + ".post_ln");
       if (d.tl >= nL || !L[d.tl].sparse) mtl::die("dfly: target layer is not a sparse layer of this pack");
@@ -369,6 +415,22 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     df_eh = lin("DF.eh"); df_hcgu = lin("DF.hc.gu"); df_hcdn = lin("DF.hc.dn"); lm_head_w4 = lin("lm_head_w4");
     df_enorm = raw("DF.enorm"); df_hnorm = raw("DF.hnorm"); df_gate = raw("DF.gate");
     df_hchn = raw("DF.hc.hnorm"); df_hcen = raw("DF.hc.enorm"); df_norm = raw("DF.norm");
+    if (df_has_ac) {
+      df_ac_src = dfm[@"ac_source_layer"] ? [dfm[@"ac_source_layer"] unsignedIntValue] : uint32_t(D.size() - 1);
+      df_ac_nh = D[df_ac_src].nh;
+      df_ac_in = lin("DF.ac.in");
+      df_ac_qb = lin("DF.ac.qb");
+      df_ac_kb = lin("DF.ac.kb", df_ac_nh);
+      df_ac_vb = lin("DF.ac.vb", df_ac_nh);
+      df_ac_o = lin("DF.ac.o");
+      df_ac_bgate = lin("DF.ac.bgate");
+      df_ac_qa_norm = raw("DF.ac.qa_norm");
+      df_ac_kva_norm = raw("DF.ac.kva_norm");
+      df_ac_sinks = raw("DF.ac.sinks");
+      df_ac_bsink = raw("DF.ac.bsink");
+      df_ac_brel = raw("DF.ac.brel");
+      df_ac_bgbias = raw("DF.ac.bgbias");
+    }
   }
   NSDictionary* vm = man[@"vision"];
   if (vm) {
@@ -480,11 +542,25 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
       reg(d.in, false, false, false); reg(d.gate, false, false, false); reg(d.qb, false, false, false); reg(d.o, false, false, false);
       reg(d.kb, true, false, false); reg(d.vb, true, false, false);
       need_grp_epi5.insert({d.vb.bits, d.vb.gs});
-      reg(d.gu, false, false, false); need_dec_epi3.insert({d.gu.bits, d.gu.gs}); reg(d.dn, false, false, false);
+      if (d.moe) {
+        reg(d.moe_in, false, false, false);
+        reg(d.moe_gu, true, false, true);
+        reg(d.moe_dn, true, false, false);
+        reg(d.moe_out, false, false, false);
+      } else {
+        reg(d.gu, false, false, false); need_dec_epi3.insert({d.gu.bits, d.gu.gs}); reg(d.dn, false, false, false);
+      }
     }
     reg(df_eh, false, false, false);
     reg(df_hcgu, false, false, false); need_dec_epi3.insert({df_hcgu.bits, df_hcgu.gs}); need_grp_epi3_nc.insert({df_hcgu.bits, df_hcgu.gs});
     reg(df_hcdn, false, false, false); reg(df_hcdn, true, false, false);
+    if (df_has_ac) {
+      reg(df_ac_in, false, false, false); reg(df_ac_in, true, false, false);
+      reg(df_ac_qb, false, false, false); reg(df_ac_qb, true, false, false);
+      reg(df_ac_kb, true, false, false); reg(df_ac_vb, true, false, false);
+      reg(df_ac_o, false, false, false); reg(df_ac_o, true, false, false);
+      reg(df_ac_bgate, false, false, false); reg(df_ac_bgate, true, false, false);
+    }
     reg(lm_head_w4, false, false, false);
     reg(lm_head_w4, true, false, false);  // GPU-gated draft head uses grouped mm2 with 1 slot
   }
@@ -497,18 +573,25 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     reg(v_merge_fc1, false, true, false); reg(v_merge_fc2, false, true, false);
   }
   auto mk = [&](std::pair<uint32_t, uint32_t> bg) { return "w" + std::to_string(bg.first) + "g" + std::to_string(bg.second); };
+  // HY4_PF / HY4_PF_GRP: k-steps of weights in flight per simdgroup in decode / verify mm2 (all, grouped only);
+  // load scheduling only, so the bits are unchanged
+  auto pfd = [](std::map<std::string, std::string> d, bool grp) {
+    const char* e = grp && getenv("HY4_PF_GRP") ? getenv("HY4_PF_GRP") : getenv("HY4_PF");
+    if (e) d["PF"] = e;
+    return d;
+  };
   for (auto bg : need_dec)
-    P[mk(bg)] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}});
+    P[mk(bg)] = C.pipe(mm2, "mm2", pfd({{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}}, false));
   for (auto bg : need_dec_epi3)
-    P[mk(bg) + "_epi3"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"EPI", "3"}});
+    P[mk(bg) + "_epi3"] = C.pipe(mm2, "mm2", pfd({{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"EPI", "3"}}, false));
   for (auto bg : need_grp)
-    P[mk(bg) + "grp"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}});
+    P[mk(bg) + "grp"] = C.pipe(mm2, "mm2", pfd({{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}}, true));
   for (auto bg : need_grp_epi3)
-    P[mk(bg) + "grp_epi3"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}, {"SWIGLU_LIMIT", lim}});
+    P[mk(bg) + "grp_epi3"] = C.pipe(mm2, "mm2", pfd({{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}, {"SWIGLU_LIMIT", lim}}, true));
   for (auto bg : need_grp_epi3_nc)
-    P[mk(bg) + "grp_epi3_nc"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}});
+    P[mk(bg) + "grp_epi3_nc"] = C.pipe(mm2, "mm2", pfd({{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}}, true));
   for (auto bg : need_grp_epi5)
-    P[mk(bg) + "grp_epi5"] = C.pipe(mm2, "mm2", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "5"}});
+    P[mk(bg) + "grp_epi5"] = C.pipe(mm2, "mm2", pfd({{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "5"}}, true));
   for (auto bg : need_mmp)
     P[mk(bg) + "mmp"] = C.pipe(mm2, "mmp", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"MMP_FAST", "1"}, {"MMP_NF", mnf}});
   for (auto bg : need_mmp_epi3)
@@ -539,7 +622,9 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
                         "h4_idx_topk", "h4_attn_merge", "h4_gate", "h4_route", "h4_plan", "h4_combine",
                         "h4_eng_rows", "h4_eng_rows_q4", "h4_eng_mix", "h4_argmax", "h4_plan_lists", "h4_combine_c",
                         "h4_wht128_pf", "h4_wht128_dec",
-                        "h4_add", "h4_dsel", "h4_add_frag", "h4_d_post_add_ln", "h4_draft_hc_in",
+                        "h4_add", "h4_dsel", "h4_add_frag", "h4_add_frag2", "h4_d_post_add_ln", "h4_draft_hc_in",
+                        "h4_ac_block_attn", "h4_yv_to_frag", "h4_ac_gate_nsel",
+                        "h4_ac_blk0_in", "h4_ac_in_lanes", "h4_ac_sel_lanes", "h4_draft_corr2",
                         "h4_sample", "h4_pick_p", "h4_idx_score_mma", "h4_dgate"})
     P[k] = C.pipe(hk, k);
   if (has_vision) {
@@ -702,7 +787,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     dfrag2 = B(size_t(MAXM) * 2 * H * 2);
     dsel = B(size_t(MAXM) * DSELMAX * 4); dnsel = B(MAXM * 4);
     rope_draft = B(MAXM * 64 * 4); dids = B(MAXM * 4);
-    dout = B(size_t(MAXM) * MAXM * 4); dprob = B(size_t(MAXM) * MAXM * 4); dpmax = B(size_t(MAXM) * MAXM * 4);
+    dout = B(size_t(MAXM) * MAXM * 4); dprob = B(size_t(MAXM) * MAXM * 4); dpmax = B(size_t(MAXM) * MAXM * 4); dmarg = B(size_t(MAXM) * MAXM * 4);
     for (uint32_t i = 0; i < MAXM; i++) { dgate.push_back(B(16)); ((uint32_t*)dgate.back().contents)[0] = 1; }
     dl_eh_b = B(MAXM * 16);
     dl_row0_b = B(MAXM * 4);
@@ -710,6 +795,14 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     dl_anchor_b = B(MAXM * 4);
     dl_dsel_b = B(D.size() * MAXM * 32);
     dl_samp_b = B(MAXM * MAXM * 32);
+    if (df_has_ac) {
+      ac_blk = B(size_t(MAXM) * 16 * 576 * 2);
+      ac_bg = B(size_t(MAXM) * 64 * 4);
+      ac_nh_gate = B(16);
+      dl_ac_rope = B(size_t(MAXM) * MAXM * 64 * 4);
+      dl_ac_sel_b = B(size_t(MAXM) * 32);
+      dl_ac_rlane = B(size_t(MAXM) * 4);
+    }
   }
   for (uint32_t i = 0; i < nhmax; i++) ((uint32_t*)head_slots.contents)[i] = i;
   nslots32 = B(16);
@@ -2035,6 +2128,8 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   if (logits_out && M > MAXM) mtl::die("step: all-row logits only for <= 16 rows");
   if (pos + M > cap) mtl::die("step: KV capacity exceeded");
   const uint32_t p0 = pos;
+  const double h_entry = host_now();
+  double h_commit0 = 0;
   mtl::last_use() = mtl::now_s();
   memcpy(ids.contents, toks.data(), M * 4);
   history.insert(history.end(), toks.begin(), toks.end());
@@ -2087,6 +2182,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   auto commit_now = [&]() {
     if (rc.e) { [rc.e endEncoding]; rc.e = nil; }
     [rc.cb commit];
+    if (!h_commit0) h_commit0 = host_now();
     sent.push_back(rc.cb);
     rc.cb = [C.q commandBuffer];
   };
@@ -2170,13 +2266,18 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   }
   if (rc.e) [rc.e endEncoding];
   [rc.cb commit];
+  const double h_commit1 = host_now();
+  if (!h_commit0) h_commit0 = h_commit1;
   [rc.cb waitUntilCompleted];
+  const double h_wake = host_now();
   if (rc.cb.error) mtl::die("step: command buffer failed", rc.cb.error);
-  if (gpu_ms) {
+  {
     // GPU span from the first buffer's start to the last one's end (the buffers run back to back)
     double t0 = rc.cb.GPUStartTime, t1 = rc.cb.GPUEndTime;
     for (id<MTLCommandBuffer> b : sent) { t0 = std::min(t0, b.GPUStartTime); t1 = std::max(t1, b.GPUEndTime); }
-    *gpu_ms = (t1 - t0) * 1e3;
+    if (gpu_ms) *gpu_ms = (t1 - t0) * 1e3;
+    last_lat = {(h_commit0 - h_entry) * 1e3, (h_commit1 - h_entry) * 1e3, (t0 - h_commit0) * 1e3, (t1 - t0) * 1e3,
+                (h_wake - t1) * 1e3};
   }
   if (profile) rc.resolve(*profile);
   pos += M;
@@ -2363,6 +2464,7 @@ struct AddFArgs { uint32_t M, H, ldx, offx; };
 std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src_s, double* gpu_ms,
                                    std::map<std::string, double>* profile, bool cut) {
   if (!has_dfly) mtl::die("draft: pack has no DFly2 drafter");
+  const double h_entry = host_now();
   const uint32_t W = dblock, p = pos;
   if (p + W > cap) return {};
   {
@@ -2417,10 +2519,12 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
   rms(use_saved ? slots_[cur_slot].df_xf : xf, 1, H, use_saved ? 0 : src_x * H, df_hnorm, nil, dfrag2, H, 2 * H, false);
   mm(rc, "d_eh", df_eh, dfrag2, Yo, 1);
   add(dx, Yo, 1, H, &df_gate);
+  bool xn_ready = false;
   for (size_t di = 0; di < D.size(); di++) {
     auto& d = D[di];
     Layer& t = L[d.tl];
-    rms(dx, W, H, 0, d.in_norm, nil, xn_frag, 0, 0);
+    if (!xn_ready) rms(dx, W, H, 0, d.in_norm, nil, xn_frag, 0, 0);
+    xn_ready = false;
     mm(rc, "d_attn_in", d.in, xn_frag, Yin, W);
     const bool ov_dgate = d.in.ksplit == 1 || d.gate.ksplit == 1;
     mm(rc, "d_gate", d.gate, xn_frag, Yg, W, nil, nil, 0, 0, 0, false, nil, 0, 1, false, !ov_dgate);
@@ -2517,15 +2621,105 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       [e setBytes:&pa length:sizeof pa atIndex:5];
       [e dispatchThreadgroups:MTLSizeMake(W, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
-    mm(rc, "d_mlp_gu", d.gu, xn_frag, Ymlp, W, nil, nil, 0, 0, 0, true, mlp_frag, dff);
-    mm(rc, "d_mlp_dn", d.dn, mlp_frag, Yo, W);
-    add(dx, Yo, W, H, nullptr);
+    if (d.moe) {
+      mm(rc, "d_moe_in", d.moe_in, xn_frag, Ym, W);
+      {
+        RouteArgs a{W, d_E, d_topk, d.moe_in.N, d_LAT, d_I, d_rscale};
+        e = rc.op("d_route");
+        [e setComputePipelineState:pipe("h4_route")];
+        [e setBuffer:Ym offset:0 atIndex:0];
+        setb(e, d.moe_bias, 1);
+        [e setBuffer:topi offset:0 atIndex:2];
+        [e setBuffer:topw offset:0 atIndex:3];
+        [e setBuffer:lat_frag offset:0 atIndex:4];
+        [e setBuffer:mo_frag offset:0 atIndex:5];
+        [e setBytes:&a length:sizeof a atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake(W, 1, 1) threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        PlanArgs pa{W, d_topk, d_E};
+        e = rc.op("d_plan");
+        [e setComputePipelineState:pipe("h4_plan")];
+        [e setBuffer:topi offset:0 atIndex:0];
+        [e setBuffer:slots offset:0 atIndex:1];
+        [e setBuffer:nslots offset:0 atIndex:2];
+        [e setBuffer:slot_of offset:0 atIndex:3];
+        [e setBytes:&pa length:sizeof pa atIndex:4];
+        [e setBuffer:rmask offset:0 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+      }
+      const uint32_t dsmax = std::min(d_E, W * d_topk);
+      mm(rc, "d_moe_gu", d.moe_gu, lat_frag, Ygu, W, slots, nslots, dsmax, 0, 16 * 2 * d_I, true, act, d_I, 1, true);
+      if (moe_dn_had == 128) {
+        WhtArgs wa{W, d_I};
+        e = rc.op("d_wht128");
+        [e setComputePipelineState:pipe("h4_wht128_dec")];
+        [e setBuffer:act offset:0 atIndex:0];
+        [e setBuffer:nslots offset:0 atIndex:1];
+        [e setBuffer:rmask offset:0 atIndex:2];
+        [e setBytes:&wa length:sizeof wa atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake(d_I / 128, dsmax, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      }
+      mm(rc, "d_moe_dn", d.moe_dn, act, yd, W, slots, nslots, dsmax, (d_I / 32) * 64, 16 * d_LAT, false, nil, 0, 1, true);
+      {
+        CombArgs a{W, d_topk, d_LAT, 16 * d_LAT};
+        e = rc.op("d_combine");
+        [e setComputePipelineState:pipe("h4_combine")];
+        [e setBuffer:yd offset:0 atIndex:0];
+        [e setBuffer:topi offset:0 atIndex:1];
+        [e setBuffer:topw offset:0 atIndex:2];
+        [e setBuffer:slot_of offset:0 atIndex:3];
+        [e setBuffer:mo_frag offset:0 atIndex:4];
+        [e setBytes:&a length:sizeof a atIndex:5];
+        [e dispatchThreads:MTLSizeMake(d_LAT, W, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      mm(rc, "d_moe_out", d.moe_out, mo_frag, Yo, W);
+      if (di + 1 < D.size()) {
+        struct { uint32_t M, H; float eps; } pa{W, H, eps};
+        e = rc.op("d_moe_post_ln");
+        [e setComputePipelineState:pipe("h4_d_post_add_ln")];
+        [e setBuffer:Yo offset:0 atIndex:0];
+        setb(e, d.moe_norm, 1);
+        [e setBuffer:dx offset:0 atIndex:2];
+        setb(e, D[di + 1].in_norm, 3);
+        [e setBuffer:xn_frag offset:0 atIndex:4];
+        [e setBytes:&pa length:sizeof pa atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(W, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        xn_ready = true;
+      } else {
+        rms(Yo, W, H, 0, d.moe_norm, y, nil, 0, 0);
+        add(dx, y, W, H, nullptr);
+      }
+    } else {
+      mm(rc, "d_mlp_gu", d.gu, xn_frag, Ymlp, W, nil, nil, 0, 0, 0, true, mlp_frag, dff);
+      mm(rc, "d_mlp_dn", d.dn, mlp_frag, Yo, W);
+      add(dx, Yo, W, H, nullptr);
+    }
   }
   rms(dx, W, H, 0, df_norm, dh, nil, 0, 0);
-  // ---- drafts: hidden correction from the previous token, then the draft head; tokens stay on the GPU
+  // ---- drafts: hidden correction (+ optional AttentiveCorrection) from previous token, then draft head
   const bool gate = draft_cut > 0;
   ((uint32_t*)dl_row0_b.contents)[0] = 0;
   ((uint32_t*)dl_maxd_b.contents)[0] = W - 1;
+  if (df_has_ac && df_ac_gated) {
+    // Populate slot 0's block latent ac_blk[0] from [norm(dh[0]); norm(embed(anchor))] at pos p
+    rms(dh, 1, H, 0, df_hchn, nil, dfrag2, 0, 2 * H);
+    embed_rows(dids, 0, 1, de, false);
+    rms(de, 1, H, 0, df_hcen, nil, dfrag2, H, 2 * H);
+    mm(rc, "d_ac_in0", df_ac_in, dfrag2, Yin, 1);
+    {
+      KvArgs a{1, df_ac_in.N, 0, 0, 0, 0, 0, df_ac_in.rows.at("kva").first, eps, 1.0f, 0u};
+      e = rc.op("d_ac_blk0");
+      [e setComputePipelineState:pipe("h4_attn_in")];
+      [e setBuffer:Yin offset:0 atIndex:0];
+      setb(e, df_ac_qa_norm, 1); setb(e, df_ac_kva_norm, 2); setb(e, df_ac_qa_norm, 3);
+      [e setBuffer:rope_draft offset:0 atIndex:4];
+      [e setBuffer:qa_frag offset:0 atIndex:5];
+      [e setBuffer:ac_blk offset:0 atIndex:6];
+      [e setBuffer:iw offset:0 atIndex:7];
+      [e setBuffer:iw offset:0 atIndex:8];
+      [e setBytes:&a length:sizeof a atIndex:9];
+      [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+  }
   for (uint32_t s2 = 0; s2 + 1 < W; s2++) {
     id<MTLBuffer> gb = dgate[gate ? s2 : 0];
     {
@@ -2550,7 +2744,132 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       mm(rc, "d_hc_gu", df_hcgu, dfrag2, Ymlp, 1, nil, nil, 0, 0, 0, true, mlp_frag, dhci);
       mm(rc, "d_hc_dn", df_hcdn, mlp_frag, Yo, 1);
     }
-    {
+    if (df_has_ac) {
+      const uint32_t slot = s2 + 1;
+      const size_t rope_off = size_t(slot) * 64 * 4;
+      Layer& t_ac = L[D[df_ac_src].tl];
+      if (gate) {
+        mm(rc, "d_ac_in", df_ac_in, dfrag2, Yin, 1, head_slots, gb, 1);
+        if (df_ac_gated) mm(rc, "d_ac_bg", df_ac_bgate, dfrag2, ac_bg, 1, head_slots, gb, 1, 0, 0, false, nil, 0, 1, false, false);
+      } else {
+        mm(rc, "d_ac_in", df_ac_in, dfrag2, Yin, 1);
+        if (df_ac_gated) mm(rc, "d_ac_bg", df_ac_bgate, dfrag2, ac_bg, 1, nil, nil, 0, 0, 0, false, nil, 0, 1, false, false);
+      }
+      {
+        KvArgs a{1, df_ac_in.N, slot, 0, 0, 0, 0, df_ac_in.rows.at("kva").first, eps, 1.0f, 0u};
+        e = rc.op("d_ac_in_k");
+        [e setComputePipelineState:pipe("h4_attn_in")];
+        [e setBuffer:Yin offset:0 atIndex:0];
+        setb(e, df_ac_qa_norm, 1); setb(e, df_ac_kva_norm, 2); setb(e, df_ac_qa_norm, 3);
+        [e setBuffer:rope_draft offset:rope_off atIndex:4];
+        [e setBuffer:qa_frag offset:0 atIndex:5];
+        [e setBuffer:ac_blk offset:0 atIndex:6];
+        [e setBuffer:iw offset:0 atIndex:7];
+        [e setBuffer:iw offset:0 atIndex:8];
+        [e setBytes:&a length:sizeof a atIndex:9];
+        [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      if (gate) mm(rc, "d_ac_qb", df_ac_qb, qa_frag, Yq, 1, head_slots, gb, 1);
+      else mm(rc, "d_ac_qb", df_ac_qb, qa_frag, Yq, 1);
+      {
+        QArgs a{1, df_ac_nh, df_ac_qb.N, 0, 16};
+        e = rc.op("d_ac_qp");
+        [e setComputePipelineState:pipe("h4_q_prep")];
+        [e setBuffer:Yq offset:0 atIndex:0];
+        [e setBuffer:rope_draft offset:rope_off atIndex:1];
+        [e setBuffer:rope_draft offset:rope_off atIndex:2];
+        [e setBuffer:qn_frag offset:0 atIndex:3];
+        [e setBuffer:qr offset:0 atIndex:4];
+        [e setBuffer:iq offset:0 atIndex:5];
+        [e setBytes:&a length:sizeof a atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      }
+      id<MTLBuffer> nsh_ac = df_ac_nh == 64 ? nslots64 : nslots32;
+      const bool use_saved_s = (src_s == ~0u);
+      id<MTLBuffer> sb = use_saved_s ? slots_[cur_slot].df_lsel[df_ac_src] : t_ac.lsel;
+      id<MTLBuffer> nb = use_saved_s ? slots_[cur_slot].df_lnsel[df_ac_src] : t_ac.lnsel;
+      const size_t soff = use_saved_s ? 0 : size_t(src_s) * selmax * 4;
+      const size_t noff = use_saved_s ? 0 : size_t(src_s) * 4;
+      id<MTLBuffer> nb_use = nb;
+      size_t noff_use = noff;
+      if (gate) {
+        struct { uint32_t nh; } ga{df_ac_nh};
+        e = rc.op("d_ac_gnsel", false);
+        [e setComputePipelineState:pipe("h4_ac_gate_nsel")];
+        [e setBuffer:nb offset:noff atIndex:0];
+        [e setBuffer:gb offset:0 atIndex:1];
+        [e setBuffer:dnsel offset:0 atIndex:2];
+        [e setBuffer:ac_nh_gate offset:0 atIndex:3];
+        [e setBytes:&ga length:sizeof ga atIndex:4];
+        [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        nb_use = dnsel;
+        noff_use = 0;
+        nsh_ac = ac_nh_gate;
+      }
+      mm(rc, "d_ac_kb", df_ac_kb, qn_frag, qlat, 1, head_slots, nsh_ac, df_ac_nh, 16 * 192 / 8, 16 * 512);
+      {
+        AttnArgs a{1, df_ac_nh, p + slot, 0, window, 0, as_draft, selmax, 1.0f / 16.0f, 16, t_ac.kv8 ? 1u : 0u};
+        e = rc.op("d_ac_attn");
+        [e setComputePipelineState:pipe("h4_attn_mma_dsa")];
+        [e setBuffer:qlat offset:0 atIndex:0];
+        [e setBuffer:qr offset:0 atIndex:1];
+        [e setBuffer:t_ac.lat offset:0 atIndex:2];
+        [e setBuffer:sb offset:soff atIndex:3];
+        [e setBuffer:nb_use offset:noff_use atIndex:4];
+        [e setBuffer:part offset:0 atIndex:5];
+        [e setBytes:&a length:sizeof a atIndex:6];
+        setb(e, df_ac_sinks, 7);
+        [e setBuffer:ofrag offset:0 atIndex:8];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh / 16, 1, as_draft) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        MergeArgs ma{1, df_ac_nh, as_draft, 16};
+        e = rc.op("d_ac_merge");
+        [e setComputePipelineState:pipe("h4_attn_merge")];
+        [e setBuffer:part offset:0 atIndex:0];
+        setb(e, df_ac_sinks, 1);
+        [e setBuffer:ofrag offset:0 atIndex:2];
+        [e setBytes:&ma length:sizeof ma atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      if (df_ac_gated) {
+        struct { uint32_t M, nh, rs, slot, blk_stride; float scale; } ba{1, df_ac_nh, 16, slot, 16, 1.0f / 16.0f};
+        e = rc.op("d_ac_blk");
+        [e setComputePipelineState:pipe("h4_ac_block_attn")];
+        [e setBuffer:qlat offset:0 atIndex:0];
+        [e setBuffer:qr offset:0 atIndex:1];
+        [e setBuffer:ac_blk offset:0 atIndex:2];
+        [e setBuffer:ac_bg offset:0 atIndex:3];
+        setb(e, df_ac_brel, 4); setb(e, df_ac_bsink, 5); setb(e, df_ac_bgbias, 6);
+        [e setBuffer:ofrag offset:0 atIndex:7];
+        [e setBuffer:gb offset:0 atIndex:8];
+        [e setBytes:&ba length:sizeof ba atIndex:9];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      mm(rc, "d_ac_vb", df_ac_vb, ofrag, yv, 1, head_slots, nsh_ac, df_ac_nh, 16 * 512 / 8, 16 * 256);
+      {
+        struct { uint32_t M, nh, rs; } ya{1, df_ac_nh, 16};
+        e = rc.op("d_ac_yv");
+        [e setComputePipelineState:pipe("h4_yv_to_frag")];
+        [e setBuffer:yv offset:0 atIndex:0];
+        [e setBuffer:gfrag offset:0 atIndex:1];
+        [e setBuffer:gb offset:0 atIndex:2];
+        [e setBytes:&ya length:sizeof ya atIndex:3];
+        [e dispatchThreads:MTLSizeMake(df_ac_nh * 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      if (gate) mm(rc, "d_ac_o", df_ac_o, gfrag, y, 1, head_slots, gb, 1);
+      else mm(rc, "d_ac_o", df_ac_o, gfrag, y, 1);
+      {
+        AddFArgs a{1, H, H, (s2 + 1) * H};
+        e = rc.op("d_corr");
+        [e setComputePipelineState:pipe("h4_add_frag2")];
+        [e setBuffer:dh offset:0 atIndex:0];
+        [e setBuffer:Yo offset:0 atIndex:1];
+        [e setBuffer:y offset:0 atIndex:2];
+        [e setBuffer:xn_frag offset:0 atIndex:3];
+        [e setBytes:&a length:sizeof a atIndex:4];
+        [e setBuffer:gb offset:0 atIndex:5];
+        [e dispatchThreads:MTLSizeMake(H, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+    } else {
       AddFArgs a{1, H, H, (s2 + 1) * H};
       e = rc.op("d_corr");
       [e setComputePipelineState:pipe("h4_add_frag")];
@@ -2574,6 +2893,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
     [e setBuffer:dprob offset:s2 * 4 atIndex:3];
     [e setBuffer:dpmax offset:s2 * 4 atIndex:4];
     [e setBuffer:dgate[gate ? s2 : 0] offset:0 atIndex:5];
+    [e setBuffer:dmarg offset:s2 * 4 atIndex:6];
     [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
     if (gate && s2 + 2 < W) {
       struct { uint32_t n; float cut; } ga{s2 + 1, draft_cut};
@@ -2587,14 +2907,19 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
   }
   if (rc.e) [rc.e endEncoding];
   [rc.cb commit];
+  const double h_commit = host_now();
   [rc.cb waitUntilCompleted];
+  const double h_wake = host_now();
   if (rc.cb.error) mtl::die("draft: command buffer failed", rc.cb.error);
   if (gpu_ms) *gpu_ms = mtl::gpu_seconds(rc.cb) * 1e3;
+  last_dlat = {(h_commit - h_entry) * 1e3, (h_commit - h_entry) * 1e3, (rc.cb.GPUStartTime - h_commit) * 1e3,
+               (rc.cb.GPUEndTime - rc.cb.GPUStartTime) * 1e3, (h_wake - rc.cb.GPUEndTime) * 1e3};
   if (profile) rc.resolve(*profile);
   std::vector<uint32_t> out(W - 1);
   memcpy(out.data(), dout.contents, (W - 1) * 4);
   last_probs.assign((const float*)dprob.contents, (const float*)dprob.contents + (W - 1));
   last_pmax.assign((const float*)dpmax.contents, (const float*)dpmax.contents + (W - 1));
+  last_marg.assign((const float*)dmarg.contents, (const float*)dmarg.contents + (W - 1));
   // verify only the drafts whose cumulative probability stays above draft_cut (at least one),
   // then optionally trim unprofitable tail drafts via the fan-out-aware tok/ms selector.
   if (cut) {
@@ -2675,6 +3000,29 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
         dr[m++] = DselLaneRowHost{ts, tn, sr, lane_p[j], q, 0};
     }
   }
+  if (df_has_ac) {
+    const Layer& t_ac = L[D[df_ac_src].tl];
+    DselLaneRowHost* ar = (DselLaneRowHost*)dl_ac_sel_b.contents;
+    uint32_t* al = (uint32_t*)dl_ac_rlane.contents;
+    for (uint32_t j = 0; j < n; j++) {
+      const auto& rq = reqs[j];
+      const bool use_saved = (rq.src_s == ~0u);
+      const uint64_t ts = use_saved ? slots_[rq.slot].df_lsel[df_ac_src].gpuAddress : t_ac.lsel.gpuAddress;
+      const uint64_t tn = use_saved ? slots_[rq.slot].df_lnsel[df_ac_src].gpuAddress : t_ac.lnsel.gpuAddress;
+      ar[j] = DselLaneRowHost{ts, tn, use_saved ? 0u : rq.src_s, lane_p[j], 0, 0};
+      al[j] = uint32_t(rq.slot);
+    }
+    // Pre-pack [slot][lane][64] RoPE table for slots 0 .. max_D
+    for (uint32_t slot = 0; slot <= max_D; slot++) {
+      std::vector<uint32_t> sp(n);
+      for (uint32_t j = 0; j < n; j++) {
+        const auto& rq = reqs[j];
+        const int32_t sdelta = (rq.slot == cur_slot) ? mrope_delta : slots_[rq.slot].mrope_delta;
+        sp[j] = uint32_t(int64_t(lane_p[j] + slot) + sdelta);
+      }
+      rope_rows(inv_dsa, sp, (float*)dl_ac_rope.contents + size_t(slot) * n * 64);
+    }
+  }
   // Per-(step, lane) SampRow descriptors
   for (uint32_t s2 = 0; s2 < max_D; s2++) {
     SampRow* sr = (SampRow*)dl_samp_b.contents + size_t(s2) * MAXM;
@@ -2746,11 +3094,13 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
     [e dispatchThreads:MTLSizeMake(H, n, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
 
-  // ---- Step B: 5 DFly2 layers over all M <= 16 rows at once
+  // ---- Step B: DFly2 layers over all M <= 16 rows at once
+  bool dl_xn_ready = false;
   for (size_t di = 0; di < D.size(); di++) {
     auto& d = D[di];
     Layer& t = L[d.tl];
-    rms(dx, M, d.in_norm, nil, xn_frag);
+    if (!dl_xn_ready) rms(dx, M, d.in_norm, nil, xn_frag);
+    dl_xn_ready = false;
     mm(rc, "dl_attn_in", d.in, xn_frag, Yin, M);
     const bool ov_dgate = d.in.ksplit == 1 || d.gate.ksplit == 1;
     mm(rc, "dl_gate", d.gate, xn_frag, Yg, M, nil, nil, 0, 0, 0, false, nil, 0, 1, false, !ov_dgate);
@@ -2851,15 +3201,109 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       [e setBytes:&pa length:sizeof pa atIndex:5];
       [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
-    mm(rc, "dl_mlp_gu", d.gu, xn_frag, Ymlp, M, nil, nil, 0, 0, 0, true, mlp_frag, dff);
-    mm(rc, "dl_mlp_dn", d.dn, mlp_frag, Yo, M);
-    add(dx, Yo, M);
+    if (d.moe) {
+      mm(rc, "dl_moe_in", d.moe_in, xn_frag, Ym, M);
+      {
+        RouteArgs a{M, d_E, d_topk, d.moe_in.N, d_LAT, d_I, d_rscale};
+        e = rc.op("dl_route");
+        [e setComputePipelineState:pipe("h4_route")];
+        [e setBuffer:Ym offset:0 atIndex:0];
+        setb(e, d.moe_bias, 1);
+        [e setBuffer:topi offset:0 atIndex:2];
+        [e setBuffer:topw offset:0 atIndex:3];
+        [e setBuffer:lat_frag offset:0 atIndex:4];
+        [e setBuffer:mo_frag offset:0 atIndex:5];
+        [e setBytes:&a length:sizeof a atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        PlanArgs pa{M, d_topk, d_E};
+        e = rc.op("dl_plan");
+        [e setComputePipelineState:pipe("h4_plan")];
+        [e setBuffer:topi offset:0 atIndex:0];
+        [e setBuffer:slots offset:0 atIndex:1];
+        [e setBuffer:nslots offset:0 atIndex:2];
+        [e setBuffer:slot_of offset:0 atIndex:3];
+        [e setBytes:&pa length:sizeof pa atIndex:4];
+        [e setBuffer:rmask offset:0 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+      }
+      const uint32_t dsmax = std::min(d_E, M * d_topk);
+      mm(rc, "dl_moe_gu", d.moe_gu, lat_frag, Ygu, M, slots, nslots, dsmax, 0, 16 * 2 * d_I, true, act, d_I, 1, true);
+      if (moe_dn_had == 128) {
+        WhtArgs wa{M, d_I};
+        e = rc.op("dl_wht128");
+        [e setComputePipelineState:pipe("h4_wht128_dec")];
+        [e setBuffer:act offset:0 atIndex:0];
+        [e setBuffer:nslots offset:0 atIndex:1];
+        [e setBuffer:rmask offset:0 atIndex:2];
+        [e setBytes:&wa length:sizeof wa atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake(d_I / 128, dsmax, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      }
+      mm(rc, "dl_moe_dn", d.moe_dn, act, yd, M, slots, nslots, dsmax, (d_I / 32) * 64, 16 * d_LAT, false, nil, 0, 1, true);
+      {
+        CombArgs a{M, d_topk, d_LAT, 16 * d_LAT};
+        e = rc.op("dl_combine");
+        [e setComputePipelineState:pipe("h4_combine")];
+        [e setBuffer:yd offset:0 atIndex:0];
+        [e setBuffer:topi offset:0 atIndex:1];
+        [e setBuffer:topw offset:0 atIndex:2];
+        [e setBuffer:slot_of offset:0 atIndex:3];
+        [e setBuffer:mo_frag offset:0 atIndex:4];
+        [e setBytes:&a length:sizeof a atIndex:5];
+        [e dispatchThreads:MTLSizeMake(d_LAT, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      mm(rc, "dl_moe_out", d.moe_out, mo_frag, Yo, M);
+      if (di + 1 < D.size()) {
+        struct { uint32_t M, H; float eps; } pa{M, H, eps};
+        e = rc.op("dl_moe_post_ln");
+        [e setComputePipelineState:pipe("h4_d_post_add_ln")];
+        [e setBuffer:Yo offset:0 atIndex:0];
+        setb(e, d.moe_norm, 1);
+        [e setBuffer:dx offset:0 atIndex:2];
+        setb(e, D[di + 1].in_norm, 3);
+        [e setBuffer:xn_frag offset:0 atIndex:4];
+        [e setBytes:&pa length:sizeof pa atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        dl_xn_ready = true;
+      } else {
+        rms(Yo, M, d.moe_norm, y, nil);
+        add(dx, y, M);
+      }
+    } else {
+      mm(rc, "dl_mlp_gu", d.gu, xn_frag, Ymlp, M, nil, nil, 0, 0, 0, true, mlp_frag, dff);
+      mm(rc, "dl_mlp_dn", d.dn, mlp_frag, Yo, M);
+      add(dx, Yo, M);
+    }
   }
   rms(dx, M, df_norm, dh, nil);
 
-  // ---- Step C: batched hidden correction + draft head across all n lanes for s2 = 0 .. max_D - 1
+  // ---- Step C: batched hidden correction (+ optional AttentiveCorrection) + draft head across all n lanes
   const bool gate = draft_cut > 0;
   const Lin& dhd = cfg().dhead_w8 ? lm_head : lm_head_w4;
+  if (df_has_ac && df_ac_gated) {
+    struct { uint32_t n, H; float eps; } a0{n, H, eps};
+    e = rc.op("dl_ac_blk0_in");
+    [e setComputePipelineState:pipe("h4_ac_blk0_in")];
+    [e setBuffer:dh offset:0 atIndex:0];
+    setb(e, embed, 1); setb(e, df_hchn, 2); setb(e, df_hcen, 3);
+    [e setBuffer:dl_row0_b offset:0 atIndex:4];
+    [e setBuffer:dl_anchor_b offset:0 atIndex:5];
+    [e setBuffer:dfrag2 offset:0 atIndex:6];
+    [e setBytes:&a0 length:sizeof a0 atIndex:7];
+    [e dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    mm(rc, "dl_ac_in0", df_ac_in, dfrag2, Yin, n);
+    {
+      struct { uint32_t M, Nin, kvoff, slot, blk_stride; float eps; } ia{n, df_ac_in.N, df_ac_in.rows.at("kva").first, 0, 16, eps};
+      e = rc.op("dl_ac_blk0");
+      [e setComputePipelineState:pipe("h4_ac_in_lanes")];
+      [e setBuffer:Yin offset:0 atIndex:0];
+      setb(e, df_ac_qa_norm, 1); setb(e, df_ac_kva_norm, 2);
+      [e setBuffer:dl_ac_rope offset:0 atIndex:3];
+      [e setBuffer:qa_frag offset:0 atIndex:4];
+      [e setBuffer:ac_blk offset:0 atIndex:5];
+      [e setBytes:&ia length:sizeof ia atIndex:6];
+      [e dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+  }
   for (uint32_t s2 = 0; s2 < max_D; s2++) {
     id<MTLBuffer> gb = dgate[gate ? s2 : 0];
     {
@@ -2884,7 +3328,128 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       mm(rc, "dl_hc_gu", df_hcgu, dfrag2, Ymlp, n, nil, nil, 0, 0, 0, true, mlp_frag, dhci);
       mm(rc, "dl_hc_dn", df_hcdn, mlp_frag, Yo, n);
     }
-    {
+    if (df_has_ac) {
+      const uint32_t slot = s2 + 1;
+      const size_t rope_off = size_t(slot) * n * 64 * 4;
+      const uint32_t tl_ac = D[df_ac_src].tl;
+      Layer& t_ac = L[tl_ac];
+      if (gate) {
+        mm(rc, "dl_ac_in", df_ac_in, dfrag2, Yin, n, head_slots, gb, 1);
+        if (df_ac_gated) mm(rc, "dl_ac_bg", df_ac_bgate, dfrag2, ac_bg, n, head_slots, gb, 1, 0, 0, false, nil, 0, 1, false, false);
+      } else {
+        mm(rc, "dl_ac_in", df_ac_in, dfrag2, Yin, n);
+        if (df_ac_gated) mm(rc, "dl_ac_bg", df_ac_bgate, dfrag2, ac_bg, n, nil, nil, 0, 0, 0, false, nil, 0, 1, false, false);
+      }
+      {
+        struct { uint32_t M, Nin, kvoff, slot, blk_stride; float eps; } ia{n, df_ac_in.N, df_ac_in.rows.at("kva").first, slot, 16, eps};
+        e = rc.op("dl_ac_in_k");
+        [e setComputePipelineState:pipe("h4_ac_in_lanes")];
+        [e setBuffer:Yin offset:0 atIndex:0];
+        setb(e, df_ac_qa_norm, 1); setb(e, df_ac_kva_norm, 2);
+        [e setBuffer:dl_ac_rope offset:rope_off atIndex:3];
+        [e setBuffer:qa_frag offset:0 atIndex:4];
+        [e setBuffer:ac_blk offset:0 atIndex:5];
+        [e setBytes:&ia length:sizeof ia atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      if (gate) mm(rc, "dl_ac_qb", df_ac_qb, qa_frag, Yq, n, head_slots, gb, 1);
+      else mm(rc, "dl_ac_qb", df_ac_qb, qa_frag, Yq, n);
+      {
+        QArgs a{n, df_ac_nh, df_ac_qb.N, 0, 16};
+        e = rc.op("dl_ac_qp");
+        [e setComputePipelineState:pipe("h4_q_prep")];
+        [e setBuffer:Yq offset:0 atIndex:0];
+        [e setBuffer:dl_ac_rope offset:rope_off atIndex:1];
+        [e setBuffer:dl_ac_rope offset:rope_off atIndex:2];
+        [e setBuffer:qn_frag offset:0 atIndex:3];
+        [e setBuffer:qr offset:0 atIndex:4];
+        [e setBuffer:iq offset:0 atIndex:5];
+        [e setBytes:&a length:sizeof a atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh, n, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      }
+      {
+        struct { uint32_t M, selmax_t, selmax_d, s2, nh; } sa{n, selmax, DSELMAX, s2, df_ac_nh};
+        e = rc.op("dl_ac_sel", false);
+        [e setComputePipelineState:pipe("h4_ac_sel_lanes")];
+        [e setBuffer:dl_ac_sel_b offset:0 atIndex:0];
+        [e setBuffer:dsel offset:0 atIndex:1];
+        [e setBuffer:dnsel offset:0 atIndex:2];
+        [e setBuffer:gb offset:0 atIndex:3];
+        [e setBuffer:dl_maxd_b offset:0 atIndex:4];
+        [e setBuffer:ac_nh_gate offset:0 atIndex:5];
+        [e setBytes:&sa length:sizeof sa atIndex:6];
+        [e dispatchThreads:MTLSizeMake(selmax, n, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      id<MTLBuffer> nsh_ac = gate ? ac_nh_gate : (df_ac_nh == 64 ? nslots64 : nslots32);
+      mm(rc, "dl_ac_kb", df_ac_kb, qn_frag, qlat, n, head_slots, nsh_ac, df_ac_nh, 16 * 192 / 8, 16 * 512);
+      {
+        AttnArgs a{n, df_ac_nh, 0, 0, window, 0, as_draft, DSELMAX, 1.0f / 16.0f, 16, t_ac.kv8 ? 1u : 0u};
+        e = rc.op("dl_ac_attn");
+        [e setComputePipelineState:pipe("h4_attn_mma_dsa_lanes")];
+        [e setBuffer:qlat offset:0 atIndex:0];
+        [e setBuffer:qr offset:0 atIndex:1];
+        [e setBuffer:t_ac.lat offset:0 atIndex:2];
+        [e setBuffer:dsel offset:0 atIndex:3];
+        [e setBuffer:dnsel offset:0 atIndex:4];
+        [e setBuffer:part offset:0 atIndex:5];
+        [e setBytes:&a length:sizeof a atIndex:6];
+        setb(e, df_ac_sinks, 7);
+        [e setBuffer:ofrag offset:0 atIndex:8];
+        [e setBuffer:lane_tab[tl_ac] offset:0 atIndex:12];
+        [e setBuffer:dl_ac_rlane offset:0 atIndex:13];
+        [e setBuffer:row_pos_b offset:0 atIndex:14];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh / 16, n, as_draft) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        MergeArgs ma{n, df_ac_nh, as_draft, 16};
+        e = rc.op("dl_ac_merge");
+        [e setComputePipelineState:pipe("h4_attn_merge")];
+        [e setBuffer:part offset:0 atIndex:0];
+        setb(e, df_ac_sinks, 1);
+        [e setBuffer:ofrag offset:0 atIndex:2];
+        [e setBytes:&ma length:sizeof ma atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh, n, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      if (df_ac_gated) {
+        struct { uint32_t M, nh, rs, slot, blk_stride; float scale; } ba{n, df_ac_nh, 16, slot, 16, 1.0f / 16.0f};
+        e = rc.op("dl_ac_blk");
+        [e setComputePipelineState:pipe("h4_ac_block_attn")];
+        [e setBuffer:qlat offset:0 atIndex:0];
+        [e setBuffer:qr offset:0 atIndex:1];
+        [e setBuffer:ac_blk offset:0 atIndex:2];
+        [e setBuffer:ac_bg offset:0 atIndex:3];
+        setb(e, df_ac_brel, 4); setb(e, df_ac_bsink, 5); setb(e, df_ac_bgbias, 6);
+        [e setBuffer:ofrag offset:0 atIndex:7];
+        [e setBuffer:gb offset:0 atIndex:8];
+        [e setBytes:&ba length:sizeof ba atIndex:9];
+        [e dispatchThreadgroups:MTLSizeMake(df_ac_nh, n, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      mm(rc, "dl_ac_vb", df_ac_vb, ofrag, yv, n, head_slots, nsh_ac, df_ac_nh, 16 * 512 / 8, 16 * 256);
+      {
+        struct { uint32_t M, nh, rs; } ya{n, df_ac_nh, 16};
+        e = rc.op("dl_ac_yv");
+        [e setComputePipelineState:pipe("h4_yv_to_frag")];
+        [e setBuffer:yv offset:0 atIndex:0];
+        [e setBuffer:gfrag offset:0 atIndex:1];
+        [e setBuffer:gb offset:0 atIndex:2];
+        [e setBytes:&ya length:sizeof ya atIndex:3];
+        [e dispatchThreads:MTLSizeMake(df_ac_nh * 256, n, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      if (gate) mm(rc, "dl_ac_o", df_ac_o, gfrag, y, n, head_slots, gb, 1);
+      else mm(rc, "dl_ac_o", df_ac_o, gfrag, y, n);
+      {
+        struct { uint32_t n, H, s2; } a{n, H, s2};
+        e = rc.op("dl_corr");
+        [e setComputePipelineState:pipe("h4_draft_corr2")];
+        [e setBuffer:dh offset:0 atIndex:0];
+        [e setBuffer:Yo offset:0 atIndex:1];
+        [e setBuffer:y offset:0 atIndex:2];
+        [e setBuffer:dl_row0_b offset:0 atIndex:3];
+        [e setBuffer:dl_maxd_b offset:0 atIndex:4];
+        [e setBuffer:gb offset:0 atIndex:5];
+        [e setBuffer:xn_frag offset:0 atIndex:6];
+        [e setBytes:&a length:sizeof a atIndex:7];
+        [e dispatchThreads:MTLSizeMake(H, n, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+    } else {
       struct { uint32_t n, H, s2; } a{n, H, s2};
       e = rc.op("dl_corr");
       [e setComputePipelineState:pipe("h4_draft_corr")];
@@ -2910,6 +3475,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       [e setBuffer:gb offset:0 atIndex:5];
       [e setBuffer:dl_maxd_b offset:0 atIndex:6];
       [e setBytes:&s2 length:4 atIndex:7];
+      [e setBuffer:dmarg offset:size_t(s2) * MAXM * 4 atIndex:8];
       [e dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
     }
     if (gate && s2 + 1 < max_D) {
@@ -2932,15 +3498,18 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
   const uint32_t* po = (const uint32_t*)dout.contents;
   const float* pp = (const float*)dprob.contents;
   const float* pm = (const float*)dpmax.contents;
+  const float* pg = (const float*)dmarg.contents;
   for (uint32_t j = 0; j < n; j++) {
     const uint32_t md = maxd[j];
     res[j].toks.resize(md);
     res[j].probs.resize(md);
     res[j].pmax.resize(md);
+    res[j].marg.resize(md);
     for (uint32_t s2 = 0; s2 < md; s2++) {
       res[j].toks[s2] = po[s2 * MAXM + j];
       res[j].probs[s2] = pp[s2 * MAXM + j];
       res[j].pmax[s2] = pm[s2 * MAXM + j];
+      res[j].marg[s2] = pg[s2 * MAXM + j];
     }
     if (cut && md > 0) {
       size_t k_gpu = md;
@@ -2954,6 +3523,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       res[j].toks.resize(keep);
       res[j].probs.resize(keep);
       res[j].pmax.resize(keep);
+      res[j].marg.resize(keep);
     }
   }
   return res;

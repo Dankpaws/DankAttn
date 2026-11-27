@@ -8,6 +8,7 @@
 #include "spec.inc"
 #include "serve.inc"
 #include <algorithm>
+#include <pthread/qos.h>
 #include <chrono>
 #include <cmath>
 
@@ -32,6 +33,9 @@ static void prefill(hy4::Model& m, const std::vector<uint32_t>& ids, double* ms,
 }
 
 int main(int argc, char** argv) {
+  // HY4_QOS=1 (default on): run the engine thread (it commits every command buffer) at user-interactive QoS
+  // to avoid 16.7 / 33 ms 60 Hz frame-boundary GPU-queue stalls on short draft command buffers (100% bit-exact).
+  if (hy4::env_b("HY4_QOS", true)) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   @autoreleasepool {
     if (argc < 3) { fprintf(stderr, "usage: opus-hy4 <pack> serve | score|gen|spec|prof|pprof|vtest|ptest <ids.bin> ...\n"); return 2; }
     const std::string mode = argv[2];
@@ -193,8 +197,36 @@ int main(int argc, char** argv) {
       sp.begin(m);
       const double ew0 = m.eng_wait_ms, er0 = m.eng_rest_ms;
       auto t0 = std::chrono::steady_clock::now();
-      while (out.size() < n) sp.round(m, b, sx, ss, out, [&](uint32_t t) { return t == m.eos; });
+      // per-round wall minus GPU: the host's share of each round; the worst rounds are printed below
+      struct RoundT { double at, wall, host, eng; uint32_t i; hy4::Model::StepLat v, d; };
+      std::vector<RoundT> rt;
+      while (out.size() < n) {
+        const auto r0 = std::chrono::steady_clock::now();
+        const double g0 = sp.st.draft_ms + sp.st.verify_ms, e0 = m.eng_wait_ms;
+        sp.round(m, b, sx, ss, out, [&](uint32_t t) { return t == m.eos; });
+        const auto r1 = std::chrono::steady_clock::now();
+        const double w = std::chrono::duration<double>(r1 - r0).count() * 1e3;
+        rt.push_back({std::chrono::duration<double>(r0 - t0).count() * 1e3, w, w - (sp.st.draft_ms + sp.st.verify_ms - g0),
+                      m.eng_wait_ms - e0, uint32_t(rt.size()), m.last_lat, m.last_dlat});
+      }
       const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1e3;
+      {
+        std::vector<RoundT> s = rt;
+        std::sort(s.begin(), s.end(), [](const RoundT& a, const RoundT& b) { return a.host > b.host; });
+        std::vector<double> h;
+        for (auto& r : rt) h.push_back(r.host);
+        std::sort(h.begin(), h.end());
+        auto med = [&](auto f) { std::vector<double> v; for (auto& r : rt) v.push_back(f(r)); std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        fprintf(stderr, "spec: verify median enc %.2f/%.2f queue %.2f wake %.2f ms\n", med([](const RoundT& r) { return r.v.first_commit; }),
+                med([](const RoundT& r) { return r.v.last_commit; }), med([](const RoundT& r) { return r.v.queue; }),
+                med([](const RoundT& r) { return r.v.wake; }));
+        fprintf(stderr, "spec: host ms / round median %.2f p90 %.2f max %.2f; worst:", h[h.size() / 2], h[h.size() * 9 / 10], h.back());
+        for (size_t k = 0; k < std::min<size_t>(5, s.size()); k++)
+          fprintf(stderr, " #%u@%.0fms host %.1f (wall %.1f, eng %.1f; verify enc %.1f/%.1f queue %.1f wake %.1f; draft enc %.1f queue %.1f wake %.1f)",
+                  s[k].i, s[k].at, s[k].host, s[k].wall, s[k].eng, s[k].v.first_commit, s[k].v.last_commit, s[k].v.queue, s[k].v.wake,
+                  s[k].d.first_commit, s[k].d.queue, s[k].d.wake);
+        fprintf(stderr, "\n");
+      }
       const auto& st = sp.st;
       const uint32_t rounds = st.rounds, acc = st.accepted;
       fprintf(stderr, "spec: engram wait %.2f ms / round (%.2f of it before the second Engram layer)\n", (m.eng_wait_ms - ew0) / rounds,
@@ -208,6 +240,12 @@ int main(int argc, char** argv) {
               "%.1f tok/s wall vs plain %.1f tok/s (GPU); %zu / %zu tokens match plain greedy\n",
               rounds, double(acc) / rounds, double(acc + rounds) / rounds, st.draft_ms / rounds, st.verify_ms / rounds,
               (acc + rounds) / (wall / 1e3), (n - 1) / (plain / 1e3), same, std::min<size_t>(ref.size(), out.size()));
+      fprintf(stderr, "spec: wall %.2f ms / round (other %.2f); all-candidates-accepted %u rounds; accepted hist", wall / rounds,
+              wall / rounds - (st.draft_ms + st.verify_ms) / rounds, st.full);
+      for (uint32_t i = 0; i <= hy4::MAXM; i++) fprintf(stderr, " %u", st.acc_hist[i]);
+      fprintf(stderr, "; candidates hist");
+      for (uint32_t i = 0; i <= hy4::MAXM; i++) fprintf(stderr, " %u", st.cand_hist[i]);
+      fprintf(stderr, "\n");
     } else if (mode == "dtest") {
       // drafts after the prompt and a given anchor token (default: the model's own next token)
       uint32_t b = 0, sx = 0, ss = 0;

@@ -93,10 +93,12 @@ struct Layer {
   id<MTLBuffer> lsel, lnsel;  // DFly2 target layers: this layer's own selection (else the shared one)
 };
 
-struct DLayer {  // one DFly2 draft layer (dense MLA, attends to its target layer's latent cache)
+struct DLayer {  // one DFly2 draft layer (dense or LatentMoE MLA, attends to its target layer's latent cache)
   uint32_t nh = 0, tl = 0;
+  bool moe = false;
   Lin in, gate, qb, kb, vb, o, gu, dn;
-  Raw qa_norm, kva_norm, sinks, post_norm, in_norm, post_ln;
+  Lin moe_in, moe_gu, moe_dn, moe_out;
+  Raw qa_norm, kva_norm, sinks, post_norm, in_norm, post_ln, moe_bias, moe_norm;
 };
 
 struct Pos3D {
@@ -147,6 +149,9 @@ struct Model {
   // Prefill: the next chunk's rows are fetched while the GPU runs this one. A caller that knows the next
   // chunk sets next_hint before step(); the step after uses the prefetched rows if its tokens match.
   std::vector<uint32_t> next_hint;
+  // the last step()'s host timeline (ms): entry -> first commit, entry -> last commit, first commit -> GPU start,
+  // GPU span, GPU end -> host wake (spec trace: which side a slow round's host time sits on)
+  struct StepLat { double first_commit = 0, last_commit = 0, queue = 0, gpu = 0, wake = 0; } last_lat, last_dlat;  // step(), draft()
   double eng_wait_ms = 0, eng_rest_ms = 0;  // host time spent in engram_rows (the GPU runs layer 0 meanwhile), cumulative
   std::future<void> pf_job;
   std::vector<uint32_t> pf_toks;
@@ -163,16 +168,22 @@ struct Model {
   void prefetch_anchors_lanes(const std::vector<AnchorLaneReq>& reqs);
 
   // DFly2 drafter
-  bool has_dfly = false;
+  bool has_dfly = false, df_moe = false, df_has_ac = false, df_ac_gated = false;
   std::vector<DLayer> D;
   Lin df_eh, df_hcgu, df_hcdn, lm_head_w4;
+  Lin df_ac_in, df_ac_qb, df_ac_kb, df_ac_vb, df_ac_o, df_ac_bgate;
   Raw df_enorm, df_hnorm, df_gate, df_hchn, df_hcen, df_norm;
+  Raw df_ac_qa_norm, df_ac_kva_norm, df_ac_sinks, df_ac_bsink, df_ac_brel, df_ac_bgbias;
   uint32_t dblock = 6, mask_id = 0, dff = 0, dhci = 0;
+  uint32_t d_E = 0, d_topk = 0, d_I = 0, d_LAT = 0, df_ac_src = 0, df_ac_nh = 32;
+  float d_rscale = 1.0f;
   static constexpr uint32_t DSELMAX = 2176;
-  id<MTLBuffer> dx, dh, de, dfrag2, dsel, dnsel, rope_draft, dids, dout, dprob, dpmax;
+  id<MTLBuffer> dx, dh, de, dfrag2, dsel, dnsel, rope_draft, dids, dout, dprob, dpmax, dmarg;
+  id<MTLBuffer> ac_blk, ac_bg, ac_nh_gate, dl_ac_rope, dl_ac_sel_b, dl_ac_rlane;
   id<MTLBuffer> dl_eh_b, dl_row0_b, dl_maxd_b, dl_anchor_b, dl_dsel_b, dl_samp_b;
   std::vector<float> last_probs;  // the last draft's per-token probabilities (draft head)
   std::vector<float> last_pmax;   // and each draft distribution's top probability
+  std::vector<float> last_marg;   // and the chosen token's (Gumbel-perturbed when sampling) score margin over the runner-up
   // GPU-side draft cut: dgate[s] holds 1 while draft s can still pass draft_cut (dgate[0] is always 1).
   std::vector<id<MTLBuffer>> dgate;
   uint32_t as_draft = cfg().as_draft;
@@ -191,7 +202,7 @@ struct Model {
   };
   struct DraftRes {
     std::vector<uint32_t> toks;
-    std::vector<float> probs, pmax;
+    std::vector<float> probs, pmax, marg;
   };
   std::vector<DraftRes> draft_lanes(const std::vector<DraftReq>& reqs, double* gpu_ms = nullptr, bool cut = true);
 

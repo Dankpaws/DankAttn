@@ -1411,10 +1411,11 @@ kernel void h4_sample(device const float* y [[buffer(0)]], device uint* out [[bu
 kernel void h4_pick_p(device const float* y [[buffer(0)]], device uint* out [[buffer(1)]],
                       constant SampArgs& a [[buffer(2)]], device float* prob [[buffer(3)]],
                       device float* pmax [[buffer(4)]], device const uint* gate [[buffer(5)]],
+                      device float* marg [[buffer(6)]],
                       uint m [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                       ushort ntg [[threads_per_threadgroup]]) {
   if (gate[0] == 0) return;  // a dead draft (h4_dgate): nothing reads its token
-  threadgroup float bv[32], bm[32], bs[32];
+  threadgroup float bv[32], bm[32], bs[32], bv2[32];
   threadgroup uint bi[32], pn[2];
   threadgroup atomic_uint hist[256];
   device const float* r = y + size_t(m) * a.N;
@@ -1428,28 +1429,33 @@ kernel void h4_pick_p(device const float* y [[buffer(0)]], device uint* out [[bu
   float M_ = bm[0];
   for (uint s = 1; s < ntg / 32; s++) M_ = max(M_, bm[s]);
   const float floor_ = samp ? trunc_floor(r, a.N, it, M_, a.lmin, a.top_p, a.top_k, bm, hist, pn, tid, ntg) : -INFINITY;
-  float v = -INFINITY, se = 0.0f;
+  // v2: the runner-up's (perturbed) score, for the margin; top-1 selection and its tie-break are unchanged
+  float v = -INFINITY, v2 = -INFINITY, se = 0.0f;
   uint idx = 0;
   for (uint i = tid; i < a.N; i += ntg) {
     const float l = r[i] * it;
     se += exp(l - M_);
     if (l < floor_) continue;
     const float s = samp ? l + gumbel(a.s0, a.s1, a.p0 + m, i) : l;
-    if (s > v) { v = s; idx = i; }
+    if (s > v) { v2 = v; v = s; idx = i; } else if (s > v2) v2 = s;
   }
   for (ushort off = 16; off > 0; off >>= 1) {
     const float ov = simd_shuffle_down(v, off);
     const uint oi = simd_shuffle_down(idx, off);
-    if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+    const float ov2 = simd_shuffle_down(v2, off);
+    if (ov > v || (ov == v && oi < idx)) { v2 = max(v, ov2); v = ov; idx = oi; } else v2 = max(v2, ov);
   }
   se = simd_sum(se);
-  if ((tid & 31) == 0) { bv[tid / 32] = v; bi[tid / 32] = idx; bs[tid / 32] = se; }
+  if ((tid & 31) == 0) { bv[tid / 32] = v; bi[tid / 32] = idx; bs[tid / 32] = se; bv2[tid / 32] = v2; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) {
-    float b = bv[0]; uint bix = bi[0]; float S = 0.0f;
-    for (uint s = 1; s < ntg / 32; s++) if (bv[s] > b || (bv[s] == b && bi[s] < bix)) { b = bv[s]; bix = bi[s]; }
+    float b = bv[0], b2 = bv2[0]; uint bix = bi[0]; float S = 0.0f;
+    for (uint s = 1; s < ntg / 32; s++) {
+      if (bv[s] > b || (bv[s] == b && bi[s] < bix)) { b2 = max(b, bv2[s]); b = bv[s]; bix = bi[s]; } else b2 = max(b2, bv[s]);
+    }
     for (uint s = 0; s < ntg / 32; s++) S += bs[s];
     out[m] = bix;
+    marg[m] = b - b2;  // +inf when nothing else survived truncation
     prob[m] = exp(r[bix] * it - M_) / S;
     pmax[m] = 1.0f / S;  // the distribution's top probability: a confidence that does not depend on the draw
   }
@@ -1572,10 +1578,11 @@ kernel void h4_pick_p_lanes(device const float* y [[buffer(0)]], device uint* ou
                             device const SampRow* sr [[buffer(2)]], device float* prob [[buffer(3)]],
                             device float* pmax [[buffer(4)]], device const uint* gate [[buffer(5)]],
                             device const uint* max_d [[buffer(6)]], constant uint& s2 [[buffer(7)]],
+                            device float* marg [[buffer(8)]],
                             uint m [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                             ushort ntg [[threads_per_threadgroup]]) {
   if (gate[0] == 0 || s2 >= max_d[m]) return;
-  threadgroup float bv[32], bm[32], bs[32];
+  threadgroup float bv[32], bm[32], bs[32], bv2[32];
   threadgroup uint bi[32], pn[2];
   threadgroup atomic_uint hist[256];
   const SampRow a = sr[m];
@@ -1590,28 +1597,33 @@ kernel void h4_pick_p_lanes(device const float* y [[buffer(0)]], device uint* ou
   float M_ = bm[0];
   for (uint s = 1; s < ntg / 32; s++) M_ = max(M_, bm[s]);
   const float floor_ = samp ? trunc_floor(r, a.N, it, M_, a.lmin, a.top_p, a.top_k, bm, hist, pn, tid, ntg) : -INFINITY;
-  float v = -INFINITY, se = 0.0f;
+  // v2: the runner-up's (perturbed) score, for the margin; top-1 selection and its tie-break are unchanged
+  float v = -INFINITY, v2 = -INFINITY, se = 0.0f;
   uint idx = 0;
   for (uint i = tid; i < a.N; i += ntg) {
     const float l = r[i] * it;
     se += exp(l - M_);
     if (l < floor_) continue;
     const float s = samp ? l + gumbel(a.s0, a.s1, a.pos, i) : l;
-    if (s > v) { v = s; idx = i; }
+    if (s > v) { v2 = v; v = s; idx = i; } else if (s > v2) v2 = s;
   }
   for (ushort off = 16; off > 0; off >>= 1) {
     const float ov = simd_shuffle_down(v, off);
     const uint oi = simd_shuffle_down(idx, off);
-    if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+    const float ov2 = simd_shuffle_down(v2, off);
+    if (ov > v || (ov == v && oi < idx)) { v2 = max(v, ov2); v = ov; idx = oi; } else v2 = max(v2, ov);
   }
   se = simd_sum(se);
-  if ((tid & 31) == 0) { bv[tid / 32] = v; bi[tid / 32] = idx; bs[tid / 32] = se; }
+  if ((tid & 31) == 0) { bv[tid / 32] = v; bi[tid / 32] = idx; bs[tid / 32] = se; bv2[tid / 32] = v2; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) {
-    float b = bv[0]; uint bix = bi[0]; float S = 0.0f;
-    for (uint s = 1; s < ntg / 32; s++) if (bv[s] > b || (bv[s] == b && bi[s] < bix)) { b = bv[s]; bix = bi[s]; }
+    float b = bv[0], b2 = bv2[0]; uint bix = bi[0]; float S = 0.0f;
+    for (uint s = 1; s < ntg / 32; s++) {
+      if (bv[s] > b || (bv[s] == b && bi[s] < bix)) { b2 = max(b, bv2[s]); b = bv[s]; bix = bi[s]; } else b2 = max(b2, bv[s]);
+    }
     for (uint s = 0; s < ntg / 32; s++) S += bs[s];
     out[m] = bix;
+    marg[m] = b - b2;  // +inf when nothing else survived truncation
     prob[m] = exp(r[bix] * it - M_) / S;
     pmax[m] = 1.0f / S;
   }
@@ -1672,4 +1684,183 @@ kernel void h4_sample_lanes(device const float* y [[buffer(0)]], device uint* ou
     for (uint s = 1; s < ntg / 32; s++) if (bv[s] > b || (bv[s] == b && bi[s] < bix)) { b = bv[s]; bix = bi[s]; }
     out[m] = bix;
   }
+}
+
+
+// ------------------------------------------------------------------ DFly2 AttentiveCorrection
+// Gated intra-block prefix attention over slots 0..slot (<= 16 keys), added directly into ofrag
+// (which already holds the context sparse-attention read from h4_attn_merge).
+struct AcBlkArgs { uint M, nh, rs, slot, blk_stride; float scale; };
+kernel void h4_ac_block_attn(device const float* qlat [[buffer(0)]], device const float* qr [[buffer(1)]],
+                             device const bfloat* ac_blk [[buffer(2)]], device const float* bgate [[buffer(3)]],
+                             device const float* brel [[buffer(4)]], device const float* bsink [[buffer(5)]],
+                             device const float* bgbias [[buffer(6)]], device bfloat* ofrag [[buffer(7)]],
+                             device const uint* gate [[buffer(8)]], constant AcBlkArgs& a [[buffer(9)]],
+                             uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+  if (gate[0] == 0) return;
+  threadgroup float sh[32];
+  threadgroup float wj[16];
+  threadgroup float gscale;
+  const uint hh = tg.x, m = tg.y;
+  const uint nkeys = a.slot + 1;
+  device const float* q = qlat + (size_t(hh) * a.rs + m) * 512;
+  device const float* qpe = qr + (size_t(m) * a.nh + hh) * 64;
+  device const bfloat* blk = ac_blk + size_t(m) * a.blk_stride * 576;
+  for (uint j = 0; j < nkeys; j++) {
+    device const bfloat* kj = blk + size_t(j) * 576;
+    float s = 0.0f;
+    for (uint d = tid; d < 512; d += 128) s = fma(q[d], float(kj[lat_phys(d)]), s);
+    if (tid < 64) s = fma(qpe[tid], float(kj[lat_phys(512 + tid)]), s);
+    const float dot = tg_sum(s, sh, tid, 128);
+    if (tid == 0) wj[j] = dot * a.scale + brel[hh * 16 + (a.slot - j)];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float M_ = bsink[hh];
+    for (uint j = 0; j < nkeys; j++) M_ = max(M_, wj[j]);
+    float den = exp(bsink[hh] - M_);
+    for (uint j = 0; j < nkeys; j++) { wj[j] = exp(wj[j] - M_); den += wj[j]; }
+    const float g = tanh(bgate[size_t(m) * a.nh + hh] + bgbias[hh * 16 + a.slot]);
+    gscale = g / den;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float gs = gscale;
+  device bfloat* fr = ofrag + size_t(hh) * a.rs * 512;
+  for (uint d = tid; d < 512; d += 128) {
+    const uint pd = lat_phys(d);
+    float acc = 0.0f;
+    for (uint j = 0; j < nkeys; j++) acc = fma(wj[j], float(blk[size_t(j) * 576 + pd]), acc);
+    const uint off = frag_off(m, d, 512);
+    fr[off] = bfloat(float(fr[off]) + gs * acc);
+  }
+}
+
+// Ungated vb_out[head][m][256] -> frag [M, nh*256] for AttentiveCorrection o_proj
+struct YvFragArgs { uint M, nh, rs; };
+kernel void h4_yv_to_frag(device const float* vb [[buffer(0)]], device bfloat* ofrag [[buffer(1)]],
+                          device const uint* gate [[buffer(2)]], constant YvFragArgs& a [[buffer(3)]],
+                          uint2 g [[thread_position_in_grid]]) {
+  if (gate[0] == 0) return;
+  const uint i = g.x, m = g.y, N = a.nh * 256;
+  if (i >= N || m >= a.M) return;
+  const uint hh = i / 256, d = i % 256;
+  ofrag[frag_off(m, i, N)] = bfloat(vb[(size_t(hh) * a.rs + m) * 256 + d]);
+}
+
+// out = x + y1 + y2 as a frag (gated): SwiGLU + AttentiveCorrection -> lm_head
+kernel void h4_add_frag2(device const float* x [[buffer(0)]], device const float* y1 [[buffer(1)]],
+                         device const float* y2 [[buffer(2)]], device bfloat* frag [[buffer(3)]],
+                         constant AddFArgs& a [[buffer(4)]], device const uint* gate [[buffer(5)]],
+                         uint2 t [[thread_position_in_grid]]) {
+  if (gate[0] == 0) return;
+  const uint c = t.x, m = t.y;
+  if (c >= a.H || m >= a.M) return;
+  const float v = x[size_t(m) * a.ldx + a.offx + c] + y1[size_t(m) * a.H + c] + y2[size_t(m) * a.H + c];
+  frag[frag_off(m, c, a.H)] = bfloat(v);
+}
+
+// Gate AttentiveCorrection's context nsel and head count by dgate[s2]: sets nsel_out[0] = gate[0] ? nsel_in[0] : 0
+// and nh_out[0] = gate[0] ? nh : 0 so dead tail slots skip d_ac_kb, d_ac_attn, and d_ac_vb.
+struct AcGateArgs { uint nh; };
+kernel void h4_ac_gate_nsel(device const uint* nsel_in [[buffer(0)]], device const uint* gate [[buffer(1)]],
+                            device uint* nsel_out [[buffer(2)]], device uint* nh_out [[buffer(3)]],
+                            constant AcGateArgs& a [[buffer(4)]], uint tid [[thread_position_in_grid]]) {
+  if (tid == 0) {
+    const uint on = gate[0] != 0 ? 1u : 0u;
+    nsel_out[0] = on ? nsel_in[0] : 0u;
+    nh_out[0] = on ? a.nh : 0u;
+  }
+}
+
+// Multi-lane slot-0 block-key input: dfrag2[j] = [norm(dh[row0[j]]); norm(embed[anchor[j]])]
+struct AcBlk0Args { uint n, H; float eps; };
+kernel void h4_ac_blk0_in(device const float* dh [[buffer(0)]], device const bfloat* E [[buffer(1)]],
+                          device const float* hchn [[buffer(2)]], device const float* hcen [[buffer(3)]],
+                          device const uint* row0 [[buffer(4)]], device const uint* anchor [[buffer(5)]],
+                          device bfloat* dfrag2 [[buffer(6)]], constant AcBlk0Args& a [[buffer(7)]],
+                          uint j [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                          ushort ntg [[threads_per_threadgroup]]) {
+  threadgroup float sh[2][32];
+  device const float* hr = dh + size_t(row0[j]) * a.H;
+  device const bfloat* er = E + size_t(anchor[j]) * a.H;
+  float s0 = 0.0f, s1 = 0.0f;
+  for (uint i = tid; i < a.H; i += ntg) {
+    const float hv = hr[i], ev = float(er[i]);
+    s0 = fma(hv, hv, s0);
+    s1 = fma(ev, ev, s1);
+  }
+  const ushort sgi = tid / 32, ns = (ntg + 31) / 32;
+  const float t0 = simd_sum(s0), t1 = simd_sum(s1);
+  if ((tid & 31) == 0) { sh[0][sgi] = t0; sh[1][sgi] = t1; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float tot0 = 0.0f, tot1 = 0.0f;
+  for (ushort k = 0; k < ns; k++) { tot0 += sh[0][k]; tot1 += sh[1][k]; }
+  const float r0 = rsqrt(tot0 / float(a.H) + a.eps), r1 = rsqrt(tot1 / float(a.H) + a.eps);
+  for (uint i = tid; i < a.H; i += ntg) {
+    dfrag2[frag_off(j, i, 2 * a.H)] = bfloat(hr[i] * r0 * hchn[i]);
+    dfrag2[frag_off(j, a.H + i, 2 * a.H)] = bfloat(float(er[i]) * r1 * hcen[i]);
+  }
+}
+
+// Multi-lane AttentiveCorrection attn_in: qa -> rms -> qa_frag[m]; kva -> rms(512)+rope(64) -> ac_blk[m * blk_stride + slot]
+struct AcInArgs { uint M, Nin, kvoff, slot, blk_stride; float eps; };
+kernel void h4_ac_in_lanes(device const float* Y [[buffer(0)]], device const float* qa_w [[buffer(1)]],
+                           device const float* kva_w [[buffer(2)]], device const float* rope [[buffer(3)]],
+                           device bfloat* qa_frag [[buffer(4)]], device bfloat* ac_blk [[buffer(5)]],
+                           constant AcInArgs& a [[buffer(6)]], uint m [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]], ushort ntg [[threads_per_threadgroup]]) {
+  threadgroup float sh[2][32], kr[64], lv[576];
+  device const float* yr = Y + size_t(m) * a.Nin;
+  device const float* kv = yr + a.kvoff;
+  float s0 = 0.0f, s1 = 0.0f;
+  for (uint i = tid; i < 1024; i += ntg) s0 = fma(yr[i], yr[i], s0);
+  for (uint i = tid; i < 512; i += ntg) s1 = fma(kv[i], kv[i], s1);
+  const ushort sgi = tid / 32, ns = (ntg + 31) / 32;
+  const float t0 = simd_sum(s0), t1 = simd_sum(s1);
+  if ((tid & 31) == 0) { sh[0][sgi] = t0; sh[1][sgi] = t1; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float tot0 = 0.0f, tot1 = 0.0f;
+  for (ushort k = 0; k < ns; k++) { tot0 += sh[0][k]; tot1 += sh[1][k]; }
+  const float r0 = rsqrt(tot0 / 1024.0f + a.eps), r1 = rsqrt(tot1 / 512.0f + a.eps);
+  for (uint i = tid; i < 1024; i += ntg) qa_frag[frag_off(m, i, 1024)] = bfloat(yr[i] * r0 * qa_w[i]);
+  for (uint i = tid; i < 512; i += ntg) lv[i] = kv[i] * r1 * kva_w[i];
+  device const float* rp = rope + size_t(m) * 64;
+  if (tid < 32) {
+    float x0 = kv[512 + 2 * tid], x1 = kv[512 + 2 * tid + 1];
+    rope_pair(x0, x1, rp[tid], rp[32 + tid]);
+    kr[2 * tid] = x0; kr[2 * tid + 1] = x1;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < 64) lv[512 + tid] = kr[tid];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  device bfloat* lr = ac_blk + (size_t(m) * a.blk_stride + a.slot) * 576;
+  for (uint i = tid; i < 576; i += ntg) lr[i] = bfloat(lv[lat_logic(i)]);
+}
+
+// Multi-lane context-only selection for AttentiveCorrection (gated by dgate[s2] and s2 < max_d[m])
+struct AcSelLaneArgs { uint M, selmax_t, selmax_d, s2, nh; };
+kernel void h4_ac_sel_lanes(device const DselLaneRow* rows [[buffer(0)]], device uint* dsel [[buffer(1)]],
+                            device uint* dnsel [[buffer(2)]], device const uint* gate [[buffer(3)]],
+                            device const uint* max_d [[buffer(4)]], device uint* nh_out [[buffer(5)]],
+                            constant AcSelLaneArgs& a [[buffer(6)]], uint2 t [[thread_position_in_grid]]) {
+  const uint i = t.x, m = t.y;
+  if (m >= a.M) return;
+  const uint on = (gate[0] != 0 && a.s2 < max_d[m]) ? 1u : 0u;
+  if (m == 0 && i == 0) nh_out[0] = gate[0] != 0 ? a.nh : 0u;
+  const DselLaneRow r = rows[m];
+  const uint nh = on ? r.tnsel[r.src] : 0u;
+  if (i == 0) dnsel[m] = nh;
+  if (i < nh) dsel[size_t(m) * a.selmax_d + i] = r.tsel[size_t(r.src) * a.selmax_t + i];
+}
+
+// Per-lane SwiGLU + AttentiveCorrection residual add -> frag (for lm_head_w4)
+kernel void h4_draft_corr2(device const float* dh [[buffer(0)]], device const float* y1 [[buffer(1)]],
+                           device const float* y2 [[buffer(2)]], device const uint* row0 [[buffer(3)]],
+                           device const uint* max_d [[buffer(4)]], device const uint* gate [[buffer(5)]],
+                           device bfloat* frag [[buffer(6)]], constant DraftCorrArgs& a [[buffer(7)]],
+                           uint2 t [[thread_position_in_grid]]) {
+  const uint c = t.x, j = t.y;
+  if (c >= a.H || j >= a.n || gate[0] == 0 || a.s2 >= max_d[j]) return;
+  const float v = dh[size_t(row0[j] + a.s2 + 1) * a.H + c] + y1[size_t(j) * a.H + c] + y2[size_t(j) * a.H + c];
+  frag[frag_off(j, c, a.H)] = bfloat(v);
 }

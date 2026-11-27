@@ -14,6 +14,8 @@ using Lookup = opus_lookup::Lookup;
 struct Stats {
   uint32_t rounds = 0, accepted = 0, rows = 0, drafts = 0, lk_only = 0, lk_proposed = 0, lk_tested = 0, lk_accepted = 0;
   double draft_ms = 0, verify_ms = 0;
+  // per round: drafts accepted (a) and candidates verified (c.size()), 0..MAXM
+  uint32_t acc_hist[hy4::MAXM + 1] = {}, cand_hist[hy4::MAXM + 1] = {}, full = 0;
 };
 
 // one round's candidates after the anchor, and what acceptance needs to score them
@@ -153,6 +155,9 @@ struct Spec {
     st.rounds++;
     st.accepted += a;
     st.rows += uint32_t(c.size()) + 1;
+    st.acc_hist[std::min<uint32_t>(a, hy4::MAXM)]++;
+    st.cand_hist[std::min<size_t>(c.size(), hy4::MAXM)]++;
+    st.full += c.size() > 0 && a == c.size();
     st.draft_ms += pr.draft_ms;
     st.verify_ms += verify_ms;
   }
@@ -166,7 +171,24 @@ struct Spec {
     rows.insert(rows.end(), pr.c.begin(), pr.c.end());
     double g2 = 0;
     auto g = m.step(rows, &g2);
+    const size_t o0 = out.size();
     finish(m, pr, g.data(), 0, g2, b, sx, ss, out);
+    // HY4_SPEC_DUMP=path: one JSON line per round with every draft's confidence signals and the accepted count
+    // (with HY4_DRAFT_CUT=0 HY4_DRAFT_ADAPT=0 HY4_LOOKUP=0 every draft is verified: offline policy replay)
+    static FILE* dump = getenv("HY4_SPEC_DUMP") ? fopen(getenv("HY4_SPEC_DUMP"), "a") : nullptr;
+    if (dump && !m.last_probs.empty()) {
+      auto arr = [&](const char* k, const std::vector<float>& v) {
+        fprintf(dump, ",\"%s\":[", k);
+        for (size_t i = 0; i < v.size(); i++) fprintf(dump, "%s%.6g", i ? "," : "", std::isfinite(v[i]) ? v[i] : 1e9f);
+        fprintf(dump, "]");
+      };
+      fprintf(dump, "{\"a\":%zu,\"k\":%zu,\"T\":%.3f", out.size() - o0 - 1, pr.c.size(), m.temp);
+      arr("p", m.last_probs);
+      arr("pm", m.last_pmax);
+      arr("mg", m.last_marg);
+      fprintf(dump, "}\n");
+      fflush(dump);
+    }
   }
 
   // Joint speculation: each lane proposes within a dynamic share of `rows` (its anchor included), one

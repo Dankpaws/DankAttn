@@ -37,7 +37,8 @@ struct Config {
 
   // DFly2 drafter & speculation
   bool no_dfly = env_set("HY4_NO_DFLY");
-  uint32_t dblock = env_u("HY4_DBLOCK", 0);  // 0 = max(manifest.block, 8)
+  int dfly_unwired = env_i("HY4_DFLY_UNWIRED", -1);  // -1 = auto (on for MoE drafters), 0/1 overrides
+  uint32_t dblock = env_u("HY4_DBLOCK", 0);  // 0 = max(manifest.block, 8) (or manifest.block for AC)
   float draft_cut = float(env_f("HY4_DRAFT_CUT", 0.2));
   bool draft_adapt = env_b("HY4_DRAFT_ADAPT", true);   // fan-out-aware expected-tok/ms draft length selector
   double draft_pscale = env_f("HY4_DRAFT_PSCALE", 1.0);
