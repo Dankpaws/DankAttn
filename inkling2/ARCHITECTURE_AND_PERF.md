@@ -1,6 +1,6 @@
 # DankAttn (Inkling-2-Mini) Architecture, Benchmarks & Engineering Log
 
-> Last updated: 2026-11-22 (branch `inkling2-decode-fusion`, HEAD `a501d5d`: decode tuning on top of `inkling2-lanes-fpr` `9bcfe2b`, see *Decode Tuning*; earlier tables measured at the commits they name; benchmarked on Apple M5 Ultra Mac Studio 96 GB and Base M5 MacBook Pro 32 GB).
+> Last updated: 2026-11-26 (DFlash2 drafter overlay + Metal 4 engine support on top of `inkling2-decode-fusion` and `inkling2-lanes-fpr`; benchmarked on Apple M5 Ultra Mac Studio 96 GB and Base M5 MacBook Pro 32 GB).
 
 ## 1. Model & Pack Architecture (`pack-inkling2-mini-w8`)
 
@@ -178,9 +178,13 @@ python3 inkling2/convert/pack_inkling2.py \
   --model /path/to/Inkling-2-Mini \
   --out /path/to/pack-inkling2-mini-w8
 
-# 2. Pack DSpark MTP drafter overlay (~382 MB) into the same pack directory
+# 2. Pack DSpark MTP drafter overlay (~382 MB) and/or DFlash2 overlay (~543 MiB) into the same pack directory
 python3 inkling2/convert/pack_mtp.py \
   --model /path/to/Inkling-2-Mini \
+  --out /path/to/pack-inkling2-mini-w8
+
+python3 inkling2/convert/pack_dflash2.py \
+  --dflash2 /path/to/Inkling-2-Mini-DFlash2 \
   --out /path/to/pack-inkling2-mini-w8
 ```
 
@@ -211,7 +215,8 @@ sh inkling2/build_inkling2.sh
 | `INK_CAP` | `32768` | Global KV cache capacity in tokens (up to `131072` in 32 GB RAM with `kv8=1`) |
 | `INK_PASSES` | `3` | Number of core loop passes (`1..3`, default from manifest) |
 | `INK_KV8` | `1` | `1`: int8 quantized global KV cache (`kv8`); `0`: BF16 global KV |
-| `INK_DRAFT_K` | `7` | Max DSpark draft tokens per round (`1..7`, verify `M = 1 + K`) |
+| `INK_DRAFTER` | `auto` | `auto`: prefer `dflash2_manifest.json` if present, else `mtp_manifest.json` (DSpark); explicit `dflash2`, `dspark`, or `none` |
+| `INK_DRAFT_K` | `7` | Max draft tokens per round (`1..7`, verify `M = 1 + K`) |
 | `INK_DRAFT_CUT` | `0.50` | Legacy per-token DSpark cutoff when `INK_DRAFT_ADAPT=0` (`0.0` disables) |
 | `INK_DRAFT_ADAPT` | `1` | `1`: fan-out-aware expected-tok/ms draft length selector (`select_draft_k`); `0`: legacy `INK_DRAFT_CUT` |
 | `INK_PCACHE` / `INK_PCACHE_GB` / `INK_PCACHE_FREE_GB` | `<tree>/pcache_ink` / `20` / `15` | `serve`: persistent SSD prefix cache dir (`0` disables), LRU GB budget, and free-disk reserve GB |
@@ -262,6 +267,15 @@ sh inkling2/build_inkling2.sh
   - Added `#if ATT_FORK` global FlashAttention (`p_attn_pf_global_kv8_fork` / `p_attn_pf_global_bf16_fork`) so forked side lanes prefill long suffixes at `MP=512` speed (non-forked prefill shader unchanged), plus `fork_lane_at()` to fork from Lane 0's checkpoint `ck0.pos` + saved `sconv` even while Lane 0 is actively decoding past it.
   - `pick_lane()` / `admit_requests()` now Split-KV fork Lane 0 (`h0` or `ck0`) into idle side lanes when a concurrent request shares Lane 0's prefix and its suffix fits `INK_SIDE_CAP` (`INK_SPLITKV_SERVE=1`), guarded by `active_fork_floor()` (prevents Lane 0 reset/rewind below any live forked lane's `fork_pos`) and `invalidate_stale_forks()`. Also wired SSD `pcache` into `run_fpr()` Stage 0.
   - **Measured on Studio** (`INK_CAP=32768`, `INK_LANES=4`, `INK_SIDE_CAP=4096`, `INK_RING_SLACK=4096`, 4 concurrent ~9.4k prompts > `side_cap` sharing an 8,558-token primed prefix + ~780–1,030-token suffixes, 220 greedy tok each): `INK_SPLITKV_SERVE=0` **12.67 s wall / 69.5 tok/s** (T1–T3 serialized cold on L0) → `INK_SPLITKV_SERVE=1` **3.92 s wall / 224.3 tok/s (3.23× faster)**, 307–362 ms suffix prefill per lane, **4/4 byte-exact** vs. solo L0 at the same 8,558 prefix. `vtest` `0.000e+00`, `forktest` `bad_tok=0 bad_lg=0 bad_draft=0 bad_prom=0`.
+- **DFlash2 Block-Diffusion Drafter Overlay (`incoai/Inkling-2-Mini-DFlash2`, 2026-11-26)**:
+  - Added `inkling2/convert/pack_dflash2.py` (543 MiB overlay `pack-df2-00.bin` + `dflash2_manifest.json`, coexisting cleanly with DSpark `pack-mtp-00.bin` via `INK_DRAFTER=auto|dflash2|dspark|none`).
+  - Architecture: 5 sliding-window (`window=2048`) Qwen3 layers (`H=2304, I=6144` W6, `Q=18, KV=6, hd=128`, NeoX RoPE `theta=1e6`, 2-tap grouped dynamic convolutions `ink_df2_conv`), reusing the exact same 4 target taps `[5, 23, 41, 48]` via `ink_df2_cat_taps` + `fc` W6 + `hidden_norm`, followed by a single `lm_head` matmul + 2-pass Top-16 candidate extractor (`ink_df2_topk16_p1`/`p2`) and rank-256 `select_head` path selector (`ink_df2_select`, coupled Gumbel-max sampling). Because all 5 layers are SWA-2048, GPU state at `cap=32k` drops `1.38 → 1.30 GB` (−5.8%).
+  - Added 8-way split-K SWA-2048 block attention (`ink_df2_attn_split` + `ink_df2_attn_reduce`, cutting draft latency `3.28 → 2.39 ms` at 4k+ context), batched `draft_lanes()` + batched `mtp_commit_lanes()`, and `mtp_window=2048` ring handling in `fork_lane`, `fork_lane_at`, `promote_lane`, `save_prefix`, and `load_prefix`.
+  - **Bit-exactness (Studio & MBP)**: `vtest` `0.000e+00`, `forktest` (`pref=1500, lanes=4, gen=16`) `bad_tok=0 bad_lg=0 bad_draft=0 bad_prom=0`, `ctest` (`n_pref=1500`) `0.000e+00`, `spec` `256/256` exact (greedy & `T=1.0, min_p=0.02`), `jspec` `1024/1024` (Studio) and `128/256/512` (MBP) exact.
+  - **M5 Ultra Live Server (`bench.py`, 131k cap, 8 lanes, greedy, 512 tok/stream)**: Single-stream Code `146.0 → 154.5 tok/s` (**+5.9%**), Single-stream Prose `117.5 → 145.7 tok/s` (**+24.0%**), 4 Concurrent Streams `265.8 → 295.0 tok/s` (**+11.0%**), 8 Concurrent Streams `368.5 → 379.6 tok/s` (**+3.0%**).
+  - **M5 Ultra CLI `spec 256` (4k prompts, 100% exact)**: Code greedy (`lk=0`) `279.7 → 314.8 tok/s` (+12.5%, `6.69 → 7.73 tok/rnd`), Code `T=1.0, min_p=0.02` (`lk=0`) `273.4 → 306.6 tok/s` (+12.1%), Doc greedy (`lk=1`) `162.7 → 183.7 tok/s` (+12.9%), 4-lane `jspec` greedy (`lk=1`) `290.5 → 310.5 tok/s` (+6.9%). Caveat: on high-entropy `T=1.0` doc continuation, DFlash2 trails DSpark (`115.1 → 110.3` 1-lane, `264.8 → 235.6` 4-lane) due to 5L vs 3L draft cost and the Top-16 candidate cap.
+  - **Base M5 MacBook Pro (32 GB, 153 GB/s, interleaved DSpark vs. DFlash2, 100% exact)**: `code_prompt.bin` greedy `50.7 → 62.9 tok/s` (**+24.1%**, draft `8.50 → 7.60 ms`, `4.25 → 5.57 tok/rnd`), `T=1.0, min_p=0.02` `58.3 → 69.0 tok/s` (**+18.4%**), `jspec` 1/2/4 lanes (4k doc, 8k cap) `27.0 → 29.8` (+10.4%) / `39.6 → 44.4` (+12.1%) / `53.6 → 56.6 tok/s` (+5.6%).
+  - **Rejected in the same cycle**: `ATT_QM = 2/4` prefill Q-tile widening in `ink_attn_pf_mma` (byte-identical, regressed −2.8% to −27.3% across 2k–64k due to cooperative-tensor register/occupancy limits); `INK_CROSS_LANE=1` cross-lane draft-slot allocator (100% exact, regressed wall tok/s due to `draft_lanes` multi-chunk splits and tail-lane starvation); `full_lse` in DFlash2 `topk16` (combined with `p_scale=0.85` over-trimmed drafts `7.73 → 6.50 tok/rnd`).
 
 ### Open Questions
 - Why DankAttn reasons shorter than SGLang at 128k (1,277 vs 1,778 mean generated tokens on RULER): base vs. uncensored checkpoint, or numerics. A base-checkpoint SGLang RULER run would separate them.

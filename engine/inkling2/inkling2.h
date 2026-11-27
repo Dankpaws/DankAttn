@@ -237,6 +237,9 @@ struct MtpLayer {
   uint32_t cap = 0;
   Raw dflare_norm, attn_norm, mlp_norm, q_norm, k_norm, k_norm_ctx;
   Lin qkv, kv_ctx, o, mlp_gu, mlp_dn;
+  // DFlash 2 dynamic convolutions (populated when is_dflash2 == true)
+  Raw attn_conv_base, mlp_conv_base;
+  Lin attn_conv_kproj, mlp_conv_kproj;
   id<MTLBuffer> k_cache = nil, v_cache = nil;
 };
 
@@ -339,15 +342,22 @@ struct Model {
     const Samp* sp;
   };
 
-  // DSpark MTP drafter (optional overlay: mtp_manifest.json + pack-mtp-00.bin)
+  // DSpark / DFlash 2 drafter (optional overlay: mtp_manifest.json or dflash2_manifest.json)
   bool has_mtp = false;
+  bool is_dflash2 = false;
   uint32_t mtp_nL = 3, mtp_I = 9216, mtp_block = 8, mtp_rank = 256;
+  uint32_t mtp_nh = 24, mtp_nkv = 8, mtp_window = 1024;
+  uint32_t df2_mask_id = 200056, df2_conv_gs = 16;
+  float df2_softcap = 30.0f;
   float mtp_rope_theta = 1000000.0f;
   uint32_t mtp_taps[4] = {5, 23, 41, 48};
   uint32_t mtp_ctx_pos = 0;
   Raw mtp_fuse_alpha, mtp_mask_embed, mtp_norm;
   Raw mtp_mh_dflare_norm, mtp_mh_markov_w1, mtp_mh_rnn_w, mtp_mh_rnn_b, mtp_mh_fold_b;
   Lin mtp_mh_fold_w;
+  // DFlash 2 shared weights
+  Lin df2_fc, df2_sel_hproj;
+  Raw df2_hidden_norm, df2_sel_pred_cb, df2_sel_succ_cb;
   std::vector<MtpLayer> MtpL;
 
   // Pipelines
@@ -373,10 +383,13 @@ struct Model {
   id<MTLComputePipelineState> p_moe_fp8_gu, p_moe_fp8_dn;
   id<MTLComputePipelineState> p_mmpg_fp4_gu, p_mmpg_fp4_dn;
   id<MTLComputePipelineState> p_mmpg_fp8_gu, p_mmpg_fp8_dn;
-  // DSpark pipelines
+  // DSpark & DFlash 2 pipelines
   id<MTLComputePipelineState> p_mtp_mix, p_mtp_kv_ctx, p_mtp_embed, p_mtp_qkv_rope;
   id<MTLComputePipelineState> p_mtp_attn, p_add_rms_frag, p_mtp_rnn_static, p_mtp_rnn_dyn, p_mtp_rnn_gates;
   id<MTLComputePipelineState> p_mtp_add_argmax_p1, p_mtp_add_argmax_p2, p_pack_frag_rows, p_sample_rows;
+  id<MTLComputePipelineState> p_df2_cat_taps, p_df2_rms, p_df2_conv, p_df2_attn;
+  id<MTLComputePipelineState> p_df2_attn_split, p_df2_attn_reduce;
+  id<MTLComputePipelineState> p_df2_topk16_p1, p_df2_topk16_p2, p_df2_select, p_df2_w6_gu;
   id<MTLResidencySet> rs = nil;
   id<MTLHeap> scratch_heap = nil;
 
@@ -401,6 +414,10 @@ struct Model {
   id<MTLBuffer> b_mtp_base_h, b_mtp_base_logits, b_mtp_bias;
   id<MTLBuffer> b_mtp_rnn_state, b_mtp_rnn_static, b_mtp_rnn_proj, b_mtp_lat_frag;
   id<MTLBuffer> b_mtp_prev_tok, b_mtp_draft_out, b_mtp_draft_probs, b_mtp_part_l, b_mtp_part_x, b_samp_rows;
+  // DFlash 2 scratch buffers
+  id<MTLBuffer> b_df2_taps_frag, b_df2_ctx_h, b_df2_h_norm, b_df2_dyn, b_df2_hsel;
+  id<MTLBuffer> b_df2_pv, b_df2_pi, b_df2_tv, b_df2_ti, b_df2_ids;
+  id<MTLBuffer> b_df2_plse, b_df2_flse, b_df2_apart, b_df2_h_final;
 
   void load(const std::string& pack_dir, uint32_t max_cap = 32768, uint32_t passes_override = 0, bool kv8 = true);
   void reset();

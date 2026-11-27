@@ -6,9 +6,9 @@ DankAttn is a from-scratch Metal 4 inference engine for Apple Silicon, written i
 
 It currently targets four architectures:
 
-- **Inkling-2-Mini (`engine/inkling2/`)**: `thinkingmachines/Inkling-2-Mini` (`Inkling2LoopForConditionalGeneration`): 26.4B total / 3.4B physical active / 5.4B effective active via a 3-pass looped core (24 physical -> 48 logical layers: 40 SWA-1024 + 8 `kv8` global, native lossless NVFP4/MXFP8 MoE, DankAttn W8 attention/unembed, DSpark MTP drafter + 3-gram lookup). Fits in **32 GB Apple Silicon** (`~21.1 GB` total at 32k context; `~22.9 GB` at 128k).
+- **Inkling-2-Mini (`engine/inkling2/`)**: `thinkingmachines/Inkling-2-Mini` (`Inkling2LoopForConditionalGeneration`): 26.4B total / 3.4B physical active / 5.4B effective active via a 3-pass looped core (24 physical -> 48 logical layers: 40 SWA-1024 + 8 `kv8` global, native lossless NVFP4/MXFP8 MoE, DankAttn W8 attention/unembed, **DFlash2** block-diffusion or DSpark MTP drafter + 3-gram lookup). Fits in **32 GB Apple Silicon** (`~21.4 GB` total at 32k context; `~23.4 GB` at 128k).
 - **ERNIE-5.5-Flash-Preview (`engine/ernie55/`)**: `ERNIE-5.5-Flash-Preview` (`ernie5_5_moe`): 43 layers (37 HCA sliding-window + C128 compressed-KV layers + 6 sparse DSA `kv8` latent layers, 4-stream Sinkhorn mHC residual mixing, 512-expert top-10 MoE in W2-g32 NF2 GPTQ + W4-g64 L1 + W8-g128 dense/attention/unembed, MultiMax head, 3-gram PLD speculation). Fits **256k context** in **96 GB Apple Silicon** (`85.51 GiB` mapped weights + `2.03 GiB` GPU state).
-- **Hy4 (`engine/hy4/`)**: `tencent/Hy4-flash` (`HYV4FlashForCausalLM`): 42 layers (30 sliding-window MLA in bf16, 12 sparse DSA with `kv8` latent caches, 512-expert MoE in W4g64 `gu` + W4g128/W6g128 `H128` `dn`, 4 SSD-offloaded `u4_g32` Engram layers with a 128 MB lock-free row cache, SigLIP2 vision, and a 5-layer DFly2 drafter).
+- **Hy4 (`engine/hy4/`)**: `tencent/Hy4-flash` (`HYV4FlashForCausalLM`): 42 layers (30 sliding-window MLA in bf16, 12 sparse DSA with `kv8` latent caches, 512-expert MoE in W4g64 `gu` + W4g128/W6g128 `H128` `dn`, 4 SSD-offloaded `u4_g32` Engram layers with a 128 MB lock-free row cache, SigLIP2 vision, and a 5-layer DFly2 / optional `dfly2-b6` W6 drafter).
 - **Flash-Next (`engine/`)**: `qwen4_exp` (GDN + sparse attention + MoE + PLE n-gram tables + MTP drafter).
 
 Everything runs directly on Apple Silicon Metal without PyTorch, MLX, or llama.cpp in the inference path. Kernels compile from source at startup with `MTLMathModeSafe` and `MTLMathFloatingPointFunctionsPrecise` so decode, verify, multi-lane batching, and speculation remain bit-identical.
@@ -58,8 +58,8 @@ Useful commands:
 - **Hardware**: Apple Silicon with Metal 4 / `MetalPerformancePrimitives` (`mpp::tensor_ops` cooperative `matmul2d`). Developed and benchmarked on an **M5 Ultra Mac Studio (96 GB)** and **Base M5 MacBook Pro (32 GB)**. Other Apple Silicon chips with Metal 4 support should work.
 - **OS & toolchain**: macOS with Metal 4.0 support and Xcode Command Line Tools (`clang++` with C++20 and Objective-C++ ARC).
 - **Memory**:
-  - For **Inkling-2-Mini (`pack-inkling2-mini-w8`)**: ~19.91 GB mapped weights (including DSpark overlay) plus ~1.33 GB GPU state at `cap=32k` (~3.37 GB at `cap=128k`), fitting comfortably on a **32 GB MacBook Pro**.
-  - For **Hy4 (`pack-v4-h128-w6`)**: ~87.4 GB mapped weights plus ~6.5 GB wired GPU state for 4 concurrent lanes (512k main slot + 3x 32k side lanes), plus fast local NVMe for the 36.9 GiB `u4_g32` Engram table (~119 GB total on disk; legacy `pack-g64-gptq-v3` with 59.0 GiB FP8 Engram remains available as `hy4-v3`).
+  - For **Inkling-2-Mini (`pack-inkling2-mini-w8`)**: ~20.1 GB mapped weights (including the DFlash2 overlay; ~19.9 GB with DSpark) plus ~1.30 GB GPU state at `cap=32k` (~3.3 GB at `cap=128k`), fitting comfortably on a **32 GB MacBook Pro**.
+  - For **Hy4 (`pack-v4-h128-w6`)**: ~87.4 GB mapped weights (`86.6 GB` wired with optional `--revision dfly2-b6` + `HY4_DFLY_UNWIRED=1`) plus ~5.0–6.5 GB wired GPU state for 4 concurrent lanes, plus fast local NVMe for the 36.9 GiB `u4_g32` Engram table (~119 GB total on disk; legacy `pack-g64-gptq-v3` with 59.0 GiB FP8 Engram remains available as `hy4-v3`).
   - For **ERNIE-5.5-Flash-Preview (`pack-ernie55-w2-g32-w8attn`)**: `85.51 GiB` mapped weights plus `2.03 GiB` wired GPU state at `cap=262144` (`87.54 GiB` total; requires `iogpu.wired_limit_mb=90112` on 96 GB Apple Silicon).
 - **Wired memory limit**: macOS defaults can cap wired GPU memory below what a 90+ GB model needs. The engine checks `iogpu.wired_limit_mb` at startup and prints the exact `sysctl` command if your limit is too low:
   ```sh
@@ -69,7 +69,7 @@ Useful commands:
 
 ## Benchmarks (M5 Ultra, Hy4 `pack-v4-h128-w6`)
 
-Pre-packed weights are available on Hugging Face: [`Dankpaws/Hy4-flash-DankAttn-v4-h128-w6`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-v4-h128-w6) (119 GB; legacy FP8-Engram `v3` remains at [`Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3) with an optional `u4-engram` revision).
+Pre-packed weights are available on Hugging Face: [`Dankpaws/Hy4-flash-DankAttn-v4-h128-w6`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-v4-h128-w6) (119 GB, plus an optional `--revision dfly2-b6` branch with the full 1024-dim W6 `DFly2-B6` drafter that adds +1.4% to +4.5% wall tok/s at `T=0.9` while keeping wired RAM 0.8 GB lower via auto `HY4_DFLY_UNWIRED=1`; legacy FP8-Engram `v3` remains at [`Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3`](https://huggingface.co/Dankpaws/Hy4-flash-DankAttn-g64-gptq-v3)).
 
 Measured on M5 Ultra (`pack-v4-h128-w6`, `kv8` on sparse layers, W4g64 `gu` + W4g128/W6g128 `H128` `dn` GPTQ experts, `u4_g32` Engram with 128 MB row cache + `F_NOCACHE` prefill fd, W8 dense/attention projections):
 
@@ -98,17 +98,19 @@ See [hy4/ARCHITECTURE_AND_PERF.md](hy4/ARCHITECTURE_AND_PERF.md) for per-op prof
 
 ![DankAttn Inkling-2-Mini Base M5 MacBook Pro Overview](assets/dankattn-inkling2-mbp.png)
 
-Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16; MMLU **86.23%** vs SGLang BF16-KV 85.96%), `kv8` on the 8 global layers, fan-out-aware adaptive DSpark MTP + 3-gram lookup, zero-copy Split-KV multi-lane serving (`:4x-fast` / `:8x-fast` / `:4x-select`), and persistent SSD prefix caching (`19.91 GB` mapped + `1.38 GB` GPU state at `cap=32k`, fits in **32 GB RAM** up to **128k context**).
+Native NVFP4 (L0–19) / MXFP8 (L20–23) MoE + DankAttn W8 attention/unembed (`KL = 0.00042` / 100% top-1 vs BF16; MMLU **86.23%** vs SGLang BF16-KV 85.96%), `kv8` on the 8 global layers, **DFlash2** block-diffusion drafter (`incoai/Inkling-2-Mini-DFlash2`, coexists with DSpark via `INK_DRAFTER=auto|dflash2|dspark|none`) + 3-gram lookup, zero-copy Split-KV multi-lane serving (`:4x-fast` / `:8x-fast` / `:4x-select`), and persistent SSD prefix caching (`20.1 GB` mapped + `1.30 GB` GPU state at `cap=32k`, fits in **32 GB RAM** up to **128k context**).
 
-Pre-packed weights are available on Hugging Face: [`Dankpaws/Inkling-2-Mini-DankAttn-w8`](https://huggingface.co/Dankpaws/Inkling-2-Mini-DankAttn-w8).
+Pre-packed weights are available on Hugging Face: [`Dankpaws/Inkling-2-Mini-DankAttn-w8`](https://huggingface.co/Dankpaws/Inkling-2-Mini-DankAttn-w8) (includes both `pack-df2-00.bin` DFlash2 and `pack-mtp-00.bin` DSpark overlays).
 
 | Workload | M5 Ultra Mac Studio (96 GB) | Base M5 MacBook Pro (32 GB) |
 | :--- | :---: | :---: |
-| `vtest` (`M=5` vs `M=1`) / `ctest` (SSD prefix) | `0.000e+00` (**BIT-EXACT**) | `0.000e+00` (**BIT-EXACT**) |
-| Prefill 2,048 / 8,192 / 32,768 tok (`MP=512`) | **4,588 / 4,288 / 3,371 tok/s GPU** | **730 / 719 tok/s GPU** (2k / 8k) |
+| `vtest` / `forktest` / `ctest` (SSD prefix) | `0.000e+00` (**BIT-EXACT**) | `0.000e+00` (**BIT-EXACT**) |
+| Prefill 2,048 / 8,192 / 32,768 tok (`MP=512`) | **4,582 / 4,292 / 3,396 tok/s GPU** | **730 / 719 tok/s GPU** (2k / 8k) |
 | Decode `M=1` (`ctx=512 / 2k / 8k`) | **93.3 / 90.6 / 89.4 tok/s GPU** (`90.6 / 88.2 / 86.9` wall) | **25.8 / 24.8 / 24.5 tok/s GPU** |
-| Speculative (`code_prompt.bin`, 256 tok) | **212.3 tok/s wall** (256/256 exact) | **43.6 tok/s wall** warm / **46.3** cold (256/256 exact) |
-| Multi-lane (`jspec` 4 lanes / `lbench` 16 lanes) | **317.1 tok/s wall** (1024/1024 exact) / **501 tok/s GPU** | **65.8 tok/s wall** (4 lanes) |
+| Live Server Single-Stream: Code / Prose (DFlash2) | **154.5 / 145.7 tok/s** (+5.9% / +24.0% vs DSpark) | — |
+| Live Server Concurrent: 4x / 8x Streams (DFlash2) | **295.0 / 379.6 tok/s** (+11.0% / +3.0% vs DSpark) | — |
+| CLI Speculative (`code_prompt.bin`, 256 tok, DFlash2) | **314.8 tok/s** greedy / **306.6** `T=1.0` (4k code, `lk=0`, 100% exact) | **62.9 tok/s** greedy / **69.0** `T=1.0` (+24.1% / +18.4% vs DSpark) |
+| Multi-lane `jspec` (4 lanes, 4k doc, DFlash2) | **310.5 tok/s wall** (1024/1024 exact) | **56.6 tok/s wall** (8k cap, 512/512 exact) |
 | Parallel Section Fill (`:4x-fast` / `:8x-fast`, live SSE) | **319.0 / 343.6 eff visible tok/s** (TTFT 1.55–2.15 s) | — |
 | SSD Prefix Cache restore (`ctest`, 1.5k / 8k tok) | **12.8 ms / 20.9 ms** (211 / 346 MB, `0.000e+00` exact) | **23.0 ms** (1.5k, `0.000e+00` exact) |
 

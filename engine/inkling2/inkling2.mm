@@ -608,9 +608,108 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   g_mmcnt = C.buf(4u * kSplitCntBytes);
   memset([g_mmcnt contents], 0, 4u * kSplitCntBytes);  // last-arrival counters start at 0; mm2 resets each after use
 
-  // Optional DSpark MTP drafter overlay
-  NSData* mjd = [NSData dataWithContentsOfFile:@((dir + "/mtp_manifest.json").c_str())];
-  if (mjd && num_passes == 3) {
+  // Optional DFlash 2 or DSpark MTP drafter overlay (INK_DRAFTER=auto|dflash2|dspark|none; auto prefers dflash2)
+  const std::string drafter_pref = getenv("INK_DRAFTER") ? std::string(getenv("INK_DRAFTER")) : "auto";
+  NSData* df2jd = (drafter_pref != "dspark" && drafter_pref != "none" && num_passes == 3)
+                      ? [NSData dataWithContentsOfFile:@((dir + "/dflash2_manifest.json").c_str())]
+                      : nil;
+  NSData* mjd = (!df2jd && drafter_pref != "dflash2" && drafter_pref != "none" && num_passes == 3)
+                    ? [NSData dataWithContentsOfFile:@((dir + "/mtp_manifest.json").c_str())]
+                    : nil;
+  if (df2jd) {
+    NSDictionary* dman = [NSJSONSerialization JSONObjectWithData:df2jd options:0 error:&err];
+    if (dman) {
+      has_mtp = true;
+      is_dflash2 = true;
+      NSDictionary* dc = dman[@"dflash2_config"];
+      mtp_nL = [dc[@"num_hidden_layers"] unsignedIntValue];
+      mtp_I = [dc[@"intermediate_size"] unsignedIntValue];
+      mtp_block = [dc[@"block_size"] unsignedIntValue];
+      mtp_rank = [dc[@"selector_rank"] unsignedIntValue];
+      mtp_nh = [dc[@"num_attention_heads"] unsignedIntValue];
+      mtp_nkv = [dc[@"num_key_value_heads"] unsignedIntValue];
+      mtp_window = [dc[@"sliding_window"] unsignedIntValue];
+      mtp_rope_theta = [dc[@"rope_theta"] floatValue];
+      df2_mask_id = [dc[@"mask_token_id"] unsignedIntValue];
+      df2_conv_gs = [dc[@"conv_group_size"] unsignedIntValue];
+      df2_softcap = [dc[@"final_logit_softcapping"] floatValue];
+      NSArray* tids = dc[@"target_layer_ids"];
+      for (uint32_t i = 0; i < 4 && i < [tids count]; i++) mtp_taps[i] = [tids[i] unsignedIntValue];
+
+      NSArray* mflist = dman[@"files"];
+      for (NSString* fn in mflist) {
+        std::string s = [fn UTF8String];
+        mtl::check_pack_filename(s);
+        mtp_files.push_back(mmap_file(C.dev, dir + "/" + s, mapped_bytes));
+      }
+      NSDictionary* mtens = dman[@"tensors"];
+      auto mraw = [&](const std::string& n) { return load_raw_from(mtens, mtp_files, n); };
+      auto mlin = [&](const std::string& n) { return load_lin_from(mtens, mtp_files, n); };
+
+      df2_fc = mlin("df2.fc");
+      df2_hidden_norm = mraw("df2.hidden_norm");
+      mtp_norm = mraw("df2.norm");
+      df2_sel_hproj = mlin("df2.sel.hproj");
+      df2_sel_pred_cb = mraw("df2.sel.pred_cb");
+      df2_sel_succ_cb = mraw("df2.sel.succ_cb");
+
+      MtpL.resize(mtp_nL);
+      for (uint32_t l = 0; l < mtp_nL; l++) {
+        auto& ml = MtpL[l];
+        std::string p = "df2.L" + std::to_string(l);
+        ml.is_local = true;
+        ml.cap = mtp_window + MP + ring_extra;
+        ml.attn_norm = mraw(p + ".attn_norm");
+        ml.mlp_norm = mraw(p + ".mlp_norm");
+        ml.q_norm = mraw(p + ".q_norm");
+        ml.k_norm = mraw(p + ".k_norm");
+        ml.k_norm_ctx = ml.k_norm;
+        ml.qkv = mlin(p + ".attn.qkv");
+        ml.kv_ctx = mlin(p + ".attn.kv");
+        ml.o = mlin(p + ".attn.o");
+        ml.attn_conv_base = mraw(p + ".attn_conv.base");
+        ml.attn_conv_kproj = mlin(p + ".attn_conv.kproj");
+        ml.mlp_gu = mlin(p + ".mlp.gu");
+        ml.mlp_dn = mlin(p + ".mlp.dn");
+        ml.mlp_conv_base = mraw(p + ".mlp_conv.base");
+        ml.mlp_conv_kproj = mlin(p + ".mlp_conv.kproj");
+        size_t kvb = size_t(ml.cap) * mtp_nkv * hd * sizeof(uint16_t);
+        ml.k_cache = C.buf(kvb);
+        ml.v_cache = C.buf(kvb);
+      }
+
+      b_taps = C.buf(4u * MP * H * sizeof(float));
+      b_mtp_f_rnn = C.buf(H * sizeof(float));
+      b_mtp_h = C.buf(MTP_MAXB * H * sizeof(float));
+      b_mtp_frag = C.buf(MP * H * sizeof(uint16_t));
+      b_mtp_qkv = C.buf(MTP_MAXB * (mtp_nh * hd + 2u * mtp_nkv * hd) * sizeof(float));
+      b_mtp_kv_ctx = C.buf(MP * 2u * mtp_nkv * hd * sizeof(float));
+      b_mtp_Q = C.buf(MTP_MAXB * mtp_nh * hd * sizeof(float));
+      b_mtp_K_blk = C.buf(MTP_MAXB * mtp_nkv * hd * sizeof(uint16_t));
+      b_mtp_V_blk = C.buf(MTP_MAXB * mtp_nkv * hd * sizeof(uint16_t));
+      b_mtp_o_frag = C.buf(MTP_MAXB * mtp_nh * hd * sizeof(uint16_t));
+      b_mtp_o_out = C.buf(MTP_MAXB * H * sizeof(float));
+      b_mtp_gu_frag = C.buf(MTP_MAXB * mtp_I * sizeof(uint16_t));
+      b_mtp_dn_out = C.buf(MTP_MAXB * H * sizeof(float));
+      b_mtp_base_logits = C.buf(MAXM * vocab_pad * sizeof(float));
+      b_mtp_draft_out = C.buf(MTP_MAXL * MAXM * sizeof(uint32_t));
+      b_mtp_draft_probs = C.buf(MTP_MAXL * MAXM * sizeof(float));
+      b_df2_taps_frag = C.buf(MP * 4u * H * sizeof(uint16_t));
+      b_df2_ctx_h = C.buf(MP * H * sizeof(float));
+      b_df2_h_norm = C.buf(MTP_MAXB * H * sizeof(float));
+      b_df2_dyn = C.buf(MTP_MAXB * (4u * (H / df2_conv_gs)) * sizeof(float));
+      b_df2_hsel = C.buf(MAXM * mtp_rank * sizeof(float));
+      b_df2_pv = C.buf(MAXM * 64u * 16u * sizeof(float));
+      b_df2_pi = C.buf(MAXM * 64u * 16u * sizeof(uint32_t));
+      b_df2_tv = C.buf(MAXM * 16u * sizeof(float));
+      b_df2_ti = C.buf(MAXM * 16u * sizeof(uint32_t));
+      b_df2_ids = C.buf(MTP_MAXB * sizeof(uint32_t));
+      b_df2_plse = C.buf(MAXM * 64u * 2u * sizeof(float));
+      b_df2_flse = C.buf(MAXM * 2u * sizeof(float));
+      b_df2_apart = C.buf(MTP_MAXB * mtp_nh * 8u * 130u * sizeof(float));
+      b_df2_h_final = C.buf(MTP_MAXB * H * sizeof(float));
+    }
+  } else if (mjd && num_passes == 3) {
     NSDictionary* mman = [NSJSONSerialization JSONObjectWithData:mjd options:0 error:&err];
     if (mman) {
       has_mtp = true;
@@ -809,6 +908,18 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     p_mmp_w8_mtp = C.pipe(mm_src, "mmp", {{"WBITS", "8"}, {"GS", "128"}, {"MMP_CH", "4"}, {"MMP_NF", "1"}, {"MMP_FAST", "0"}});
     p_mmp_w6_gu = C.pipe(mm_src, "mmp", {{"WBITS", mb}, {"GS", "128"}, {"MMP_CH", "4"}, {"MMP_NF", "1"}, {"MMP_FAST", "0"}, {"EPI", "3"}});
     p_mmp_w6_dn = C.pipe(mm_src, "mmp", {{"WBITS", mb}, {"GS", "128"}, {"MMP_CH", "4"}, {"MMP_NF", "1"}, {"MMP_FAST", "0"}});
+    if (is_dflash2) {
+      p_df2_cat_taps = C.pipe(ink_src, "ink_df2_cat_taps");
+      p_df2_rms = C.pipe(ink_src, "ink_df2_rms");
+      p_df2_conv = C.pipe(ink_src, "ink_df2_conv");
+      p_df2_attn = C.pipe(ink_src, "ink_df2_attn");
+      p_df2_attn_split = C.pipe(ink_src, "ink_df2_attn_split");
+      p_df2_attn_reduce = C.pipe(ink_src, "ink_df2_attn_reduce");
+      p_df2_topk16_p1 = C.pipe(ink_src, "ink_df2_topk16_p1");
+      p_df2_topk16_p2 = C.pipe(ink_src, "ink_df2_topk16_p2");
+      p_df2_select = C.pipe(ink_src, "ink_df2_select");
+      p_df2_w6_gu = C.pipe(mm_src, "mm2", {{"WBITS", mb}, {"GS", "128"}, {"TILES", "1"}, {"EPI", "3"}});
+    }
   }
 
   // Attach residency set for mapped weight shards + KV caches
@@ -844,11 +955,12 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
     auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
     for (unsigned char c : dir) mix(c);
     mix(mapped_bytes); mix(H); mix(nL); mix(num_passes); mix(window);
-    mix(use_kv8 ? 1u : 0u); mix(has_mtp ? 1u : 0u); mix(uint64_t(S.size()));
+    mix(use_kv8 ? 1u : 0u); mix(has_mtp ? 1u : 0u); mix(is_dflash2 ? 1u : 0u); mix(uint64_t(S.size()));
     fingerprint = h;
   }
-  fprintf(stderr, "inkling2: loaded %s (%.2f GB mapped, %.2f GB GPU state, %u phys -> %u logical, %u passes, cap=%u, kv8=%d, dspark=%d)\n",
-          dir.c_str(), mapped_bytes / 1e9, C.allocated / 1e9, nL, uint32_t(S.size()), num_passes, cap, int(use_kv8), int(has_mtp));
+  fprintf(stderr, "inkling2: loaded %s (%.2f GB mapped, %.2f GB GPU state, %u phys -> %u logical, %u passes, cap=%u, kv8=%d, drafter=%s)\n",
+          dir.c_str(), mapped_bytes / 1e9, C.allocated / 1e9, nL, uint32_t(S.size()), num_passes, cap, int(use_kv8),
+          is_dflash2 ? "dflash2" : (has_mtp ? "dspark" : "none"));
 }
 
 void Model::alloc_state(std::vector<LogicalState>& SS, uint32_t global_cap) {
@@ -992,9 +1104,9 @@ void Model::fork_lane(int src, int dst) {
   id<MTLCommandBuffer> cb = [C.q commandBuffer];
   id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
   const size_t kv_row_bf16 = size_t(nkv) * hd * sizeof(uint16_t);
-  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap) {
+  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap, uint32_t win) {
     if (len == 0u) return;
-    const uint32_t t0 = (len > window) ? (len - window) : 0u;
+    const uint32_t t0 = (len > win) ? (len - win) : 0u;
     const uint32_t n = len - t0;
     const uint32_t s0 = t0 % rcap;
     const uint32_t first = std::min(n, rcap - s0);
@@ -1008,8 +1120,8 @@ void Model::fork_lane(int src, int dst) {
   };
   for (size_t i = 0; i < src_S.size(); i++) {
     if (!L[src_S[i].phys_idx].is_local) continue;
-    blit_ring(src_S[i].k_cache, dst_S[i].k_cache, P, src_S[i].cap);
-    blit_ring(src_S[i].v_cache, dst_S[i].v_cache, P, src_S[i].cap);
+    blit_ring(src_S[i].k_cache, dst_S[i].k_cache, P, src_S[i].cap, window);
+    blit_ring(src_S[i].v_cache, dst_S[i].v_cache, P, src_S[i].cap, window);
   }
   if (has_mtp) {
     const uint32_t mp = (src == active_lane) ? mtp_ctx_pos : lanes_[src].mtp_ctx_pos;
@@ -1024,8 +1136,8 @@ void Model::fork_lane(int src, int dst) {
       id<MTLBuffer> dk = (dst == active_lane) ? MtpL[l].k_cache : lanes_[dst].mtp_k[l];
       id<MTLBuffer> dv = (dst == active_lane) ? MtpL[l].v_cache : lanes_[dst].mtp_v[l];
       const uint32_t rcap = (src == active_lane) ? MtpL[l].cap : lanes_[src].mtp_cap[l];
-      blit_ring(sk, dk, mp, rcap);
-      blit_ring(sv, dv, mp, rcap);
+      blit_ring(sk, dk, mp, rcap, mtp_window);
+      blit_ring(sv, dv, mp, rcap, mtp_window);
     }
   }
   [blit endEncoding];
@@ -1060,9 +1172,9 @@ void Model::fork_lane_at(int src, int dst, uint32_t P, const std::vector<uint8_t
   id<MTLCommandBuffer> cb = [C.q commandBuffer];
   id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
   const size_t kv_row_bf16 = size_t(nkv) * hd * sizeof(uint16_t);
-  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap) {
+  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap, uint32_t win) {
     if (len == 0u) return;
-    const uint32_t t0 = (len > window) ? (len - window) : 0u;
+    const uint32_t t0 = (len > win) ? (len - win) : 0u;
     const uint32_t n = len - t0;
     const uint32_t s0 = t0 % rcap;
     const uint32_t first = std::min(n, rcap - s0);
@@ -1076,8 +1188,8 @@ void Model::fork_lane_at(int src, int dst, uint32_t P, const std::vector<uint8_t
   };
   for (size_t i = 0; i < src_S.size(); i++) {
     if (!L[src_S[i].phys_idx].is_local) continue;
-    blit_ring(src_S[i].k_cache, dst_S[i].k_cache, P, src_S[i].cap);
-    blit_ring(src_S[i].v_cache, dst_S[i].v_cache, P, src_S[i].cap);
+    blit_ring(src_S[i].k_cache, dst_S[i].k_cache, P, src_S[i].cap, window);
+    blit_ring(src_S[i].v_cache, dst_S[i].v_cache, P, src_S[i].cap, window);
   }
   if (has_mtp) {
     (dst == active_lane ? mtp_ctx_pos : lanes_[dst].mtp_ctx_pos) = P;
@@ -1088,8 +1200,8 @@ void Model::fork_lane_at(int src, int dst, uint32_t P, const std::vector<uint8_t
       id<MTLBuffer> dk = (dst == active_lane) ? MtpL[l].k_cache : lanes_[dst].mtp_k[l];
       id<MTLBuffer> dv = (dst == active_lane) ? MtpL[l].v_cache : lanes_[dst].mtp_v[l];
       const uint32_t rcap = (src == active_lane) ? MtpL[l].cap : lanes_[src].mtp_cap[l];
-      blit_ring(sk, dk, P, rcap);
-      blit_ring(sv, dv, P, rcap);
+      blit_ring(sk, dk, P, rcap, mtp_window);
+      blit_ring(sv, dv, P, rcap, mtp_window);
     }
   }
   [blit endEncoding];
@@ -1128,9 +1240,9 @@ void Model::promote_lane(int src, int dst) {
   const size_t kv_row_bf16 = size_t(nkv) * hd * sizeof(uint16_t);
   const size_t kv_row_i8 = size_t(nkv) * hd;
   const size_t sc_row = size_t(nkv) * sizeof(uint16_t);
-  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap) {
+  auto blit_ring = [&](id<MTLBuffer> sb, id<MTLBuffer> db, uint32_t len, uint32_t rcap, uint32_t win) {
     if (len == 0u) return;
-    const uint32_t t0 = (len > window) ? (len - window) : 0u;
+    const uint32_t t0 = (len > win) ? (len - win) : 0u;
     const uint32_t n = len - t0;
     const uint32_t s0 = t0 % rcap;
     const uint32_t first = std::min(n, rcap - s0);
@@ -1146,8 +1258,8 @@ void Model::promote_lane(int src, int dst) {
     const auto& ss = src_S[i];
     auto& ds = dst_S[i];
     if (L[ss.phys_idx].is_local) {
-      blit_ring(ss.k_cache, ds.k_cache, E, ss.cap);
-      blit_ring(ss.v_cache, ds.v_cache, E, ss.cap);
+      blit_ring(ss.k_cache, ds.k_cache, E, ss.cap, window);
+      blit_ring(ss.v_cache, ds.v_cache, E, ss.cap, window);
     } else if (n_gen > 0u) {
       if (ss.kv8) {
         [blit copyFromBuffer:ss.k_i8 sourceOffset:0 toBuffer:ds.k_i8 destinationOffset:size_t(P) * kv_row_i8 size:size_t(n_gen) * kv_row_i8];
@@ -1173,8 +1285,8 @@ void Model::promote_lane(int src, int dst) {
       id<MTLBuffer> dv = (dst == active_lane) ? MtpL[l].v_cache : lanes_[dst].mtp_v[l];
       if (MtpL[l].is_local) {
         const uint32_t rcap = (src == active_lane) ? MtpL[l].cap : lanes_[src].mtp_cap[l];
-        blit_ring(sk, dk, mp, rcap);
-        blit_ring(sv, dv, mp, rcap);
+        blit_ring(sk, dk, mp, rcap, mtp_window);
+        blit_ring(sv, dv, mp, rcap, mtp_window);
       } else if (mp > P) {
         const uint32_t mg = mp - P;
         [blit copyFromBuffer:sk sourceOffset:0 toBuffer:dk destinationOffset:size_t(P) * kv_row_bf16 size:size_t(mg) * kv_row_bf16];
@@ -2505,11 +2617,75 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   return out;
 }
 
+struct Df2CatArgs { uint32_t H, MP, row0; };
+struct Df2RmsArgs { uint32_t H, row_off, write_f32, write_frag; float eps; };
+struct Df2ConvArgs { uint32_t H, group_size, stage, B; };
+struct Df2AttnSplitArgs { uint32_t B, nh, nkv, hd, ctx_len, cap, window, n_splits, out_row0; };
+struct Df2TopkArgs { uint32_t V_valid, V_pad; };
+struct Df2SelArgs {
+  uint32_t gamma, anchor_tok, pos0, seed0, seed1, top_k;
+  float inv_temp, log_min_p, top_p, softcap;
+};
+
 void Model::mtp_commit(uint32_t n_commit, double* gpu_ms) {
   if (!has_mtp || n_commit == 0) return;
   id<MTLCommandBuffer> cb = [C.q commandBuffer];
   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
   auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+
+  if (is_dflash2) {
+    Df2CatArgs ca{H, MP, tap_row0};
+    [enc setComputePipelineState:p_df2_cat_taps];
+    [enc setBuffer:b_taps offset:0 atIndex:0];
+    [enc setBuffer:b_df2_taps_frag offset:0 atIndex:1];
+    [enc setBytes:&ca length:sizeof(ca) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(n_commit, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    if (n_commit > MAXM) {
+      enc_mmp(enc, p_mmp_w8, df2_fc, b_df2_taps_frag, 0, b_df2_ctx_h, 0, n_commit, b_dummy);
+    } else {
+      enc_mm2(enc, p_mm_w8, df2_fc, b_df2_taps_frag, 0, b_df2_ctx_h, 0, n_commit, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+    }
+    barrier();
+
+    Df2RmsArgs ra{H, 0u, 0u, 1u, eps};
+    [enc setComputePipelineState:p_df2_rms];
+    [enc setBuffer:b_df2_ctx_h offset:0 atIndex:0];
+    [enc setBuffer:df2_hidden_norm.b offset:df2_hidden_norm.off atIndex:1];
+    [enc setBuffer:b_dummy offset:0 atIndex:2];
+    [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+    [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(n_commit, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    for (uint32_t l = 0; l < mtp_nL; l++) {
+      auto& ml = MtpL[l];
+      if (n_commit > MAXM) {
+        enc_mmp(enc, p_mmp_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, b_dummy);
+      } else {
+        enc_mm2(enc, p_mm_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      }
+      barrier();
+
+      MtpKvArgs ka{mtp_nkv, hd, mtp_ctx_pos, ml.cap, 0u, eps, mtp_rope_theta};
+      [enc setComputePipelineState:p_mtp_kv_ctx];
+      [enc setBuffer:b_mtp_kv_ctx offset:0 atIndex:0];
+      [enc setBuffer:ml.k_norm.b offset:ml.k_norm.off atIndex:1];
+      [enc setBuffer:ml.k_cache offset:0 atIndex:2];
+      [enc setBuffer:ml.v_cache offset:0 atIndex:3];
+      [enc setBytes:&ka length:sizeof(ka) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(n_commit, mtp_nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+      barrier();
+    }
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.error) mtl::die("GPU df2_commit error", cb.error);
+    if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    mtp_ctx_pos += n_commit;
+    return;
+  }
 
   // 1. Project & cache context KV for each of the 3 MTP layers
   for (uint32_t l = 0; l < mtp_nL; l++) {
@@ -2569,6 +2745,263 @@ std::vector<uint32_t> Model::draft(uint32_t anchor_tok, uint32_t max_drafts,
   if (!has_mtp) return {};
   const uint32_t B = mtp_block;  // 8
   const uint32_t gamma = std::max(1u, std::min(max_drafts, B - 1u));
+  if (is_dflash2) {
+    uint32_t* idp = (uint32_t*)[b_df2_ids contents];
+    idp[0] = anchor_tok;
+    for (uint32_t i = 1; i < B; i++) idp[i] = df2_mask_id;
+
+    id<MTLCommandBuffer> cb = [C.q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+
+    if (n_commit > 0u) {
+      Df2CatArgs ca{H, MP, tap_row0};
+      [enc setComputePipelineState:p_df2_cat_taps];
+      [enc setBuffer:b_taps offset:0 atIndex:0];
+      [enc setBuffer:b_df2_taps_frag offset:0 atIndex:1];
+      [enc setBytes:&ca length:sizeof(ca) atIndex:2];
+      [enc dispatchThreadgroups:MTLSizeMake(n_commit, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+      if (n_commit > MAXM) enc_mmp(enc, p_mmp_w8, df2_fc, b_df2_taps_frag, 0, b_df2_ctx_h, 0, n_commit, b_dummy);
+      else enc_mm2(enc, p_mm_w8, df2_fc, b_df2_taps_frag, 0, b_df2_ctx_h, 0, n_commit, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+      Df2RmsArgs ra{H, 0u, 0u, 1u, eps};
+      [enc setComputePipelineState:p_df2_rms];
+      [enc setBuffer:b_df2_ctx_h offset:0 atIndex:0];
+      [enc setBuffer:df2_hidden_norm.b offset:df2_hidden_norm.off atIndex:1];
+      [enc setBuffer:b_dummy offset:0 atIndex:2];
+      [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+      [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(n_commit, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+      for (uint32_t l = 0; l < mtp_nL; l++) {
+        auto& ml = MtpL[l];
+        if (n_commit > MAXM) enc_mmp(enc, p_mmp_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, b_dummy);
+        else enc_mm2(enc, p_mm_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, n_commit, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+        barrier();
+        MtpKvArgs ka{mtp_nkv, hd, mtp_ctx_pos, ml.cap, 0u, eps, mtp_rope_theta};
+        [enc setComputePipelineState:p_mtp_kv_ctx];
+        [enc setBuffer:b_mtp_kv_ctx offset:0 atIndex:0];
+        [enc setBuffer:ml.k_norm.b offset:ml.k_norm.off atIndex:1];
+        [enc setBuffer:ml.k_cache offset:0 atIndex:2];
+        [enc setBuffer:ml.v_cache offset:0 atIndex:3];
+        [enc setBytes:&ka length:sizeof(ka) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(n_commit, mtp_nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+        barrier();
+      }
+      mtp_ctx_pos += n_commit;
+    }
+
+    // 1. Target input embedding (embed_norm(embed_tokens([anchor, mask..]))) -> b_mtp_h
+    [enc setComputePipelineState:p_embed];
+    [enc setBuffer:embed.b offset:embed.off atIndex:0];
+    [enc setBuffer:embed_norm.b offset:embed_norm.off atIndex:1];
+    [enc setBuffer:b_df2_ids offset:0 atIndex:2];
+    [enc setBuffer:b_mtp_h offset:0 atIndex:3];
+    [enc setBytes:&H length:4 atIndex:4];
+    [enc setBytes:&eps length:4 atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    // 2. Five Qwen3 SWA-2048 layers with 2-tap grouped dynamic convolutions
+    for (uint32_t l = 0; l < mtp_nL; l++) {
+      auto& ml = MtpL[l];
+      // Pre-attention RMSNorm -> b_df2_h_norm (f32) & b_mtp_frag (bf16 frag)
+      Df2RmsArgs ra{H, 0u, 1u, 1u, eps};
+      [enc setComputePipelineState:p_df2_rms];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:0];
+      [enc setBuffer:ml.attn_norm.b offset:ml.attn_norm.off atIndex:1];
+      [enc setBuffer:b_df2_h_norm offset:0 atIndex:2];
+      [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+      [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      // attention_conv.prepare: kproj -> b_df2_dyn, then conv stage=0 -> b_mtp_frag
+      enc_mm2(enc, p_mm_w8, ml.attn_conv_kproj, b_mtp_frag, 0, b_df2_dyn, 0, B, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+      Df2ConvArgs ca0{H, df2_conv_gs, 0u, B};
+      [enc setComputePipelineState:p_df2_conv];
+      [enc setBuffer:b_df2_h_norm offset:0 atIndex:0];
+      [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+      [enc setBuffer:ml.attn_conv_base.b offset:ml.attn_conv_base.off atIndex:2];
+      [enc setBuffer:b_dummy offset:0 atIndex:3];
+      [enc setBuffer:b_dummy offset:0 atIndex:4];
+      [enc setBuffer:b_mtp_frag offset:0 atIndex:5];
+      [enc setBytes:&ca0 length:sizeof(ca0) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      // QKV + QK-norm + RoPE (nh=32, nkv=8, theta=10000)
+      enc_mm2(enc, p_mm_w8, ml.qkv, b_mtp_frag, 0, b_mtp_qkv, 0, B, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+      MtpQkvArgs qa{mtp_nh, mtp_nkv, hd, pos, eps, mtp_rope_theta};
+      [enc setComputePipelineState:p_mtp_qkv_rope];
+      [enc setBuffer:b_mtp_qkv offset:0 atIndex:0];
+      [enc setBuffer:ml.q_norm.b offset:ml.q_norm.off atIndex:1];
+      [enc setBuffer:ml.k_norm.b offset:ml.k_norm.off atIndex:2];
+      [enc setBuffer:b_mtp_Q offset:0 atIndex:3];
+      [enc setBuffer:b_mtp_K_blk offset:0 atIndex:4];
+      [enc setBuffer:b_mtp_V_blk offset:0 atIndex:5];
+      [enc setBytes:&qa length:sizeof(qa) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nh + mtp_nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+      barrier();
+
+      // Non-causal SWA-2048 block attention (G=4, 8 key splits when ctx > 128) -> b_mtp_o_frag -> o_proj
+      if (mtp_ctx_pos > 128u) {
+        const uint32_t nsp = 8u;
+        Df2AttnSplitArgs sa_sp{B, mtp_nh, mtp_nkv, hd, mtp_ctx_pos, ml.cap, mtp_window, nsp, 0u};
+        [enc setComputePipelineState:p_df2_attn_split];
+        [enc setBuffer:b_mtp_Q offset:0 atIndex:0];
+        [enc setBuffer:ml.k_cache offset:0 atIndex:1];
+        [enc setBuffer:ml.v_cache offset:0 atIndex:2];
+        [enc setBuffer:b_mtp_K_blk offset:0 atIndex:3];
+        [enc setBuffer:b_mtp_V_blk offset:0 atIndex:4];
+        [enc setBuffer:b_df2_apart offset:0 atIndex:5];
+        [enc setBytes:&sa_sp length:sizeof(sa_sp) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nkv, nsp) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
+        [enc setComputePipelineState:p_df2_attn_reduce];
+        [enc setBuffer:b_df2_apart offset:0 atIndex:0];
+        [enc setBuffer:b_mtp_o_frag offset:0 atIndex:1];
+        [enc setBytes:&sa_sp length:sizeof(sa_sp) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nh, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      } else {
+        MtpAttnArgs aa{B, mtp_nh, mtp_nkv, hd, mtp_ctx_pos, ml.cap, mtp_window, 1u, 0u, 0u};
+        [enc setComputePipelineState:p_df2_attn];
+        [enc setBuffer:b_mtp_Q offset:0 atIndex:0];
+        [enc setBuffer:ml.k_cache offset:0 atIndex:1];
+        [enc setBuffer:ml.v_cache offset:0 atIndex:2];
+        [enc setBuffer:b_mtp_K_blk offset:0 atIndex:3];
+        [enc setBuffer:b_mtp_V_blk offset:0 atIndex:4];
+        [enc setBuffer:b_mtp_o_frag offset:0 atIndex:5];
+        [enc setBytes:&aa length:sizeof(aa) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nkv, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      barrier();
+      enc_mm2(enc, p_mm_w8, ml.o, b_mtp_o_frag, 0, b_mtp_o_out, 0, B, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+
+      // attention_conv.finish + residual add -> b_mtp_h
+      Df2ConvArgs ca1{H, df2_conv_gs, 1u, B};
+      [enc setComputePipelineState:p_df2_conv];
+      [enc setBuffer:b_mtp_o_out offset:0 atIndex:0];
+      [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+      [enc setBuffer:ml.attn_conv_base.b offset:ml.attn_conv_base.off atIndex:2];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:3];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:4];
+      [enc setBuffer:b_dummy offset:0 atIndex:5];
+      [enc setBytes:&ca1 length:sizeof(ca1) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      // Pre-MLP RMSNorm -> b_df2_h_norm & b_mtp_frag
+      [enc setComputePipelineState:p_df2_rms];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:0];
+      [enc setBuffer:ml.mlp_norm.b offset:ml.mlp_norm.off atIndex:1];
+      [enc setBuffer:b_df2_h_norm offset:0 atIndex:2];
+      [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+      [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      // mlp_conv.prepare -> b_mtp_frag -> SwiGLU (EPI=1) -> down_proj -> b_mtp_dn_out
+      enc_mm2(enc, p_mm_w8, ml.mlp_conv_kproj, b_mtp_frag, 0, b_df2_dyn, 0, B, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+      [enc setComputePipelineState:p_df2_conv];
+      [enc setBuffer:b_df2_h_norm offset:0 atIndex:0];
+      [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+      [enc setBuffer:ml.mlp_conv_base.b offset:ml.mlp_conv_base.off atIndex:2];
+      [enc setBuffer:b_dummy offset:0 atIndex:3];
+      [enc setBuffer:b_dummy offset:0 atIndex:4];
+      [enc setBuffer:b_mtp_frag offset:0 atIndex:5];
+      [enc setBytes:&ca0 length:sizeof(ca0) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      enc_mm2(enc, p_df2_w6_gu, ml.mlp_gu, b_mtp_frag, 0, b_dummy, 0, B, b_mtp_gu_frag, b_dummy, nil, nil, nil, false, mtp_I, 0, 0, big_gpu);
+      barrier();
+      enc_mm2(enc, p_mm_w6_dn, ml.mlp_dn, b_mtp_gu_frag, 0, b_mtp_dn_out, 0, B, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+
+      // mlp_conv.finish + residual add -> b_mtp_h
+      [enc setComputePipelineState:p_df2_conv];
+      [enc setBuffer:b_mtp_dn_out offset:0 atIndex:0];
+      [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+      [enc setBuffer:ml.mlp_conv_base.b offset:ml.mlp_conv_base.off atIndex:2];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:3];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:4];
+      [enc setBuffer:b_dummy offset:0 atIndex:5];
+      [enc setBytes:&ca1 length:sizeof(ca1) atIndex:6];
+      [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+    }
+
+    // 3. Final norm on draft rows 1..gamma -> b_mtp_frag [gamma, H]
+    Df2RmsArgs nra{H, 1u, 0u, 1u, eps};
+    [enc setComputePipelineState:p_df2_rms];
+    [enc setBuffer:b_mtp_h offset:0 atIndex:0];
+    [enc setBuffer:mtp_norm.b offset:mtp_norm.off atIndex:1];
+    [enc setBuffer:b_dummy offset:0 atIndex:2];
+    [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+    [enc setBytes:&nra length:sizeof(nra) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(gamma, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    // 4. Shared target lm_head (raw logits) + selector hidden_projection
+    enc_mm2(enc, p_mm_w8, lm_head, b_mtp_frag, 0, b_mtp_base_logits, 0, gamma, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+    barrier();
+    enc_mm2(enc, p_mm_w8, df2_sel_hproj, b_mtp_frag, 0, b_df2_hsel, 0, gamma, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+    barrier();
+
+    // 5. Exact Top-16 over valid_vocab_size raw logits
+    const float inv_t = samp.temp > 0.0f ? (1.0f / samp.temp) : -1.0f;
+    Df2TopkArgs tka{vocab_valid, vocab_pad};
+    [enc setComputePipelineState:p_df2_topk16_p1];
+    [enc setBuffer:b_mtp_base_logits offset:0 atIndex:0];
+    [enc setBuffer:b_df2_pv offset:0 atIndex:1];
+    [enc setBuffer:b_df2_pi offset:0 atIndex:2];
+    [enc setBytes:&tka length:sizeof(tka) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(gamma, 64, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    [enc setComputePipelineState:p_df2_topk16_p2];
+    [enc setBuffer:b_df2_pv offset:0 atIndex:0];
+    [enc setBuffer:b_df2_pi offset:0 atIndex:1];
+    [enc setBuffer:b_df2_tv offset:0 atIndex:2];
+    [enc setBuffer:b_df2_ti offset:0 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(gamma, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    // 6. Candidate path selector (post_softcap=30.0, greedy or coupled Gumbel-max)
+    Df2SelArgs sa{gamma, anchor_tok, pos, uint32_t(samp.seed), uint32_t(samp.seed >> 32), samp.top_k,
+                  inv_t, samp.min_p > 0.0f ? logf(samp.min_p) : -INFINITY,
+                  samp.top_p, df2_softcap};
+    [enc setComputePipelineState:p_df2_select];
+    [enc setBuffer:b_df2_tv offset:0 atIndex:0];
+    [enc setBuffer:b_df2_ti offset:0 atIndex:1];
+    [enc setBuffer:b_df2_hsel offset:0 atIndex:2];
+    [enc setBuffer:df2_sel_pred_cb.b offset:df2_sel_pred_cb.off atIndex:3];
+    [enc setBuffer:df2_sel_succ_cb.b offset:df2_sel_succ_cb.off atIndex:4];
+    [enc setBuffer:b_mtp_draft_out offset:0 atIndex:5];
+    [enc setBuffer:b_mtp_draft_probs offset:0 atIndex:6];
+    [enc setBytes:&sa length:sizeof(sa) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.error) mtl::die("GPU df2_draft error", cb.error);
+    if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+
+    std::vector<uint32_t> out(gamma);
+    memcpy(out.data(), [b_mtp_draft_out contents], gamma * sizeof(uint32_t));
+    if (draft_probs) {
+      draft_probs->resize(gamma);
+      memcpy(draft_probs->data(), [b_mtp_draft_probs contents], gamma * sizeof(float));
+    }
+    return out;
+  }
   *(uint32_t*)[b_mtp_prev_tok contents] = anchor_tok;
   memset([b_mtp_rnn_state contents], 0, size_t(mtp_rank) * sizeof(float));
 
@@ -2819,6 +3252,67 @@ void Model::mtp_commit_lanes(const std::vector<MtpCommitReq>& reqs, uint32_t tot
   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
   auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
 
+  if (is_dflash2) {
+    // 1. Batched cat_taps + fc + hidden_norm over all total_tap_rows in ONE pass
+    Df2CatArgs ca{H, MP, 0u};
+    [enc setComputePipelineState:p_df2_cat_taps];
+    [enc setBuffer:b_taps offset:0 atIndex:0];
+    [enc setBuffer:b_df2_taps_frag offset:0 atIndex:1];
+    [enc setBytes:&ca length:sizeof(ca) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(total_tap_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    enc_mm2(enc, p_mm_w8, df2_fc, b_df2_taps_frag, 0, b_df2_ctx_h, 0, total_tap_rows, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+    barrier();
+
+    Df2RmsArgs ra{H, 0u, 0u, 1u, eps};
+    [enc setComputePipelineState:p_df2_rms];
+    [enc setBuffer:b_df2_ctx_h offset:0 atIndex:0];
+    [enc setBuffer:df2_hidden_norm.b offset:df2_hidden_norm.off atIndex:1];
+    [enc setBuffer:b_dummy offset:0 atIndex:2];
+    [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+    [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(total_tap_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    // 2. One kv matmul per layer + concurrent per-lane kv_ctx_cache scatter
+    for (uint32_t l = 0; l < mtp_nL; l++) {
+      auto& ml = MtpL[l];
+      enc_mm2(enc, p_mm_w8, ml.kv_ctx, b_mtp_frag, 0, b_mtp_kv_ctx, 0, total_tap_rows, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+      for (const auto& rq : reqs) {
+        if (rq.n_commit == 0u) continue;
+        const int k = rq.lane;
+        id<MTLBuffer> kc = (k == active_lane) ? ml.k_cache : lanes_[k].mtp_k[l];
+        id<MTLBuffer> vc = (k == active_lane) ? ml.v_cache : lanes_[k].mtp_v[l];
+        const uint32_t mcap = (k == active_lane) ? ml.cap : lanes_[k].mtp_cap[l];
+        const uint32_t mpos = (k == active_lane) ? mtp_ctx_pos : lanes_[k].mtp_ctx_pos;
+        MtpKvArgs ka{mtp_nkv, hd, mpos, mcap, 0u, eps, mtp_rope_theta};
+        [enc setComputePipelineState:p_mtp_kv_ctx];
+        [enc setBuffer:b_mtp_kv_ctx offset:size_t(rq.tap_row0) * 2u * mtp_nkv * hd * sizeof(float) atIndex:0];
+        [enc setBuffer:ml.k_norm.b offset:ml.k_norm.off atIndex:1];
+        [enc setBuffer:kc offset:0 atIndex:2];
+        [enc setBuffer:vc offset:0 atIndex:3];
+        [enc setBytes:&ka length:sizeof(ka) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(rq.n_commit, mtp_nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+      }
+      barrier();
+    }
+    [enc endEncoding];
+    [cb commit];
+    static const bool sync_commit = getenv("INK_SYNC_COMMIT") && atoi(getenv("INK_SYNC_COMMIT")) != 0;
+    if (gpu_ms || sync_commit) {
+      [cb waitUntilCompleted];
+      if (cb.error) mtl::die("GPU df2_commit_lanes error", cb.error);
+      if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    }
+    for (const auto& rq : reqs) {
+      if (rq.lane == active_lane) mtp_ctx_pos += rq.n_commit;
+      else lanes_[rq.lane].mtp_ctx_pos += rq.n_commit;
+    }
+    return;
+  }
+
   // 1. Project & cache context KV for all lanes in ONE kv_ctx matmul per MTP layer!
   for (uint32_t l = 0; l < mtp_nL; l++) {
     auto& ml = MtpL[l];
@@ -2901,6 +3395,287 @@ void Model::draft_lanes(const std::vector<MtpDraftReq>& reqs, uint32_t max_draft
     std::vector<float> dp;
     out_drafts[0] = draft(reqs[0].anchor_tok, gamma, out_probs ? &dp : nullptr, gpu_ms, 0u);
     if (out_probs) (*out_probs)[0] = std::move(dp);
+    return;
+  }
+
+  if (is_dflash2) {
+    const uint32_t max_batch = std::max(1u, std::min<uint32_t>(MTP_MAXL, MAXM / gamma));
+    double tot_ms = 0.0;
+    for (size_t off = 0; off < reqs.size(); off += max_batch) {
+      const uint32_t L = uint32_t(std::min<size_t>(max_batch, reqs.size() - off));
+      if (L == 1u) {
+        use_lane(reqs[off].lane);
+        std::vector<float> dp;
+        double g = 0.0;
+        out_drafts[off] = draft(reqs[off].anchor_tok, gamma, out_probs ? &dp : nullptr, &g, 0u);
+        if (out_probs) (*out_probs)[off] = std::move(dp);
+        tot_ms += g;
+        continue;
+      }
+      const uint32_t MB = L * B;
+      const uint32_t total_rows = L * gamma;
+      uint32_t* idp = (uint32_t*)[b_df2_ids contents];
+      for (uint32_t i = 0; i < L; i++) {
+        idp[i * B + 0u] = reqs[off + i].anchor_tok;
+        for (uint32_t b = 1; b < B; b++) idp[i * B + b] = df2_mask_id;
+      }
+      id<MTLCommandBuffer> cb = [C.q commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+      auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+      auto enc_df2_lin = [&](id<MTLComputePipelineState> p_mm, id<MTLComputePipelineState> p_mmp, const Lin& ln,
+                             id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> epi = nil, uint32_t R = 0u) {
+        if (MB > MAXM) {
+          if (epi) enc_mmp_nf1(enc, p_mmp, ln, X, 0, b_dummy, 0, MB, epi, b_dummy, R);
+          else enc_mmp_nf1(enc, p_mmp, ln, X, 0, Y, 0, MB, b_dummy, b_dummy);
+        } else {
+          if (epi) enc_mm2(enc, p_mm, ln, X, 0, b_dummy, 0, MB, epi, b_dummy, nil, nil, nil, false, R, 0, 0, big_gpu);
+          else enc_mm2(enc, p_mm, ln, X, 0, Y, 0, MB, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+        }
+      };
+
+      // 1. Batched target input embedding over L*B tokens
+      [enc setComputePipelineState:p_embed];
+      [enc setBuffer:embed.b offset:embed.off atIndex:0];
+      [enc setBuffer:embed_norm.b offset:embed_norm.off atIndex:1];
+      [enc setBuffer:b_df2_ids offset:0 atIndex:2];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:3];
+      [enc setBytes:&H length:4 atIndex:4];
+      [enc setBytes:&eps length:4 atIndex:5];
+      [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      // 2. Five batched Qwen3 SWA-2048 layers
+      Df2RmsArgs ra{H, 0u, 1u, 1u, eps};
+      Df2ConvArgs ca0{H, df2_conv_gs, 0u, B};
+      Df2ConvArgs ca1{H, df2_conv_gs, 1u, B};
+      for (uint32_t l = 0; l < mtp_nL; l++) {
+        auto& ml = MtpL[l];
+        [enc setComputePipelineState:p_df2_rms];
+        [enc setBuffer:b_mtp_h offset:0 atIndex:0];
+        [enc setBuffer:ml.attn_norm.b offset:ml.attn_norm.off atIndex:1];
+        [enc setBuffer:b_df2_h_norm offset:0 atIndex:2];
+        [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+        [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        enc_df2_lin(p_mm_w8, p_mmp_w8_mtp, ml.attn_conv_kproj, b_mtp_frag, b_df2_dyn);
+        barrier();
+        [enc setComputePipelineState:p_df2_conv];
+        [enc setBuffer:b_df2_h_norm offset:0 atIndex:0];
+        [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+        [enc setBuffer:ml.attn_conv_base.b offset:ml.attn_conv_base.off atIndex:2];
+        [enc setBuffer:b_dummy offset:0 atIndex:3];
+        [enc setBuffer:b_dummy offset:0 atIndex:4];
+        [enc setBuffer:b_mtp_frag offset:0 atIndex:5];
+        [enc setBytes:&ca0 length:sizeof(ca0) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        enc_df2_lin(p_mm_w8, p_mmp_w8_mtp, ml.qkv, b_mtp_frag, b_mtp_qkv);
+        barrier();
+
+        const size_t qkv_lane_b = size_t(B) * (mtp_nh + 2u * mtp_nkv) * hd * sizeof(float);
+        const size_t q_lane_b = size_t(B) * mtp_nh * hd * sizeof(float);
+        const size_t kv_lane_b = size_t(B) * mtp_nkv * hd * sizeof(uint16_t);
+        for (uint32_t i = 0; i < L; i++) {
+          const int k = reqs[off + i].lane;
+          const uint32_t lpos = (k == active_lane) ? pos : lanes_[k].pos;
+          MtpQkvArgs qa{mtp_nh, mtp_nkv, hd, lpos, eps, mtp_rope_theta};
+          [enc setComputePipelineState:p_mtp_qkv_rope];
+          [enc setBuffer:b_mtp_qkv offset:size_t(i) * qkv_lane_b atIndex:0];
+          [enc setBuffer:ml.q_norm.b offset:ml.q_norm.off atIndex:1];
+          [enc setBuffer:ml.k_norm.b offset:ml.k_norm.off atIndex:2];
+          [enc setBuffer:b_mtp_Q offset:size_t(i) * q_lane_b atIndex:3];
+          [enc setBuffer:b_mtp_K_blk offset:size_t(i) * kv_lane_b atIndex:4];
+          [enc setBuffer:b_mtp_V_blk offset:size_t(i) * kv_lane_b atIndex:5];
+          [enc setBytes:&qa length:sizeof(qa) atIndex:6];
+          [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nh + mtp_nkv, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+        }
+        barrier();
+
+        const size_t ap_lane_b = size_t(B) * mtp_nh * 8u * 130u * sizeof(float);
+        bool any_split = false;
+        for (uint32_t i = 0; i < L; i++) {
+          const int k = reqs[off + i].lane;
+          const uint32_t mpos = (k == active_lane) ? mtp_ctx_pos : lanes_[k].mtp_ctx_pos;
+          const uint32_t mcap = (k == active_lane) ? ml.cap : lanes_[k].mtp_cap[l];
+          id<MTLBuffer> kc = (k == active_lane) ? ml.k_cache : lanes_[k].mtp_k[l];
+          id<MTLBuffer> vc = (k == active_lane) ? ml.v_cache : lanes_[k].mtp_v[l];
+          if (mpos > 128u) {
+            any_split = true;
+            Df2AttnSplitArgs sa_sp{B, mtp_nh, mtp_nkv, hd, mpos, mcap, mtp_window, 8u, i * B};
+            [enc setComputePipelineState:p_df2_attn_split];
+            [enc setBuffer:b_mtp_Q offset:size_t(i) * q_lane_b atIndex:0];
+            [enc setBuffer:kc offset:0 atIndex:1];
+            [enc setBuffer:vc offset:0 atIndex:2];
+            [enc setBuffer:b_mtp_K_blk offset:size_t(i) * kv_lane_b atIndex:3];
+            [enc setBuffer:b_mtp_V_blk offset:size_t(i) * kv_lane_b atIndex:4];
+            [enc setBuffer:b_df2_apart offset:size_t(i) * ap_lane_b atIndex:5];
+            [enc setBytes:&sa_sp length:sizeof(sa_sp) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nkv, 8) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+          } else {
+            MtpAttnArgs aa{B, mtp_nh, mtp_nkv, hd, mpos, mcap, mtp_window, 1u, 0u, i * B};
+            [enc setComputePipelineState:p_df2_attn];
+            [enc setBuffer:b_mtp_Q offset:size_t(i) * q_lane_b atIndex:0];
+            [enc setBuffer:kc offset:0 atIndex:1];
+            [enc setBuffer:vc offset:0 atIndex:2];
+            [enc setBuffer:b_mtp_K_blk offset:size_t(i) * kv_lane_b atIndex:3];
+            [enc setBuffer:b_mtp_V_blk offset:size_t(i) * kv_lane_b atIndex:4];
+            [enc setBuffer:b_mtp_o_frag offset:0 atIndex:5];
+            [enc setBytes:&aa length:sizeof(aa) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nkv, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+          }
+        }
+        if (any_split) {
+          barrier();
+          for (uint32_t i = 0; i < L; i++) {
+            const int k = reqs[off + i].lane;
+            const uint32_t mpos = (k == active_lane) ? mtp_ctx_pos : lanes_[k].mtp_ctx_pos;
+            const uint32_t mcap = (k == active_lane) ? ml.cap : lanes_[k].mtp_cap[l];
+            if (mpos <= 128u) continue;
+            Df2AttnSplitArgs sa_sp{B, mtp_nh, mtp_nkv, hd, mpos, mcap, mtp_window, 8u, i * B};
+            [enc setComputePipelineState:p_df2_attn_reduce];
+            [enc setBuffer:b_df2_apart offset:size_t(i) * ap_lane_b atIndex:0];
+            [enc setBuffer:b_mtp_o_frag offset:0 atIndex:1];
+            [enc setBytes:&sa_sp length:sizeof(sa_sp) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(B, mtp_nh, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+          }
+        }
+        barrier();
+
+        enc_df2_lin(p_mm_w8, p_mmp_w8_mtp, ml.o, b_mtp_o_frag, b_mtp_o_out);
+        barrier();
+        [enc setComputePipelineState:p_df2_conv];
+        [enc setBuffer:b_mtp_o_out offset:0 atIndex:0];
+        [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+        [enc setBuffer:ml.attn_conv_base.b offset:ml.attn_conv_base.off atIndex:2];
+        [enc setBuffer:b_mtp_h offset:0 atIndex:3];
+        [enc setBuffer:b_mtp_h offset:0 atIndex:4];
+        [enc setBuffer:b_dummy offset:0 atIndex:5];
+        [enc setBytes:&ca1 length:sizeof(ca1) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        [enc setComputePipelineState:p_df2_rms];
+        [enc setBuffer:b_mtp_h offset:0 atIndex:0];
+        [enc setBuffer:ml.mlp_norm.b offset:ml.mlp_norm.off atIndex:1];
+        [enc setBuffer:b_df2_h_norm offset:0 atIndex:2];
+        [enc setBuffer:b_mtp_frag offset:0 atIndex:3];
+        [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        enc_df2_lin(p_mm_w8, p_mmp_w8_mtp, ml.mlp_conv_kproj, b_mtp_frag, b_df2_dyn);
+        barrier();
+        [enc setComputePipelineState:p_df2_conv];
+        [enc setBuffer:b_df2_h_norm offset:0 atIndex:0];
+        [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+        [enc setBuffer:ml.mlp_conv_base.b offset:ml.mlp_conv_base.off atIndex:2];
+        [enc setBuffer:b_dummy offset:0 atIndex:3];
+        [enc setBuffer:b_dummy offset:0 atIndex:4];
+        [enc setBuffer:b_mtp_frag offset:0 atIndex:5];
+        [enc setBytes:&ca0 length:sizeof(ca0) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        enc_df2_lin(p_df2_w6_gu, p_mmp_w6_gu, ml.mlp_gu, b_mtp_frag, b_dummy, b_mtp_gu_frag, mtp_I);
+        barrier();
+        enc_df2_lin(p_mm_w6_dn, p_mmp_w6_dn, ml.mlp_dn, b_mtp_gu_frag, b_mtp_dn_out);
+        barrier();
+
+        [enc setComputePipelineState:p_df2_conv];
+        [enc setBuffer:b_mtp_dn_out offset:0 atIndex:0];
+        [enc setBuffer:b_df2_dyn offset:0 atIndex:1];
+        [enc setBuffer:ml.mlp_conv_base.b offset:ml.mlp_conv_base.off atIndex:2];
+        [enc setBuffer:b_mtp_h offset:0 atIndex:3];
+        [enc setBuffer:b_mtp_h offset:0 atIndex:4];
+        [enc setBuffer:b_dummy offset:0 atIndex:5];
+        [enc setBytes:&ca1 length:sizeof(ca1) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+      }
+
+      // 3. Final norm -> b_df2_h_final [MB, H], pack L*gamma active rows -> b_mtp_frag [total_rows, H]
+      Df2RmsArgs nra{H, 0u, 1u, 0u, eps};
+      [enc setComputePipelineState:p_df2_rms];
+      [enc setBuffer:b_mtp_h offset:0 atIndex:0];
+      [enc setBuffer:mtp_norm.b offset:mtp_norm.off atIndex:1];
+      [enc setBuffer:b_df2_h_final offset:0 atIndex:2];
+      [enc setBuffer:b_dummy offset:0 atIndex:3];
+      [enc setBytes:&nra length:sizeof(nra) atIndex:4];
+      [enc dispatchThreadgroups:MTLSizeMake(MB, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      PackFragArgs pfa{H, B, gamma};
+      [enc setComputePipelineState:p_pack_frag_rows];
+      [enc setBuffer:b_df2_h_final offset:0 atIndex:0];
+      [enc setBuffer:b_mtp_frag offset:0 atIndex:1];
+      [enc setBytes:&pfa length:sizeof(pfa) atIndex:2];
+      [enc dispatchThreadgroups:MTLSizeMake(total_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      // 4. Single batched lm_head + selector hidden_projection over L*gamma rows
+      enc_mm2(enc, p_mm_w8, lm_head, b_mtp_frag, 0, b_mtp_base_logits, 0, total_rows, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+      enc_mm2(enc, p_mm_w8, df2_sel_hproj, b_mtp_frag, 0, b_df2_hsel, 0, total_rows, nil, b_dummy, nil, nil, nil, false, 0, 0, 0, big_gpu);
+      barrier();
+
+      // 5. Batched Top-16 over L*gamma rows
+      Df2TopkArgs tka{vocab_valid, vocab_pad};
+      [enc setComputePipelineState:p_df2_topk16_p1];
+      [enc setBuffer:b_mtp_base_logits offset:0 atIndex:0];
+      [enc setBuffer:b_df2_pv offset:0 atIndex:1];
+      [enc setBuffer:b_df2_pi offset:0 atIndex:2];
+      [enc setBytes:&tka length:sizeof(tka) atIndex:3];
+      [enc dispatchThreadgroups:MTLSizeMake(total_rows, 64, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      [enc setComputePipelineState:p_df2_topk16_p2];
+      [enc setBuffer:b_df2_pv offset:0 atIndex:0];
+      [enc setBuffer:b_df2_pi offset:0 atIndex:1];
+      [enc setBuffer:b_df2_tv offset:0 atIndex:2];
+      [enc setBuffer:b_df2_ti offset:0 atIndex:3];
+      [enc dispatchThreadgroups:MTLSizeMake(total_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      barrier();
+
+      // 6. Concurrent candidate path selection across all L lanes
+      for (uint32_t i = 0; i < L; i++) {
+        const int k = reqs[off + i].lane;
+        const uint32_t lpos = (k == active_lane) ? pos : lanes_[k].pos;
+        const Samp& lsp = (k == active_lane) ? samp : lanes_[k].samp;
+        const float inv_t = lsp.temp > 0.0f ? (1.0f / lsp.temp) : -1.0f;
+        const size_t r0 = size_t(i) * gamma;
+        Df2SelArgs sa{gamma, reqs[off + i].anchor_tok, lpos, uint32_t(lsp.seed), uint32_t(lsp.seed >> 32), lsp.top_k,
+                      inv_t, lsp.min_p > 0.0f ? logf(lsp.min_p) : -INFINITY, lsp.top_p, df2_softcap};
+        [enc setComputePipelineState:p_df2_select];
+        [enc setBuffer:b_df2_tv offset:r0 * 16u * sizeof(float) atIndex:0];
+        [enc setBuffer:b_df2_ti offset:r0 * 16u * sizeof(uint32_t) atIndex:1];
+        [enc setBuffer:b_df2_hsel offset:r0 * mtp_rank * sizeof(float) atIndex:2];
+        [enc setBuffer:df2_sel_pred_cb.b offset:df2_sel_pred_cb.off atIndex:3];
+        [enc setBuffer:df2_sel_succ_cb.b offset:df2_sel_succ_cb.off atIndex:4];
+        [enc setBuffer:b_mtp_draft_out offset:size_t(i) * MAXM * sizeof(uint32_t) atIndex:5];
+        [enc setBuffer:b_mtp_draft_probs offset:size_t(i) * MAXM * sizeof(float) atIndex:6];
+        [enc setBytes:&sa length:sizeof(sa) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.error) mtl::die("GPU df2_draft_lanes error", cb.error);
+      tot_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+
+      for (uint32_t i = 0; i < L; i++) {
+        out_drafts[off + i].resize(gamma);
+        memcpy(out_drafts[off + i].data(), (const uint32_t*)[b_mtp_draft_out contents] + size_t(i) * MAXM, gamma * sizeof(uint32_t));
+        if (out_probs) {
+          (*out_probs)[off + i].resize(gamma);
+          memcpy((*out_probs)[off + i].data(), (const float*)[b_mtp_draft_probs contents] + size_t(i) * MAXM, gamma * sizeof(float));
+        }
+      }
+    }
+    if (gpu_ms) *gpu_ms = tot_ms;
     return;
   }
 
@@ -3222,8 +3997,8 @@ bool Model::save_prefix(const std::string& path, const std::vector<uint32_t>& hi
   const size_t kv_row_i8 = c_kv * sizeof(int8_t);
   const size_t kv_row_sc = size_t(nkv) * sizeof(uint16_t);
 
-  auto write_ring = [&](id<MTLBuffer> buf, uint32_t P, uint32_t rcap, size_t row_bytes) -> bool {
-    const uint32_t n = std::min(P, window);
+  auto write_ring = [&](id<MTLBuffer> buf, uint32_t P, uint32_t rcap, size_t row_bytes, uint32_t win) -> bool {
+    const uint32_t n = std::min(P, win);
     if (n == 0) return true;
     const uint32_t start = (P - n) % rcap;
     const uint32_t first = std::min(n, rcap - start);
@@ -3241,8 +4016,8 @@ bool Model::save_prefix(const std::string& path, const std::vector<uint32_t>& hi
          write_all(f, [st.mlp_conv contents], h_conv_bytes);
     if (!ok) break;
     if (L[st.phys_idx].is_local) {
-      ok = write_ring(st.k_cache, pos, st.cap, kv_row_bf16) &&
-           write_ring(st.v_cache, pos, st.cap, kv_row_bf16);
+      ok = write_ring(st.k_cache, pos, st.cap, kv_row_bf16, window) &&
+           write_ring(st.v_cache, pos, st.cap, kv_row_bf16, window);
     } else if (st.kv8) {
       ok = write_all(f, [st.k_i8 contents], size_t(pos) * kv_row_i8) &&
            write_all(f, [st.k_sc contents], size_t(pos) * kv_row_sc) &&
@@ -3259,8 +4034,8 @@ bool Model::save_prefix(const std::string& path, const std::vector<uint32_t>& hi
     for (size_t l = 0; ok && l < MtpL.size(); l++) {
       const auto& ml = MtpL[l];
       if (ml.is_local) {
-        ok = write_ring(ml.k_cache, mtp_ctx_pos, ml.cap, kv_row_bf16) &&
-             write_ring(ml.v_cache, mtp_ctx_pos, ml.cap, kv_row_bf16);
+        ok = write_ring(ml.k_cache, mtp_ctx_pos, ml.cap, kv_row_bf16, mtp_window) &&
+             write_ring(ml.v_cache, mtp_ctx_pos, ml.cap, kv_row_bf16, mtp_window);
       } else {
         ok = write_all(f, [ml.k_cache contents], size_t(mtp_ctx_pos) * kv_row_bf16) &&
              write_all(f, [ml.v_cache contents], size_t(mtp_ctx_pos) * kv_row_bf16);
@@ -3305,8 +4080,8 @@ uint32_t Model::load_prefix(const std::string& path, std::vector<uint32_t>* out_
   const size_t kv_row_i8 = c_kv * sizeof(int8_t);
   const size_t kv_row_sc = size_t(nkv) * sizeof(uint16_t);
 
-  auto read_ring = [&](id<MTLBuffer> buf, uint32_t P, uint32_t rcap, size_t row_bytes) -> bool {
-    const uint32_t n = std::min(P, window);
+  auto read_ring = [&](id<MTLBuffer> buf, uint32_t P, uint32_t rcap, size_t row_bytes, uint32_t win) -> bool {
+    const uint32_t n = std::min(P, win);
     if (n == 0) return true;
     const uint32_t start = (P - n) % rcap;
     const uint32_t first = std::min(n, rcap - start);
@@ -3324,8 +4099,8 @@ uint32_t Model::load_prefix(const std::string& path, std::vector<uint32_t>* out_
          read_all(f, [st.mlp_conv contents], h_conv_bytes);
     if (!ok) break;
     if (L[st.phys_idx].is_local) {
-      ok = read_ring(st.k_cache, hdr.pos, st.cap, kv_row_bf16) &&
-           read_ring(st.v_cache, hdr.pos, st.cap, kv_row_bf16);
+      ok = read_ring(st.k_cache, hdr.pos, st.cap, kv_row_bf16, window) &&
+           read_ring(st.v_cache, hdr.pos, st.cap, kv_row_bf16, window);
     } else if (st.kv8) {
       ok = read_all(f, [st.k_i8 contents], size_t(hdr.pos) * kv_row_i8) &&
            read_all(f, [st.k_sc contents], size_t(hdr.pos) * kv_row_sc) &&
@@ -3342,8 +4117,8 @@ uint32_t Model::load_prefix(const std::string& path, std::vector<uint32_t>* out_
     for (size_t l = 0; ok && l < MtpL.size(); l++) {
       auto& ml = MtpL[l];
       if (ml.is_local) {
-        ok = read_ring(ml.k_cache, hdr.mtp_ctx_pos, ml.cap, kv_row_bf16) &&
-             read_ring(ml.v_cache, hdr.mtp_ctx_pos, ml.cap, kv_row_bf16);
+        ok = read_ring(ml.k_cache, hdr.mtp_ctx_pos, ml.cap, kv_row_bf16, mtp_window) &&
+             read_ring(ml.v_cache, hdr.mtp_ctx_pos, ml.cap, kv_row_bf16, mtp_window);
       } else {
         ok = read_all(f, [ml.k_cache contents], size_t(hdr.mtp_ctx_pos) * kv_row_bf16) &&
              read_all(f, [ml.v_cache contents], size_t(hdr.mtp_ctx_pos) * kv_row_bf16);

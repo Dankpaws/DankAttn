@@ -3279,3 +3279,463 @@ kernel void ink_sample_rows(device const float* y [[buffer(0)]], device uint* ou
     conf_out[m] = (M_raw + log(max(tse, 1e-30f))) - (tsl / float(a.N)) - log(float(a.N));
   }
 }
+
+// ============================================================================
+// DFlash 2 Block-Diffusion Drafter Kernels (incoai/Inkling-2-Mini-DFlash2)
+// ============================================================================
+
+// D1. Concatenate 4 target taps [4, MP, H] f32 -> bf16 matmul fragment [n_commit, 4*H] for df2.fc.
+// Grid: (n_commit, 1, 1), TG: 256 threads.
+struct Df2CatArgs { uint H, MP, row0; };
+kernel void ink_df2_cat_taps(device const float* taps [[buffer(0)]],
+                             device bfloat* out_frag [[buffer(1)]],
+                             constant Df2CatArgs& a [[buffer(2)]],
+                             uint r [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint tpg [[threads_per_threadgroup]]) {
+  const uint K = 4u * a.H;
+  const uint src_r = a.row0 + r;
+  for (uint t = 0u; t < 4u; t++) {
+    device const float* src = taps + (size_t(t) * a.MP + src_r) * a.H;
+    const uint k0 = t * a.H;
+    for (uint c = tid; c < a.H; c += tpg) {
+      out_frag[frag_off(r, k0 + c, K)] = bfloat(src[c]);
+    }
+  }
+}
+
+// D2. RMSNorm writing both f32 output (optional) and bf16 matmul fragment (optional).
+// Grid: (M, 1, 1), TG: 256 threads.
+struct Df2RmsArgs { uint H, row_off, write_f32, write_frag; float eps; };
+kernel void ink_df2_rms(device const float* x [[buffer(0)]],
+                        device const float* w [[buffer(1)]],
+                        device float* y_f32 [[buffer(2)]],
+                        device bfloat* y_frag [[buffer(3)]],
+                        constant Df2RmsArgs& a [[buffer(4)]],
+                        uint r [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint tpg [[threads_per_threadgroup]]) {
+  device const float* xr = x + size_t(a.row_off + r) * a.H;
+  threadgroup float sm[8];
+  float s2 = 0.0f;
+  for (uint c = tid; c < a.H; c += tpg) { const float v = xr[c]; s2 += v * v; }
+  s2 = simd_sum(s2);
+  if ((tid & 31u) == 0u) sm[tid >> 5] = s2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float tot = 0.0f;
+    for (uint i = 0u; i < 8u; i++) tot += sm[i];
+    sm[0] = rsqrt(tot / float(a.H) + a.eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = sm[0];
+  device float* yr = y_f32 + size_t(r) * a.H;
+  for (uint c = tid; c < a.H; c += tpg) {
+    const float v = float(bfloat(xr[c] * inv * w[c]));
+    if (a.write_f32) yr[c] = v;
+    if (a.write_frag) y_frag[frag_off(r, c, a.H)] = bfloat(v);
+  }
+}
+
+// D3. Grouped 2-tap dynamic causal convolution within each B-token draft block (supports L*B batched rows).
+// stage=0 (prepare): reads x [L*B, H], dyn [L*B, 576], base [2, 2, H] -> writes bf16 frag out_frag [L*B, H].
+// stage=1 (finish):  reads x [L*B, H], dyn [L*B, 576], base [2, 2, H], res [L*B, H] -> writes f32 out_f32 = res + y.
+// Grid: (L*B, 1, 1), TG: 256 threads.
+struct Df2ConvArgs { uint H, group_size, stage, B; };
+kernel void ink_df2_conv(device const float* x [[buffer(0)]],
+                         device const float* dyn [[buffer(1)]],
+                         device const float* base [[buffer(2)]],
+                         device const float* res [[buffer(3)]],
+                         device float* out_f32 [[buffer(4)]],
+                         device bfloat* out_frag [[buffer(5)]],
+                         constant Df2ConvArgs& a [[buffer(6)]],
+                         uint r [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint tpg [[threads_per_threadgroup]]) {
+  const uint G = a.H / a.group_size;
+  const uint dyn_stride = 4u * G;
+  const uint r_blk = r % a.B;
+  device const float* dr = dyn + size_t(r) * dyn_stride + size_t(a.stage) * (2u * G);
+  device const float* b0 = base + size_t(a.stage) * (2u * a.H);
+  device const float* b1 = b0 + a.H;
+  device const float* x0 = x + size_t(r) * a.H;
+  device const float* x1 = (r_blk > 0u) ? (x + size_t(r - 1u) * a.H) : x0;
+  device const float* rr = res + size_t(r) * a.H;
+  device float* yr = out_f32 + size_t(r) * a.H;
+  for (uint c = tid; c < a.H; c += tpg) {
+    const uint g = c / a.group_size;
+    const float v0 = x0[c];
+    const float v1 = (r_blk > 0u) ? x1[c] : 0.0f;
+    const float y = (b0[c] + dr[g]) * v0 + (b1[c] + dr[G + g]) * v1;
+    if (a.stage == 0u) out_frag[frag_off(r, c, a.H)] = bfloat(y);
+    else yr[c] = rr[c] + y;
+  }
+}
+
+// D4b. Split-K GQA G=4 Shared-KV Non-Causal SWA-2048 Block Attention for DFlash 2 (8 key splits -> 512 TGs).
+// Grid: (B, nkv, n_splits), TG: 128 threads (4 simdgroups).
+struct Df2AttnSplitArgs {
+  uint B, nh, nkv, hd, ctx_len, cap, window, n_splits, out_row0;
+};
+kernel void ink_df2_attn_split(device const float4* Q [[buffer(0)]],
+                               device const bfloat4* K_ctx [[buffer(1)]],
+                               device const bfloat4* V_ctx [[buffer(2)]],
+                               device const bfloat4* K_blk [[buffer(3)]],
+                               device const bfloat4* V_blk [[buffer(4)]],
+                               device float* part_out [[buffer(5)]],  // [B, nh, n_splits, 130]
+                               constant Df2AttnSplitArgs& a [[buffer(6)]],
+                               uint3 tg [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, kvh = tg.y, sp = tg.z;
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint h0 = kvh * 4u;
+  const uint q_abs = a.ctx_len + row;
+  const uint t_start = (q_abs + 1u > a.window) ? (q_abs + 1u - a.window) : 0u;
+  const uint total_ctx = (a.ctx_len > t_start) ? (a.ctx_len - t_start) : 0u;
+  const uint chunk = (total_ctx + a.n_splits - 1u) / a.n_splits;
+  const uint t0 = t_start + sp * chunk;
+  const uint t1 = min(a.ctx_len, t0 + chunk);
+
+  const float scale = rsqrt(float(a.hd));
+  const size_t q_base = size_t(row) * a.nh + h0;
+  const float4 q0 = Q[(q_base + 0u) * 32u + lane] * scale;
+  const float4 q1 = Q[(q_base + 1u) * 32u + lane] * scale;
+  const float4 q2 = Q[(q_base + 2u) * 32u + lane] * scale;
+  const float4 q3 = Q[(q_base + 3u) * 32u + lane] * scale;
+
+  float m0 = -1e30f, l0 = 0.0f; float4 o0 = float4(0.0f);
+  float m1 = -1e30f, l1 = 0.0f; float4 o1 = float4(0.0f);
+  float m2 = -1e30f, l2 = 0.0f; float4 o2 = float4(0.0f);
+  float m3 = -1e30f, l3 = 0.0f; float4 o3 = float4(0.0f);
+
+  for (uint t = t0 + sg; t < t1; t += 4u) {
+    const uint sl = t % a.cap;
+    const size_t kv_off = (size_t(sl) * a.nkv + kvh) * 32u + lane;
+    const float4 k4 = float4(K_ctx[kv_off]);
+    const float4 v4 = float4(V_ctx[kv_off]);
+    { const float s = simd_sum(dot(q0, k4)); const float mn = max(m0, s); const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f; const float p = exp(s - mn); o0 = fma(p, v4, o0 * al); l0 = l0 * al + p; m0 = mn; }
+    { const float s = simd_sum(dot(q1, k4)); const float mn = max(m1, s); const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f; const float p = exp(s - mn); o1 = fma(p, v4, o1 * al); l1 = l1 * al + p; m1 = mn; }
+    { const float s = simd_sum(dot(q2, k4)); const float mn = max(m2, s); const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f; const float p = exp(s - mn); o2 = fma(p, v4, o2 * al); l2 = l2 * al + p; m2 = mn; }
+    { const float s = simd_sum(dot(q3, k4)); const float mn = max(m3, s); const float al = (l3 > 0.0f) ? exp(m3 - mn) : 0.0f; const float p = exp(s - mn); o3 = fma(p, v4, o3 * al); l3 = l3 * al + p; m3 = mn; }
+  }
+  if (sp == 0u) {
+    for (uint j = sg; j < a.B; j += 4u) {
+      const size_t kv_off = (size_t(j) * a.nkv + kvh) * 32u + lane;
+      const float4 k4 = float4(K_blk[kv_off]);
+      const float4 v4 = float4(V_blk[kv_off]);
+      { const float s = simd_sum(dot(q0, k4)); const float mn = max(m0, s); const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f; const float p = exp(s - mn); o0 = fma(p, v4, o0 * al); l0 = l0 * al + p; m0 = mn; }
+      { const float s = simd_sum(dot(q1, k4)); const float mn = max(m1, s); const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f; const float p = exp(s - mn); o1 = fma(p, v4, o1 * al); l1 = l1 * al + p; m1 = mn; }
+      { const float s = simd_sum(dot(q2, k4)); const float mn = max(m2, s); const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f; const float p = exp(s - mn); o2 = fma(p, v4, o2 * al); l2 = l2 * al + p; m2 = mn; }
+      { const float s = simd_sum(dot(q3, k4)); const float mn = max(m3, s); const float al = (l3 > 0.0f) ? exp(m3 - mn) : 0.0f; const float p = exp(s - mn); o3 = fma(p, v4, o3 * al); l3 = l3 * al + p; m3 = mn; }
+    }
+  }
+
+  threadgroup float sm_m[4][4], sm_l[4][4];
+  threadgroup float4 sm_o[4][4][32];
+  if (lane == 0u) {
+    sm_m[0][sg] = m0; sm_l[0][sg] = l0;
+    sm_m[1][sg] = m1; sm_l[1][sg] = l1;
+    sm_m[2][sg] = m2; sm_l[2][sg] = l2;
+    sm_m[3][sg] = m3; sm_l[3][sg] = l3;
+  }
+  sm_o[0][sg][lane] = o0;
+  sm_o[1][sg][lane] = o1;
+  sm_o[2][sg][lane] = o2;
+  sm_o[3][sg][lane] = o3;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint qh = h0 + sg;
+  float mm = max(max(sm_m[sg][0], sm_m[sg][1]), max(sm_m[sg][2], sm_m[sg][3]));
+  float ll = 0.0f;
+  float4 oo = float4(0.0f);
+  for (uint s = 0u; s < 4u; s++) {
+    const float w = (sm_l[sg][s] > 0.0f) ? exp(sm_m[sg][s] - mm) : 0.0f;
+    ll += sm_l[sg][s] * w;
+    oo += sm_o[sg][s][lane] * w;
+  }
+  device float* dst = part_out + ((size_t(row) * a.nh + qh) * a.n_splits + sp) * 130u;
+  dst[lane * 4u + 0u] = oo.x;
+  dst[lane * 4u + 1u] = oo.y;
+  dst[lane * 4u + 2u] = oo.z;
+  dst[lane * 4u + 3u] = oo.w;
+  if (lane == 0u) { dst[128u] = mm; dst[129u] = ll; }
+}
+
+// D4c. Reduce n_splits partials -> out_frag [out_row0 + B, nh * hd]. Grid: (B, nh, 1), TG: 32 threads.
+kernel void ink_df2_attn_reduce(device const float* part_out [[buffer(0)]],
+                                device bfloat* out_frag [[buffer(1)]],
+                                constant Df2AttnSplitArgs& a [[buffer(2)]],
+                                uint2 tg [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, qh = tg.y;
+  device const float* base = part_out + (size_t(row) * a.nh + qh) * a.n_splits * 130u;
+  float mm = -1e30f;
+  for (uint sp = 0u; sp < a.n_splits; sp++) {
+    if (base[sp * 130u + 129u] > 0.0f) mm = max(mm, base[sp * 130u + 128u]);
+  }
+  float ll = 0.0f;
+  float4 oo = float4(0.0f);
+  for (uint sp = 0u; sp < a.n_splits; sp++) {
+    const float ls = base[sp * 130u + 129u];
+    if (ls <= 0.0f) continue;
+    const float w = exp(base[sp * 130u + 128u] - mm);
+    ll += ls * w;
+    const float4 v4 = float4(base[sp * 130u + lane * 4u + 0u], base[sp * 130u + lane * 4u + 1u],
+                             base[sp * 130u + lane * 4u + 2u], base[sp * 130u + lane * 4u + 3u]);
+    oo = fma(w, v4, oo);
+  }
+  const float4 out4 = oo / max(ll, 1e-30f);
+  const uint K_tot = a.nh * a.hd;
+  const uint k0 = qh * a.hd + lane * 4u;
+  const uint out_r = a.out_row0 + row;
+  out_frag[frag_off(out_r, k0 + 0u, K_tot)] = bfloat(out4.x);
+  out_frag[frag_off(out_r, k0 + 1u, K_tot)] = bfloat(out4.y);
+  out_frag[frag_off(out_r, k0 + 2u, K_tot)] = bfloat(out4.z);
+  out_frag[frag_off(out_r, k0 + 3u, K_tot)] = bfloat(out4.w);
+}
+
+// D4. GQA G=4 Shared-KV Non-Causal SWA-2048 Block Attention for DFlash 2 (nh=32, nkv=8, hd=128).
+// Grid: (B, nkv, 1), TG: 128 threads (4 simdgroups).
+kernel void ink_df2_attn(device const float4* Q [[buffer(0)]],
+                         device const bfloat4* K_ctx [[buffer(1)]],
+                         device const bfloat4* V_ctx [[buffer(2)]],
+                         device const bfloat4* K_blk [[buffer(3)]],
+                         device const bfloat4* V_blk [[buffer(4)]],
+                         device bfloat* out_frag [[buffer(5)]],
+                         constant MtpAttnArgs& a [[buffer(6)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, kvh = tg.y;
+  const uint sg = tid >> 5, lane = tid & 31u;
+  const uint h0 = kvh * 4u;
+  const uint q_abs = a.ctx_len + row;
+  const uint t_start = (q_abs + 1u > a.window) ? (q_abs + 1u - a.window) : 0u;
+  const float scale = rsqrt(float(a.hd));
+  const size_t q_base = size_t(row) * a.nh + h0;
+  const float4 q0 = Q[(q_base + 0u) * 32u + lane] * scale;
+  const float4 q1 = Q[(q_base + 1u) * 32u + lane] * scale;
+  const float4 q2 = Q[(q_base + 2u) * 32u + lane] * scale;
+  const float4 q3 = Q[(q_base + 3u) * 32u + lane] * scale;
+
+  float m0 = -1e30f, l0 = 0.0f; float4 o0 = float4(0.0f);
+  float m1 = -1e30f, l1 = 0.0f; float4 o1 = float4(0.0f);
+  float m2 = -1e30f, l2 = 0.0f; float4 o2 = float4(0.0f);
+  float m3 = -1e30f, l3 = 0.0f; float4 o3 = float4(0.0f);
+
+  for (uint t = t_start + sg; t < a.ctx_len; t += 4u) {
+    const uint sl = t % a.cap;
+    const size_t kv_off = (size_t(sl) * a.nkv + kvh) * 32u + lane;
+    const float4 k4 = float4(K_ctx[kv_off]);
+    const float4 v4 = float4(V_ctx[kv_off]);
+    { const float s = simd_sum(dot(q0, k4)); const float mn = max(m0, s); const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f; const float p = exp(s - mn); o0 = fma(p, v4, o0 * al); l0 = l0 * al + p; m0 = mn; }
+    { const float s = simd_sum(dot(q1, k4)); const float mn = max(m1, s); const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f; const float p = exp(s - mn); o1 = fma(p, v4, o1 * al); l1 = l1 * al + p; m1 = mn; }
+    { const float s = simd_sum(dot(q2, k4)); const float mn = max(m2, s); const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f; const float p = exp(s - mn); o2 = fma(p, v4, o2 * al); l2 = l2 * al + p; m2 = mn; }
+    { const float s = simd_sum(dot(q3, k4)); const float mn = max(m3, s); const float al = (l3 > 0.0f) ? exp(m3 - mn) : 0.0f; const float p = exp(s - mn); o3 = fma(p, v4, o3 * al); l3 = l3 * al + p; m3 = mn; }
+  }
+  for (uint j = sg; j < a.B; j += 4u) {
+    const size_t kv_off = (size_t(j) * a.nkv + kvh) * 32u + lane;
+    const float4 k4 = float4(K_blk[kv_off]);
+    const float4 v4 = float4(V_blk[kv_off]);
+    { const float s = simd_sum(dot(q0, k4)); const float mn = max(m0, s); const float al = (l0 > 0.0f) ? exp(m0 - mn) : 0.0f; const float p = exp(s - mn); o0 = fma(p, v4, o0 * al); l0 = l0 * al + p; m0 = mn; }
+    { const float s = simd_sum(dot(q1, k4)); const float mn = max(m1, s); const float al = (l1 > 0.0f) ? exp(m1 - mn) : 0.0f; const float p = exp(s - mn); o1 = fma(p, v4, o1 * al); l1 = l1 * al + p; m1 = mn; }
+    { const float s = simd_sum(dot(q2, k4)); const float mn = max(m2, s); const float al = (l2 > 0.0f) ? exp(m2 - mn) : 0.0f; const float p = exp(s - mn); o2 = fma(p, v4, o2 * al); l2 = l2 * al + p; m2 = mn; }
+    { const float s = simd_sum(dot(q3, k4)); const float mn = max(m3, s); const float al = (l3 > 0.0f) ? exp(m3 - mn) : 0.0f; const float p = exp(s - mn); o3 = fma(p, v4, o3 * al); l3 = l3 * al + p; m3 = mn; }
+  }
+
+  threadgroup float sm_m[4][4], sm_l[4][4];
+  threadgroup float4 sm_o[4][4][32];
+  if (lane == 0u) {
+    sm_m[0][sg] = m0; sm_l[0][sg] = l0;
+    sm_m[1][sg] = m1; sm_l[1][sg] = l1;
+    sm_m[2][sg] = m2; sm_l[2][sg] = l2;
+    sm_m[3][sg] = m3; sm_l[3][sg] = l3;
+  }
+  sm_o[0][sg][lane] = o0;
+  sm_o[1][sg][lane] = o1;
+  sm_o[2][sg][lane] = o2;
+  sm_o[3][sg][lane] = o3;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // 4 simdgroups each finalize one of the 4 Q heads!
+  const uint qh = h0 + sg;
+  float mm = max(max(sm_m[sg][0], sm_m[sg][1]), max(sm_m[sg][2], sm_m[sg][3]));
+  float ll = 0.0f;
+  float4 oo = float4(0.0f);
+  for (uint s = 0u; s < 4u; s++) {
+    const float w = (sm_l[sg][s] > 0.0f) ? exp(sm_m[sg][s] - mm) : 0.0f;
+    ll += sm_l[sg][s] * w;
+    oo += sm_o[sg][s][lane] * w;
+  }
+  const float4 out4 = oo / max(ll, 1e-30f);
+  const uint K_tot = a.nh * a.hd;
+  const uint k0 = qh * a.hd + lane * 4u;
+  const uint out_r = a.out_row0 + row;
+  out_frag[frag_off(out_r, k0 + 0u, K_tot)] = bfloat(out4.x);
+  out_frag[frag_off(out_r, k0 + 1u, K_tot)] = bfloat(out4.y);
+  out_frag[frag_off(out_r, k0 + 2u, K_tot)] = bfloat(out4.z);
+  out_frag[frag_off(out_r, k0 + 3u, K_tot)] = bfloat(out4.w);
+}
+
+// D5. Exact Top-16 over valid_vocab_size raw logits (Stage 1: Grid (rows, 64, 1), TG 256).
+struct Df2TopkArgs { uint V_valid, V_pad; };
+kernel void ink_df2_topk16_p1(device const float* logits [[buffer(0)]],
+                              device float* part_v [[buffer(1)]],
+                              device uint* part_i [[buffer(2)]],
+                              constant Df2TopkArgs& a [[buffer(3)]],
+                              uint2 tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = tg.x, blk = tg.y;
+  device const float* lr = logits + size_t(row) * a.V_pad;
+  const uint stride = 64u * 256u;
+  float lv[13];
+  uint li[13];
+  uint n = 0u;
+  for (uint v = blk * 256u + tid; v < a.V_valid && n < 13u; v += stride) {
+    lv[n] = lr[v];
+    li[n] = v;
+    n++;
+  }
+  threadgroup float sm_v[8];
+  threadgroup uint sm_i[8];
+  const size_t out_base = (size_t(row) * 64u + blk) * 16u;
+  for (uint k = 0u; k < 16u; k++) {
+    float bv = -1e30f; uint bi = 0xFFFFFFFFu; uint bj = 13u;
+    for (uint j = 0u; j < n; j++) {
+      if (lv[j] > bv || (lv[j] == bv && li[j] < bi)) { bv = lv[j]; bi = li[j]; bj = j; }
+    }
+    float sv = bv; uint si = bi;
+    for (ushort d = 16; d > 0; d >>= 1) {
+      const float ov = simd_shuffle_down(sv, d);
+      const uint oi = simd_shuffle_down(si, d);
+      if (ov > sv || (ov == sv && oi < si)) { sv = ov; si = oi; }
+    }
+    if ((tid & 31u) == 0u) { sm_v[tid >> 5] = sv; sm_i[tid >> 5] = si; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+      float fv = sm_v[0]; uint fi = sm_i[0];
+      for (uint s = 1u; s < 8u; s++) {
+        if (sm_v[s] > fv || (sm_v[s] == fv && sm_i[s] < fi)) { fv = sm_v[s]; fi = sm_i[s]; }
+      }
+      sm_v[0] = fv; sm_i[0] = fi;
+      part_v[out_base + k] = fv;
+      part_i[out_base + k] = fi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (bj < n && bi == sm_i[0]) lv[bj] = -1e30f;
+  }
+}
+
+// D5b. Exact Top-16 Stage 2: merge 64 x 16 = 1024 partials -> [rows, 16]. Grid (rows, 1, 1), TG 256.
+kernel void ink_df2_topk16_p2(device const float* part_v [[buffer(0)]],
+                              device const uint* part_i [[buffer(1)]],
+                              device float* top_v [[buffer(2)]],
+                              device uint* top_i [[buffer(3)]],
+                              uint row [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]]) {
+  const size_t in_base = size_t(row) * 1024u;
+  float lv[4];
+  uint li[4];
+  for (uint j = 0u; j < 4u; j++) {
+    const uint idx = j * 256u + tid;
+    lv[j] = part_v[in_base + idx];
+    li[j] = part_i[in_base + idx];
+  }
+  threadgroup float sm_v[8];
+  threadgroup uint sm_i[8];
+  const size_t out_base = size_t(row) * 16u;
+  for (uint k = 0u; k < 16u; k++) {
+    float bv = -1e30f; uint bi = 0xFFFFFFFFu; uint bj = 4u;
+    for (uint j = 0u; j < 4u; j++) {
+      if (lv[j] > bv || (lv[j] == bv && li[j] < bi)) { bv = lv[j]; bi = li[j]; bj = j; }
+    }
+    float sv = bv; uint si = bi;
+    for (ushort d = 16; d > 0; d >>= 1) {
+      const float ov = simd_shuffle_down(sv, d);
+      const uint oi = simd_shuffle_down(si, d);
+      if (ov > sv || (ov == sv && oi < si)) { sv = ov; si = oi; }
+    }
+    if ((tid & 31u) == 0u) { sm_v[tid >> 5] = sv; sm_i[tid >> 5] = si; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+      float fv = sm_v[0]; uint fi = sm_i[0];
+      for (uint s = 1u; s < 8u; s++) {
+        if (sm_v[s] > fv || (sm_v[s] == fv && sm_i[s] < fi)) { fv = sm_v[s]; fi = sm_i[s]; }
+      }
+      sm_v[0] = fv; sm_i[0] = fi;
+      top_v[out_base + k] = fv;
+      top_i[out_base + k] = fi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (bj < 4u && bi == sm_i[0]) lv[bj] = -1e30f;
+  }
+}
+
+// D6. DFlash 2 Candidate Path Selector (rank=256, top_k=16, post_softcap=30.0, greedy + coupled Gumbel-max).
+// Grid: (1, 1, 1), TG: 256 threads (1 thread per rank dim).
+struct Df2SelArgs {
+  uint gamma, anchor_tok, pos0, seed0, seed1, top_k;
+  float inv_temp, log_min_p, top_p, softcap;
+};
+kernel void ink_df2_select(device const float* unary [[buffer(0)]],       // [gamma, 16]
+                           device const uint* cand_ids [[buffer(1)]],     // [gamma, 16]
+                           device const float* h_sel [[buffer(2)]],       // [gamma, 256]
+                           device const bfloat* pred_cb [[buffer(3)]],    // [V_valid, 256]
+                           device const bfloat* succ_cb [[buffer(4)]],    // [V_valid, 256]
+                           device uint* draft_out [[buffer(5)]],          // [gamma]
+                           device float* draft_probs [[buffer(6)]],       // [gamma]
+                           constant Df2SelArgs& a [[buffer(7)]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float sm[8];
+  threadgroup float scores[16];
+  threadgroup uint prev_tok;
+  if (tid == 0u) prev_tok = a.anchor_tok;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float inv_cap = (a.softcap > 0.0f) ? (1.0f / a.softcap) : 0.0f;
+  for (uint p = 0u; p < a.gamma; p++) {
+    const uint pt = prev_tok;
+    const float ph = float(pred_cb[size_t(pt) * 256u + tid]) * h_sel[size_t(p) * 256u + tid];
+    for (uint k = 0u; k < 16u; k++) {
+      const uint cid = cand_ids[size_t(p) * 16u + k];
+      float prod = ph * float(succ_cb[size_t(cid) * 256u + tid]);
+      prod = simd_sum(prod);
+      if ((tid & 31u) == 0u) sm[tid >> 5] = prod;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid == 0u) {
+        float dot = 0.0f;
+        for (uint s = 0u; s < 8u; s++) dot += sm[s];
+        float sc = unary[size_t(p) * 16u + k] + dot;
+        if (a.softcap > 0.0f) sc = tanh(sc * inv_cap) * a.softcap;
+        scores[k] = sc;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+      float mx = -1e30f;
+      uint bi = 0u;
+      for (uint k = 0u; k < 16u; k++) {
+        if (scores[k] > mx) { mx = scores[k]; bi = k; }
+      }
+      const float it = (a.inv_temp > 0.0f) ? a.inv_temp : 1.0f;
+      float se = 0.0f;
+      for (uint k = 0u; k < 16u; k++) se += exp((scores[k] - mx) * it);
+      uint pick = bi;
+      if (a.inv_temp > 0.0f) {
+        const float floor_v = mx * it + a.log_min_p;
+        float bg = -1e30f;
+        for (uint k = 0u; k < 16u; k++) {
+          const float sc = scores[k] * it;
+          if (sc >= floor_v) {
+            const float g = sc + s_gumbel(a.seed0, a.seed1, a.pos0 + 1u + p, cand_ids[size_t(p) * 16u + k]);
+            if (g > bg) { bg = g; pick = k; }
+          }
+        }
+      }
+      const uint tok = cand_ids[size_t(p) * 16u + pick];
+      const float prob = exp((scores[pick] - mx) * it) / max(se, 1e-30f);
+      draft_out[p] = tok;
+      draft_probs[p] = prob;
+      prev_tok = tok;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
