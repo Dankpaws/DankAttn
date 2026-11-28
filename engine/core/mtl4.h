@@ -28,6 +28,7 @@
   bool _dispatched;
   bool _barrier_done;  // true if an explicit barrier was already emitted since the last dispatch
   bool _at_dirty;
+  MTL4VisibilityOptions _vis;
 }
 - (void)resetState;
 - (void)setBakedTable:(id<MTL4ArgumentTable>)table;
@@ -94,17 +95,17 @@
 }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
   (void)scope;
-  if (_barrier_done) return;
+  if (!_dispatched || _barrier_done) return;
   [_enc barrierAfterEncoderStages:MTLStageDispatch
               beforeEncoderStages:MTLStageDispatch
-                visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
+                visibilityOptions:_vis];
   _barrier_done = true;
 }
 - (void)dispatchThreadgroups:(MTLSize)grid threadsPerThreadgroup:(MTLSize)tg {
   if (_auto_barrier && _dispatched && !_barrier_done) {
     [_enc barrierAfterEncoderStages:MTLStageDispatch
                 beforeEncoderStages:MTLStageDispatch
-                  visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
+                  visibilityOptions:_vis];
   }
   if (_baked_at) {
     [_enc setArgumentTable:_baked_at];
@@ -122,7 +123,7 @@
   if (_auto_barrier && _dispatched && !_barrier_done) {
     [_enc barrierAfterEncoderStages:MTLStageDispatch
                 beforeEncoderStages:MTLStageDispatch
-                  visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
+                  visibilityOptions:_vis];
   }
   if (_baked_at) {
     [_enc setArgumentTable:_baked_at];
@@ -142,7 +143,7 @@
   if (_auto_barrier && _dispatched && !_barrier_done) {
     [_enc barrierAfterEncoderStages:MTLStageDispatch
                 beforeEncoderStages:MTLStageDispatch
-                  visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
+                  visibilityOptions:_vis];
   }
   if (_baked_at) {
     [_enc setArgumentTable:_baked_at];
@@ -169,7 +170,7 @@
 namespace dankattn {
 
 struct Mtl4Runtime {
-  static constexpr uint32_t MAX_CBS = 8;
+  static constexpr uint32_t MAX_CBS = 16;
 
   bool enabled = false;
   id<MTLDevice> dev = nil;
@@ -182,6 +183,7 @@ struct Mtl4Runtime {
   id<MTLSharedEvent> ev = nil;
   id<MTLBuffer> cbuf = nil;
   id<MTLResidencySet> own_rs = nil;
+  id<MTLResidencySet> unwired_rs = nil;
   uint64_t ev_val = 0;
   DankMTL4Encoder* proxy = nil;
   std::unordered_map<uint64_t, id<MTL4ArgumentTable>> baked_tables;
@@ -242,6 +244,22 @@ struct Mtl4Runtime {
     [own_rs requestResidency];
   }
 
+  // Register buffers with the MTL4 command queue without pinning them in wired RAM
+  // (e.g. unwired drafter or vision weight files).
+  void add_unwired_buffers(const std::vector<id<MTLBuffer>>& bufs) {
+    if (!enabled || !q4 || bufs.empty()) return;
+    if (!unwired_rs) {
+      NSError* err = nil;
+      MTLResidencySetDescriptor* rsd = [MTLResidencySetDescriptor new];
+      rsd.label = @"dankattn-mtl4-unwired";
+      unwired_rs = [dev newResidencySetWithDescriptor:rsd error:&err];
+      if (!unwired_rs) mtl::die("MTL4 unwired_rs failed", err);
+      [q4 addResidencySet:unwired_rs];
+    }
+    for (id<MTLBuffer> b : bufs) if (b) [unwired_rs addAllocation:b];
+    [unwired_rs commit];
+  }
+
   void add_heap(id<MTLHeap> h) {
     if (!enabled || !own_rs || !h) return;
     [own_rs addAllocation:h];
@@ -249,7 +267,8 @@ struct Mtl4Runtime {
     [own_rs requestResidency];
   }
 
-  id<MTLComputeCommandEncoder> begin(bool auto_barrier) {
+  id<MTLComputeCommandEncoder> begin(bool auto_barrier,
+                                     MTL4VisibilityOptions vis = MTL4VisibilityOptionNone) {
     for (uint32_t i = 0; i <= max_used_cb && i < MAX_CBS; i++) [allocs[i] reset];
     cb_idx = 0;
     max_used_cb = 0;
@@ -257,6 +276,7 @@ struct Mtl4Runtime {
     proxy->_enc = [cbs[0] computeCommandEncoder];
     proxy->_cbuf_off = 0;
     proxy->_auto_barrier = auto_barrier;
+    proxy->_vis = vis;
     [proxy resetState];
     return (id<MTLComputeCommandEncoder>)proxy;
   }

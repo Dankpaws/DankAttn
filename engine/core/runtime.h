@@ -32,7 +32,6 @@ struct Rec {
   id<MTLCommandBuffer> cb = nil;
   id<MTLComputeCommandEncoder> e = nil;
   id<MTLComputeCommandEncoder> mtl4_e = nil;
-  bool mtl4_dispatched = false;
   bool prof = false;
   bool conc = true;
   std::vector<id<MTLCounterSampleBuffer>> pool;
@@ -67,8 +66,7 @@ struct Rec {
     }
     if (!prof) {
       if (mtl4_e) {
-        if (mtl4_dispatched && barrier) [mtl4_e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        mtl4_dispatched = true;
+        if (barrier) [mtl4_e memoryBarrierWithScope:MTLBarrierScopeBuffers];
         return mtl4_e;
       }
       if (chunk0 && e && (++nops == chunk0 || (chunk && nops > chunk0 && (nops - chunk0) % chunk == 0))) flush();

@@ -813,6 +813,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     mtl4.init(C.dev);
     mtl4.add_residency_set(rs);
     mtl4.add_residency_set(slot_rs);
+    mtl4.add_unwired_buffers(files);
     mtl4.add_heap(scratch_heap);
     mtl4.add_buffers(C.made);
     fprintf(stderr, "hy4: Metal 4 command encoding enabled (DANKATTN_MTL4=1, %zu tracked bufs)\n", C.made.size());
@@ -2249,7 +2250,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   double m4_t0 = 0.0;
   if (use_m4) {
     m4_t0 = host_now();
-    rc.mtl4_e = mtl4.begin(/*auto_barrier=*/true);
+    rc.mtl4_e = mtl4.begin(/*auto_barrier=*/false);
   } else {
     rc.cb = [C.q commandBuffer];
   }
@@ -2258,7 +2259,6 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   auto commit_now = [&]() {
     if (use_m4) {
       rc.mtl4_e = mtl4.flush();
-      rc.mtl4_dispatched = false;
       if (!h_commit0) h_commit0 = host_now();
       return;
     }
@@ -2318,7 +2318,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
       const double w = std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count() * 1e3;
       eng_wait_ms += w;
       eng_rest_ms += w;
-    } else if (chunk_layers && i > 1 && i % chunk_layers == 0) {
+    } else if (!use_m4 && chunk_layers && i > 1 && i % chunk_layers == 0) {
       commit_now();
     }
     encode_layer(rc, L[i], i, M, p0, i == 0);
@@ -2579,9 +2579,14 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
     for (uint32_t i = 0; i < W; i++) pp[i] = uint32_t(int64_t(p + i) + mrope_delta);
     rope_rows(inv_dsa, pp, (float*)rope_draft.contents);
   }
+  const bool use_m4 = mtl4.enabled && profile == nullptr;
   Rec rc;
-  rc.cb = [C.q commandBuffer];
   rc.prof = profile != nullptr;
+  if (use_m4) {
+    rc.mtl4_e = mtl4.begin(/*auto_barrier=*/false);
+  } else {
+    rc.cb = [C.q commandBuffer];
+  }
   id<MTLComputeCommandEncoder> e;
   auto embed_rows = [&](id<MTLBuffer> idb, size_t idoff, uint32_t M, id<MTLBuffer> out, bool barrier = true) {
     struct { uint32_t M, H, HC; } a{M, H, 1};
@@ -3011,16 +3016,24 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     }
   }
-  if (rc.e) [rc.e endEncoding];
-  [rc.cb commit];
-  const double h_commit = host_now();
-  [rc.cb waitUntilCompleted];
-  const double h_wake = host_now();
-  if (rc.cb.error) mtl::die("draft: command buffer failed", rc.cb.error);
-  if (gpu_ms) *gpu_ms = mtl::gpu_seconds(rc.cb) * 1e3;
-  last_dlat = {(h_commit - h_entry) * 1e3, (h_commit - h_entry) * 1e3, (rc.cb.GPUStartTime - h_commit) * 1e3,
-               (rc.cb.GPUEndTime - rc.cb.GPUStartTime) * 1e3, (h_wake - rc.cb.GPUEndTime) * 1e3};
-  if (profile) rc.resolve(*profile);
+  if (use_m4) {
+    mtl4.commit_and_wait();
+    const double h_wake = host_now();
+    const double ms = (h_wake - h_entry) * 1e3;
+    if (gpu_ms) *gpu_ms = ms;
+    last_dlat = {0.0, 0.0, 0.0, ms, 0.0};
+  } else {
+    if (rc.e) [rc.e endEncoding];
+    [rc.cb commit];
+    const double h_commit = host_now();
+    [rc.cb waitUntilCompleted];
+    const double h_wake = host_now();
+    if (rc.cb.error) mtl::die("draft: command buffer failed", rc.cb.error);
+    if (gpu_ms) *gpu_ms = mtl::gpu_seconds(rc.cb) * 1e3;
+    last_dlat = {(h_commit - h_entry) * 1e3, (h_commit - h_entry) * 1e3, (rc.cb.GPUStartTime - h_commit) * 1e3,
+                 (rc.cb.GPUEndTime - rc.cb.GPUStartTime) * 1e3, (h_wake - rc.cb.GPUEndTime) * 1e3};
+    if (profile) rc.resolve(*profile);
+  }
   std::vector<uint32_t> out(W - 1);
   memcpy(out.data(), dout.contents, (W - 1) * 4);
   last_probs.assign((const float*)dprob.contents, (const float*)dprob.contents + (W - 1));
