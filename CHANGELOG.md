@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Engine Core & Refactoring
+- **Shared C++ runtime (`engine/core/`):** extracted `env.h`, `pack.h`, `runtime.h`, `proto.h`, and `pcache.h`, deduplicating `Lin`, `Raw`, `jload`, `parse_json`, `mmap_file`, `host_now`, `new_sample_buffer`, `Rec`, and `PrefixCache` across Hy4, Inkling2, ERNIE-5.5, and Flash-Next.
+- **Modular Metal shaders (`engine/mtl.h`, `engine/kernels/mm2_epilogues.metal`):** added recursive local `#include "..."` expansion in `mtl::slurp()` and split model-specific epilogues (`EPI=1..5`, `epi3_regs`) out of `engine/kernels/mm2.metal` (`-133` LOC).
+- **Unified Python chat frontend (`server/engine_frontend.py`):** consolidated `parse_chat_params`, `find_stop_cut`, `finish_reason_of`, `make_sse_chunk`, `make_usage`, and `run_chat_completion` across `hy4_server.py`, `ernie55_server.py`, `inkling2_server.py`, and `dankattn_server.py`.
+
+### Shader Cache, Quantization & Paged KV
+- **Disk-cached `MTLBinaryArchive` (`engine/mtl.h`):** caches compiled Metal pipeline states in `~/Library/Caches/DankAttn/metallib` keyed by device, OS, source hash, and defines (`DANKATTN_SHADER_CACHE=0` to disable), cutting warm Hy4 server startup to ~1.5–7s.
+- **`W3` and `MXFP4` quantization tiers (`engine/kernels/mm2.metal`, `convert/layout.py`, `bench/quant_test.mm`):** added `WBITS=3` (`gs=64/128`, 12 B/lane) and `WBITS=41` (`MXFP4`, E2M1, `gs=32`) kernels, packing layouts, and GPU unit tests verified bit-exact (`0.000e+00` error across `mm1`/`mm2`/`mmp`, `M1==M16` `0` bit diffs).
+- **Lossless Paged KV + Radix Prefix Tree (`engine/core/kv_radix.h`, `bench/kv_radix_test.mm`):** 128-token block-table pool with refcounted zero-copy prefix sharing and LRU leaf eviction; wired into Hy4 behind opt-in `HY4_PAGED_KV=1` (`0.000e+00` diff on `vtest`/`ntest 4`/`calib2048`).
+
+### API & Serving
+- **Anthropic Messages API (`server/anthropic_compat.py`):** native `/v1/messages` (non-streaming + SSE streaming) and `/v1/messages/count_tokens` registered automatically across all DankAttn servers.
+- **Zero-dependency structured outputs (`server/json_schema_dfa.py`):** `response_format: {"type": "json_schema", ...}` token-level schema enforcement on `/v1/chat/completions`.
+- **Single-port multi-model router (`server/router.py`):** serves multiple DankAttn engines behind one port with on-demand backend switching.
+- **Consolidated pack auto-detection (`hy4/serve_hy4.sh`):** auto-detects `models/pack-dfly2b6` vs `models/pack-v4-h128-w6` and sets matching `HY4_CAP` / `HY4_SIDE_CAP`.
+
+## v2026.11.26
+
+### Hy4 DFly2-B6 & Inkling2 DFlash2
+- **Hy4 DFly2-B6 drafter:** added `DFly2-B6` LatentMoE + Attention-Conditioned speculative drafter, made `HY4_QOS=1` default, and added bit-exact audit logging.
+- **Inkling-2-Mini DFlash2:** added `DFlash2` block-diffusion drafter overlay, split-K SWA-2048 attention, and updated `v2026.11.26` model cards/docs.
+- **ERNIE-5.5 docs:** corrected quantization description to hybrid `W2-g32`/`W2-g64` NF2 RTN.
+
 ## v2026.11.25
 
 ### Hy4 Engine & `pack-v4-h128-w6`
