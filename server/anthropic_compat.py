@@ -216,7 +216,7 @@ def register_anthropic_routes(app, model_id: str, render_fn, tok, json_body_fn, 
             if not sent[0]:
                 sent[0] = True
                 return {"type": "http.request", "body": oai_bytes, "more_body": False}
-            return {"type": "http.disconnect"}
+            return await request.receive()
 
         sub_req = Request(request.scope, receive=_recv)
         res = await chat_endpoint(sub_req)
