@@ -10,6 +10,7 @@
 // drafts, one step_lanes() verifies every lane's rows (HY4_JS=0: plain one-row lanes).
 #include "../core/pcache.h"
 #include "../core/proto.h"
+#include "../core/sample.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -30,6 +31,7 @@ std::mutex mu;
 std::condition_variable cv;
 std::deque<ReqP> inbox;
 std::map<uint32_t, ReqP> live;
+std::map<uint32_t, std::deque<std::vector<uint32_t>>> mask_q;  // rid -> pending OPMK allowed-ID lists
 bool closed = false;
 
 void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
@@ -38,26 +40,48 @@ void error(uint32_t rid, const std::string& msg) {
   fprintf(stderr, "hy4: rid %u refused: %s\n", rid, msg.c_str());
 }
 
+static bool pop_mask(uint32_t rid, const std::atomic<bool>& cancel, std::vector<uint32_t>& out) {
+  std::unique_lock<std::mutex> g(mu);
+  cv.wait(g, [&] {
+    if (closed || cancel.load()) return true;
+    auto it = mask_q.find(rid);
+    return it != mask_q.end() && !it->second.empty();
+  });
+  auto it = mask_q.find(rid);
+  if (it == mask_q.end() || it->second.empty()) return false;
+  out = std::move(it->second.front());
+  it->second.pop_front();
+  return true;
+}
+
 void reader() {
   const dankattn::proto::ReadOpts ropts{.keep_images = true, .parse_fpr_suffixes = false};
   for (;;) {
     auto q = std::make_shared<Req>();
-    uint32_t cancel_rid = 0;
-    const auto kind = dankattn::proto::read_packet(*q, cancel_rid, ropts);
+    uint32_t ctrl_rid = 0;
+    std::vector<uint32_t> mask_ids;
+    const auto kind = dankattn::proto::read_packet(*q, ctrl_rid, ropts, stdin, &mask_ids);
     if (kind == dankattn::proto::PacketKind::Eof) break;
     if (kind == dankattn::proto::PacketKind::Cancel) {
       std::lock_guard<std::mutex> g(mu);
-      if (auto it = live.find(cancel_rid); it != live.end()) it->second->cancel = true;
+      if (auto it = live.find(ctrl_rid); it != live.end()) it->second->cancel = true;
+      cv.notify_all();
+      continue;
+    }
+    if (kind == dankattn::proto::PacketKind::Mask) {
+      std::lock_guard<std::mutex> g(mu);
+      mask_q[ctrl_rid].push_back(std::move(mask_ids));
+      cv.notify_all();
       continue;
     }
     std::lock_guard<std::mutex> g(mu);
     live[q->rid] = q;
     inbox.push_back(q);
-    cv.notify_one();
+    cv.notify_all();
   }
   std::lock_guard<std::mutex> g(mu);
   closed = true;
-  cv.notify_one();
+  cv.notify_all();
 }
 
 // feed toks (prefill chunks or one verify / decode step); returns the next token and where the source
@@ -294,6 +318,7 @@ static void finish_active(Active& a, std::vector<bool>& slot_busy) {
   if (a.slot >= 0) slot_busy[a.slot] = false;
   std::lock_guard<std::mutex> g(mu);
   live.erase(a.q->rid);
+  mask_q.erase(a.q->rid);
 }
 
 static void apply_sampling(hy4::Model& m, const Req& q) {
@@ -445,7 +470,7 @@ static void admit_requests(hy4::Model& m, std::vector<Active>& active, std::vect
     slot_imgs()[sl].clear();
     for (const auto& im : q->imgs) slot_imgs()[sl].push_back({im.tok_off, im.hash});
     a.rest.assign(q->ids.begin() + a.reused, q->ids.end());
-    a.spec = (q->flags & 1) && m.has_dfly;
+    a.spec = (q->flags & 1) && !(q->flags & (64 | 128)) && m.has_dfly;
     a.thinking = (q->flags & 4) != 0;
     slot_busy[sl] = true;
     active.push_back(std::move(a));
@@ -498,11 +523,14 @@ int main(hy4::Model& m) {
       }
       if (active.empty()) continue;
 
-      // 2) Prefill one chunk for the first prefilling request (smaller chunk when decode lanes are active to bound ITL)
-      bool any_decoding = false;
-      for (const auto& a : active) if (!a.prefilling) { any_decoding = true; break; }
-      const uint32_t pf_chunk = any_decoding
-          ? std::min(m.MR, std::max<uint32_t>(hy4::MAXM + 1, (hy4::cfg().pf_dec_chunk / 16) * 16))
+      // 2) Prefill one chunk for the first prefilling request (adaptive chunk cap when decode lanes are active)
+      uint32_t n_decoding = 0;
+      for (const auto& a : active) if (!a.prefilling) n_decoding++;
+      const uint32_t base_dec_chunk = (n_decoding >= 2u)
+          ? std::max<uint32_t>(64u, hy4::cfg().pf_dec_chunk / 2u)
+          : hy4::cfg().pf_dec_chunk;
+      const uint32_t pf_chunk = n_decoding > 0u
+          ? std::min(m.MR, std::max<uint32_t>(hy4::MAXM + 1, (base_dec_chunk / 16) * 16))
           : m.MR;
       for (size_t i = 0; i < active.size(); i++) {
         if (!active[i].prefilling) continue;
@@ -552,18 +580,40 @@ int main(hy4::Model& m) {
           }
           a.vis_ready = true;
         }
-        const size_t end = std::min(a.rest.size(), a.pref_off + pf_chunk);
+        const bool need_logits = (a.q->flags & (64u | 128u)) != 0u;
+        // When constrained or logprobs is requested, keep the final prompt token in its own 1-row step
+        // so we get full float[V] logits for masked sampling / logprobs.
+        size_t end = std::min(a.rest.size(), a.pref_off + pf_chunk);
+        if (need_logits && end == a.rest.size() && end - a.pref_off > 1) end = a.rest.size() - 1;
         std::vector<uint32_t> c(a.rest.begin() + long(a.pref_off), a.rest.begin() + long(end));
         if (end < a.rest.size())
           m.next_hint.assign(a.rest.begin() + long(end), a.rest.begin() + long(std::min(a.rest.size(), end + pf_chunk)));
         double g = 0;
         const size_t g_off = a.reused + a.pref_off;
+        std::vector<float> step_lg;
+        const bool want_step_lg = need_logits && (end >= a.rest.size()) && c.size() == 1;
         if (!a.req_pos3d.empty()) {
           const uint32_t n_vis = uint32_t(a.vis_embeds.size() / m.H);
-          a.b = m.step(c, &g, nullptr, nullptr, n_vis ? a.vis_embeds.data() : nullptr, n_vis,
+          a.b = m.step(c, &g, want_step_lg ? &step_lg : nullptr, nullptr, n_vis ? a.vis_embeds.data() : nullptr, n_vis,
                        n_vis ? a.vis_idx.data() + g_off : nullptr, a.req_pos3d.data() + g_off).back();
         } else {
-          a.b = m.step(c, &g).back();
+          a.b = m.step(c, &g, want_step_lg ? &step_lg : nullptr).back();
+        }
+        if (want_step_lg && !step_lg.empty()) {
+          std::vector<uint32_t> allowed;
+          const bool constrained = (a.q->flags & 64u) != 0u;
+          if (!constrained || pop_mask(a.q->rid, a.q->cancel, allowed)) {
+            float lp_val = 0.0f;
+            std::vector<std::pair<uint32_t, float>> tops;
+            const bool want_lp = (a.q->flags & 128u) != 0u;
+            a.b = dankattn::sample::sample_and_logprobs(
+                step_lg.data(), m.vocab, constrained ? &allowed : nullptr,
+                a.q->temp > 0 ? a.q->temp : 0.0f,
+                (a.q->top_p > 0.0f && a.q->top_p <= 1.0f) ? a.q->top_p : 1.0f,
+                a.q->top_k, a.q->min_p >= 0.0f ? a.q->min_p : m.default_min_p,
+                a.q->seed, m.pos, want_lp, a.q->top_logprobs, lp_val, tops);
+            if (want_lp) dankattn::proto::send_logprob(a.q->rid, a.b, lp_val, tops);
+          }
         }
         a.pms += g;
         a.pref_off = end;
@@ -575,6 +625,7 @@ int main(hy4::Model& m) {
           a.req_pos3d.clear();
           m.save_dfly_src(a.slot, c.size() > hy4::MAXM ? 0 : uint32_t(c.size()) - 1);
           m.save_ckpt();
+          if (m.paged_kv) m.commit_kv_blocks(a.slot);
         }
         break;  // one chunk per loop iteration so arriving requests / active decodes stay responsive
       }
@@ -616,8 +667,31 @@ int main(hy4::Model& m) {
         bool stop = false;
         if (!a.spec || !m.slots_[a.slot].has_df_src || m.pos + sp.max_rows(m) + 1 >= m.cap) {
           stop = emit_tok(m, a, a.b);
+          fflush(stdout);
           if (!stop) {
-            a.b = m.step({a.b}).back();
+            const bool need_lg = (a.q->flags & (64u | 128u)) != 0u;
+            if (need_lg) {
+              std::vector<float> step_lg;
+              a.b = m.step({a.b}, nullptr, &step_lg).back();
+              std::vector<uint32_t> allowed;
+              const bool constrained = (a.q->flags & 64u) != 0u;
+              if (constrained && !pop_mask(a.q->rid, a.q->cancel, allowed)) {
+                stop = true;
+              } else {
+                float lp_val = 0.0f;
+                std::vector<std::pair<uint32_t, float>> tops;
+                const bool want_lp = (a.q->flags & 128u) != 0u;
+                a.b = dankattn::sample::sample_and_logprobs(
+                    step_lg.data(), m.vocab, constrained ? &allowed : nullptr,
+                    a.q->temp > 0 ? a.q->temp : 0.0f,
+                    (a.q->top_p > 0.0f && a.q->top_p <= 1.0f) ? a.q->top_p : 1.0f,
+                    a.q->top_k, a.q->min_p >= 0.0f ? a.q->min_p : m.default_min_p,
+                    a.q->seed, m.pos, want_lp, a.q->top_logprobs, lp_val, tops);
+                if (want_lp) dankattn::proto::send_logprob(a.q->rid, a.b, lp_val, tops);
+              }
+            } else {
+              a.b = m.step({a.b}).back();
+            }
             m.save_dfly_src(a.slot, 0);
           }
         } else {

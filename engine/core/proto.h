@@ -12,11 +12,13 @@ namespace dankattn::proto {
 
 constexpr uint32_t MAGIC_REQ = 0x5355504Fu;     // 'OPUS'
 constexpr uint32_t MAGIC_CANCEL = 0x5843504Fu;  // 'OPCX'
+constexpr uint32_t MAGIC_MASK = 0x4B4D504Fu;    // 'OPMK' (constrained-decoding allowed token IDs)
 
 constexpr uint32_t END = 0xFFFFFFFFu;
 constexpr uint32_t ERR = 0xFFFFFFFEu;
 constexpr uint32_t READY = 0xFFFFFFFDu;
 constexpr uint32_t CAND_SEP = 0xFFFFFFFCu;
+constexpr uint32_t LOGPROB = 0xFFFFFFFBu;
 
 inline bool rd(void* p, size_t n, FILE* f = stdin) { return n == 0 || fread(p, 1, n, f) == n; }
 inline bool wr(const void* p, size_t n, FILE* f = stdout) { return n == 0 || fwrite(p, 1, n, f) == n; }
@@ -44,6 +46,17 @@ inline void send_end(uint32_t rid, uint32_t reused, uint32_t n_prompt, uint32_t 
   fflush(stdout);
 }
 
+inline void send_logprob(uint32_t rid, uint32_t tok, float lp,
+                         const std::vector<std::pair<uint32_t, float>>& tops) {
+  struct { uint32_t rid, tag, tok; float lp; uint32_t n_top; } __attribute__((packed)) hdr{
+      rid, LOGPROB, tok, lp, uint32_t(tops.size())};
+  fwrite(&hdr, sizeof(hdr), 1, stdout);
+  for (const auto& [tid, tlp] : tops) {
+    struct { uint32_t id; float lp; } __attribute__((packed)) entry{tid, tlp};
+    fwrite(&entry, sizeof(entry), 1, stdout);
+  }
+}
+
 struct VisImg {
   uint32_t T = 0, h = 0, w = 0, tok_off = 0;
   uint64_t hash = 0;
@@ -60,26 +73,41 @@ struct OpusReq {
   float temp = 0.0f, top_p = 1.0f, min_p = -1.0f;
   uint32_t top_k = 0;
   uint64_t seed = 0;
+  uint32_t top_logprobs = 0;  // flags & 128: emit per-token logprobs + top_logprobs (0..20)
   std::atomic<bool> cancel{false};
   std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now();
 };
 
-enum class PacketKind { Eof, Cancel, Request };
+enum class PacketKind { Eof, Cancel, Request, Mask };
 
 struct ReadOpts {
   bool keep_images = false;         // true for vision-capable engines (hy4); false drains stream cleanly
   bool parse_fpr_suffixes = false;  // true for inkling2 (reads per-lane suffixes when (grp2 & 0xF) == 2)
 };
 
-// Read the next OPUS or OPCX packet from `in`. On Cancel, sets `out_cancel_rid`.
-// On Request, populates `out_req`. Returns Eof on clean EOF or framing error.
-inline PacketKind read_packet(OpusReq& out_req, uint32_t& out_cancel_rid,
-                              const ReadOpts& opts = {}, FILE* in = stdin) {
+// Read the next OPUS, OPCX, or OPMK packet from `in`.
+inline PacketKind read_packet(OpusReq& out_req, uint32_t& out_ctrl_rid,
+                              const ReadOpts& opts = {}, FILE* in = stdin,
+                              std::vector<uint32_t>* out_mask_ids = nullptr) {
   uint32_t magic = 0;
   if (!rd(&magic, 4, in)) return PacketKind::Eof;
   if (magic == MAGIC_CANCEL) {
-    if (!rd(&out_cancel_rid, 4, in)) return PacketKind::Eof;
+    if (!rd(&out_ctrl_rid, 4, in)) return PacketKind::Eof;
     return PacketKind::Cancel;
+  }
+  if (magic == MAGIC_MASK) {
+    uint32_t mh[2];
+    if (!rd(mh, 8, in)) return PacketKind::Eof;
+    out_ctrl_rid = mh[0];
+    const uint32_t n = mh[1];
+    if (out_mask_ids) {
+      out_mask_ids->resize(n);
+      if (!rd(out_mask_ids->data(), size_t(n) * 4u, in)) return PacketKind::Eof;
+    } else if (n) {
+      std::vector<uint32_t> skip(n);
+      if (!rd(skip.data(), size_t(n) * 4u, in)) return PacketKind::Eof;
+    }
+    return PacketKind::Mask;
   }
   if (magic != MAGIC_REQ) return PacketKind::Eof;
 
@@ -147,6 +175,9 @@ inline PacketKind read_packet(OpusReq& out_req, uint32_t& out_cancel_rid,
         if (!rd(scratch.data(), npix * 2u, in)) return PacketKind::Eof;
       }
     }
+  }
+  if (out_req.flags & 128u) {
+    if (!rd(&out_req.top_logprobs, 4, in)) return PacketKind::Eof;
   }
   return PacketKind::Request;
 }

@@ -467,6 +467,25 @@ cmd_doctor() {
   fi
 }
 
+cmd_router() {
+  py="$(pick_python)"
+  port="8340"
+  models_dir="$ROOT/models"
+  extra=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)        port="$2"; shift 2 ;;
+      --models-dir)  models_dir="$2"; shift 2 ;;
+      --config|--idle-unload|--allow-host|--api-key|--max-body-mb)
+                     extra="$extra $1 $2"; shift 2 ;;
+      *)             extra="$extra $1"; shift ;;
+    esac
+  done
+  say "Starting DankAttn multi-model router on :$port (models: $models_dir)..."
+  # shellcheck disable=SC2086
+  exec "$py" "$ROOT/server/router.py" --port "$port" --models-dir "$models_dir" $extra
+}
+
 cmd_version() {
   ver="$(git -C "$ROOT" describe --tags --always 2>/dev/null || echo unknown)"
   echo "dankattn $ver ($ROOT)"
@@ -486,6 +505,9 @@ Usage:
 
   dankattn serve <inkling2|hy4|ernie55> [start|stop|status|smoke|logs] [options]
       Manage the OpenAI-compatible server in the background (default: start).
+
+  dankattn router [--port 8340] [--models-dir <dir>] [--idle-unload <sec>] [options]
+      Run the single-port multi-model router (auto-switches RAM-exclusive packs on demand).
 
   dankattn update [inkling2|hy4|ernie55|all]
       Pull the latest DankAttn release and rebuild installed binaries (~4s).
@@ -520,6 +542,7 @@ case "$cmd" in
   pull)              cmd_pull "$@" ;;
   run)               cmd_run "$@" ;;
   serve)             cmd_serve "$@" ;;
+  router)            cmd_router "$@" ;;
   update)            exec sh "$ROOT/update.sh" "$@" ;;
   doctor)            cmd_doctor ;;
   version|-v|--version) cmd_version ;;

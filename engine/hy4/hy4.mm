@@ -1298,6 +1298,14 @@ void Model::truncate(uint32_t n) {
     mrope_delta = int32_t(std::max({b.t, b.h, b.w}) + 1u) - int32_t(n);
   }
   while (!ckpts.empty() && ckpts.back().pos > n) ckpts.pop_back();
+  if (paged_kv && cur_slot >= 0 && cur_slot < int(slots_.size())) {
+    const uint32_t keep_blks = (n + 127u) / 128u;
+    auto& blks = slots_[cur_slot].kv_blocks;
+    while (blks.size() > keep_blks) {
+      kv_pool.release_block(blks.back());
+      blks.pop_back();
+    }
+  }
 }
 
 // ring rows of positions [p0, p0 + n) <-> a contiguous blob (two blits when the range wraps)
@@ -1422,6 +1430,7 @@ Model::PrefixSnap Model::snapshot_prefix(int slot) const {
   s.lat = slots_[slot].lat;
   s.tokring = slots_[slot].tokring;
   s.bk = slots_[slot].bk;
+  s.kv_blocks = slots_[slot].kv_blocks;
   return s;
 }
 
@@ -1451,10 +1460,27 @@ bool Model::save_prefix_snap(const PrefixSnap& snap, const std::string& path, do
     if (!ok) break;
     const Layer& l = L[li];
     if (l.sparse) {
-      const size_t a = size_t(sp) * lat_row(l), b = size_t((sp + 3) / 4) * 256;
-      ok = ring_xfer(fd, snap.tokring[li], TOKR, 512, lo_t, h.nt, off, true) &&
-           xfer(fd, snap.lat[li].contents, a, off + off_t(size_t(h.nt) * 512), true) &&
-           xfer(fd, snap.bk[li].contents, b, off + off_t(size_t(h.nt) * 512 + a), true);
+      const size_t lr = lat_row(l);
+      const size_t a = size_t(sp) * lr, b = size_t((sp + 3) / 4) * 256;
+      ok = ring_xfer(fd, snap.tokring[li], TOKR, 512, lo_t, h.nt, off, true);
+      if (ok && paged_kv) {
+        const uint32_t nblk = (sp + 127u) / 128u;
+        const uint32_t ng = (sp + 3u) / 4u;
+        off_t lat_off = off + off_t(size_t(h.nt) * 512);
+        off_t bk_off = lat_off + off_t(a);
+        for (uint32_t bi = 0; bi < nblk && ok; bi++) {
+          const uint32_t phys = snap.kv_blocks[bi];
+          const uint32_t rows = std::min<uint32_t>(128u, sp - bi * 128u);
+          const uint32_t grps = std::min<uint32_t>(32u, ng - bi * 32u);
+          ok = xfer(fd, (uint8_t*)snap.lat[li].contents + size_t(phys) * 128u * lr, size_t(rows) * lr,
+                    lat_off + off_t(size_t(bi) * 128u * lr), true) &&
+               xfer(fd, (uint8_t*)snap.bk[li].contents + size_t(phys) * 32u * 256u, size_t(grps) * 256u,
+                    bk_off + off_t(size_t(bi) * 32u * 256u), true);
+        }
+      } else if (ok) {
+        ok = xfer(fd, snap.lat[li].contents, a, off + off_t(size_t(h.nt) * 512), true) &&
+             xfer(fd, snap.bk[li].contents, b, off + off_t(size_t(h.nt) * 512 + a), true);
+      }
       off += off_t(size_t(h.nt) * 512 + a + b);
     } else {
       ok = ring_xfer(fd, snap.lat[li], RING, 1152, lo_s, h.nw, off, true);
@@ -1488,7 +1514,7 @@ bool Model::prefix_tokens(const std::string& path, uint64_t fp, std::vector<uint
   return ok;
 }
 
-bool Model::load_prefix_into(int slot, const std::string& path, PrefixLoad& out) const {
+bool Model::load_prefix_into(int slot, const std::string& path, PrefixLoad& out) {
   out = PrefixLoad{};
   if (slot < 0 || slot >= int(slots_.size())) return false;
   const uint32_t scap = slots_[slot].cap;
@@ -1506,15 +1532,36 @@ bool Model::load_prefix_into(int slot, const std::string& path, PrefixLoad& out)
   off_t off = sizeof h;
   bool ok = xfer(fd, toks.data(), size_t(h.pos) * 4, off, false);
   off += off_t(h.pos) * 4;
+  if (ok && paged_kv) {
+    release_kv_blocks(slot);
+    ensure_kv_blocks(slot, h.pos);
+  }
   const Slot& sl = slots_[slot];
   for (size_t li = 0; li < L.size(); li++) {
     if (!ok) break;
     const Layer& l = L[li];
     if (l.sparse) {
-      const size_t a = size_t(h.pos) * lat_row(l), b = size_t((h.pos + 3) / 4) * 256;
-      ok = ring_xfer(fd, sl.tokring[li], TOKR, 512, h.pos - h.nt, h.nt, off, false) &&
-           xfer(fd, sl.lat[li].contents, a, off + off_t(size_t(h.nt) * 512), false) &&
-           xfer(fd, sl.bk[li].contents, b, off + off_t(size_t(h.nt) * 512 + a), false);
+      const size_t lr = lat_row(l);
+      const size_t a = size_t(h.pos) * lr, b = size_t((h.pos + 3) / 4) * 256;
+      ok = ring_xfer(fd, sl.tokring[li], TOKR, 512, h.pos - h.nt, h.nt, off, false);
+      if (ok && paged_kv) {
+        const uint32_t nblk = (h.pos + 127u) / 128u;
+        const uint32_t ng = (h.pos + 3u) / 4u;
+        off_t lat_off = off + off_t(size_t(h.nt) * 512);
+        off_t bk_off = lat_off + off_t(a);
+        for (uint32_t bi = 0; bi < nblk && ok; bi++) {
+          const uint32_t phys = sl.kv_blocks[bi];
+          const uint32_t rows = std::min<uint32_t>(128u, h.pos - bi * 128u);
+          const uint32_t grps = std::min<uint32_t>(32u, ng - bi * 32u);
+          ok = xfer(fd, (uint8_t*)sl.lat[li].contents + size_t(phys) * 128u * lr, size_t(rows) * lr,
+                    lat_off + off_t(size_t(bi) * 128u * lr), false) &&
+               xfer(fd, (uint8_t*)sl.bk[li].contents + size_t(phys) * 32u * 256u, size_t(grps) * 256u,
+                    bk_off + off_t(size_t(bi) * 32u * 256u), false);
+        }
+      } else if (ok) {
+        ok = xfer(fd, sl.lat[li].contents, a, off + off_t(size_t(h.nt) * 512), false) &&
+             xfer(fd, sl.bk[li].contents, b, off + off_t(size_t(h.nt) * 512 + a), false);
+      }
       off += off_t(size_t(h.nt) * 512 + a + b);
     } else {
       ok = ring_xfer(fd, sl.lat[li], RING, 1152, h.pos - h.nw, h.nw, off, false);
@@ -1545,6 +1592,7 @@ uint32_t Model::apply_prefix_load(int slot, PrefixLoad&& pl) {
   ring_floor = pl.ring_floor;
   ckpts.clear();
   slots_[cur_slot].has_df_src = false;
+  if (paged_kv) commit_kv_blocks(cur_slot);
   return pl.pos;
 }
 

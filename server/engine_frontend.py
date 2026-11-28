@@ -8,7 +8,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from anthropic_compat import register_anthropic_routes
-from json_schema_dfa import parse_response_format, schema_system_hint, validate_json_schema
+from json_schema_dfa import JsonSchemaDFA, VocabMasker, parse_response_format, schema_system_hint, validate_json_schema
 
 
 class Unavailable(Exception):
@@ -104,6 +104,13 @@ class EngineProc:
         self.engine = None
         self.state = {"state": "starting", "restarts": 0, "pid": 0, "since": time.time(), "idle_unload_s": self.idle_unload_s}
         self.load = {"instance": uuid.uuid4().hex, "running": 0, "waiting": 0, "decode": 0, "prefill": 0, "prefill_us": 0}
+        self.metrics = {
+            "requests_total": 0, "requests_errors": 0,
+            "prompt_tokens_total": 0, "reused_prompt_tokens_total": 0,
+            "generated_tokens_total": 0, "spec_rounds_total": 0, "accepted_drafts_total": 0,
+            "prefill_ms_total": 0.0, "wall_ms_total": 0.0,
+            "last_decode_tps": 0.0, "last_prefill_tps": 0.0,
+        }
         threading.Thread(target=self._supervise, daemon=True).start()
         if self.idle_unload_s > 0:
             threading.Thread(target=self._idle_watchdog, daemon=True).start()
@@ -133,8 +140,24 @@ class EngineProc:
                     else:
                         self.load["running"] -= 1
                     if "prompt" in item:
-                        self.load["prefill"] += item["prompt"] - item["reused"]
+                        pf_toks = max(0, item["prompt"] - item["reused"])
+                        self.load["prefill"] += pf_toks
                         self.load["prefill_us"] += int(item["prefill_ms"] * 1000)
+                        self.metrics["requests_total"] += 1
+                        self.metrics["prompt_tokens_total"] += item["prompt"]
+                        self.metrics["reused_prompt_tokens_total"] += item["reused"]
+                        self.metrics["generated_tokens_total"] += item["generated"]
+                        self.metrics["spec_rounds_total"] += item["rounds"]
+                        self.metrics["accepted_drafts_total"] += item["accepted"]
+                        self.metrics["prefill_ms_total"] += float(item["prefill_ms"])
+                        self.metrics["wall_ms_total"] += float(item["wall_ms"])
+                        dec_ms = max(0.0, float(item["wall_ms"]) - float(item["prefill_ms"]))
+                        if item["generated"] > 0 and dec_ms > 0:
+                            self.metrics["last_decode_tps"] = round(item["generated"] * 1000.0 / dec_ms, 2)
+                        if pf_toks > 0 and item["prefill_ms"] > 0:
+                            self.metrics["last_prefill_tps"] = round(pf_toks * 1000.0 / float(item["prefill_ms"]), 2)
+                    elif "error" in item:
+                        self.metrics["requests_errors"] += 1
             cb(item)
 
         return f
@@ -164,6 +187,13 @@ class EngineProc:
                 elif w == 0xFFFFFFFC:
                     conf, cflags = struct.unpack("<fI", read_exact(out, 8))
                     item = ("cand_sep", conf, cflags)
+                elif w == 0xFFFFFFFB:
+                    tok_id, lp, n_top = struct.unpack("<IfI", read_exact(out, 12))
+                    tops = []
+                    for _ in range(n_top):
+                        tid, tlp = struct.unpack("<If", read_exact(out, 8))
+                        tops.append((tid, tlp))
+                    item = ("logprob", tok_id, lp, tops)
                 else:
                     item = w
                 with self.streams_lock:
@@ -263,7 +293,8 @@ class EngineProc:
             time.sleep(2)
 
     def submit(self, ids, max_new, spec, temp, top_p, top_k, seed, cb,
-               group=None, think_budget=0, strict=False, min_p=None, extra_stops=(), vision_imgs=None, fpr_suffixes=None):
+               group=None, think_budget=0, strict=False, min_p=None, extra_stops=(),
+               vision_imgs=None, fpr_suffixes=None, constrained=False, top_logprobs=None):
         self.ensure_awake()
         rid = next(self.rids)
         stops = list(self.default_stops)
@@ -272,12 +303,14 @@ class EngineProc:
                 stops.append(t)
         req = struct.pack("<III", 0x5355504F, rid, len(ids)) + struct.pack(f"<{len(ids)}I", *ids)
         flags = (
-            (1 if spec else 0)
+            (1 if (spec and not constrained) else 0)
             | (2 if group else 0)
             | (4 if think_budget else 0)
             | (8 if strict else 0)
             | (16 if min_p is not None else 0)
             | (32 if vision_imgs else 0)
+            | (64 if constrained else 0)
+            | (128 if top_logprobs is not None else 0)
         )
         req += struct.pack("<III", max_new, flags, len(stops)) + struct.pack(f"<{len(stops)}I", *stops)
         req += struct.pack("<ffIQ", temp, top_p, top_k, seed)
@@ -297,6 +330,8 @@ class EngineProc:
                 parts.append(struct.pack("<IIIIQ", im["T"], im["h"], im["w"], im["tok_off"], im["hash_u64"]))
                 parts.append(im["pixels_bf16"])
             req = b"".join(parts)
+        if top_logprobs is not None:
+            req += struct.pack("<I", max(0, min(20, int(top_logprobs))))
         with self.streams_lock:
             self.streams[rid] = cb
         try:
@@ -308,6 +343,17 @@ class EngineProc:
                 self.streams.pop(rid, None)
             raise Unavailable("engine exited")
         return rid
+
+    def send_mask(self, rid, allowed_ids):
+        """Send an OPMK allowed-token-ID list for a constrained-decoding request."""
+        n = len(allowed_ids)
+        pkt = struct.pack("<III", 0x4B4D504F, rid, n) + (struct.pack(f"<{n}I", *allowed_ids) if n else b"")
+        try:
+            with self.write_lock:
+                self.engine.stdin.write(pkt)
+                self.engine.stdin.flush()
+        except (OSError, ValueError):
+            pass
 
     def cancel(self, rid):
         with self.streams_lock:
@@ -646,6 +692,61 @@ def register_common_routes(app, eng: EngineProc, model_id: str, cap: int, lanes_
                 "busy_us": {"prefill": eng.load["prefill_us"]},
             }
 
+    def _metrics_snapshot():
+        with eng.load_lock:
+            m = dict(eng.metrics)
+            ld = dict(eng.load)
+        st = dict(eng.state)
+        uptime_s = round(max(0.0, time.time() - st["since"]), 1)
+        acc_rate = round(m["accepted_drafts_total"] / m["spec_rounds_total"], 3) if m["spec_rounds_total"] > 0 else 0.0
+        reuse_rate = round(m["reused_prompt_tokens_total"] / m["prompt_tokens_total"], 4) if m["prompt_tokens_total"] > 0 else 0.0
+        return {
+            "model": model_id,
+            "state": st["state"],
+            "pid": st["pid"],
+            "uptime_seconds": uptime_s,
+            "restarts_total": st["restarts"],
+            "lanes_capacity": lanes_fn(),
+            "requests_running": ld["running"],
+            "requests_waiting": ld["waiting"],
+            "spec_acceptance_per_round": acc_rate,
+            "prefix_reuse_ratio": reuse_rate,
+            **m,
+        }
+
+    @app.get("/v1/metrics")
+    def metrics_json():
+        return _metrics_snapshot()
+
+    @app.get("/metrics")
+    def metrics_prom(request: Request):
+        snap = _metrics_snapshot()
+        if request.query_params.get("format") == "json" or "application/json" in request.headers.get("accept", ""):
+            return JSONResponse(snap)
+        up = 1 if snap["state"] == "up" else 0
+        lines = [
+            f'# HELP dankattn_up Engine readiness (1=up, 0=sleeping/down)',
+            f'# TYPE dankattn_up gauge',
+            f'dankattn_up{{model="{model_id}"}} {up}',
+            f'dankattn_uptime_seconds{{model="{model_id}"}} {snap["uptime_seconds"]}',
+            f'dankattn_restarts_total{{model="{model_id}"}} {snap["restarts_total"]}',
+            f'dankattn_lanes_capacity{{model="{model_id}"}} {snap["lanes_capacity"]}',
+            f'dankattn_requests_running{{model="{model_id}"}} {snap["requests_running"]}',
+            f'dankattn_requests_waiting{{model="{model_id}"}} {snap["requests_waiting"]}',
+            f'dankattn_requests_total{{model="{model_id}"}} {snap["requests_total"]}',
+            f'dankattn_requests_errors_total{{model="{model_id}"}} {snap["requests_errors"]}',
+            f'dankattn_prompt_tokens_total{{model="{model_id}"}} {snap["prompt_tokens_total"]}',
+            f'dankattn_reused_prompt_tokens_total{{model="{model_id}"}} {snap["reused_prompt_tokens_total"]}',
+            f'dankattn_generated_tokens_total{{model="{model_id}"}} {snap["generated_tokens_total"]}',
+            f'dankattn_spec_rounds_total{{model="{model_id}"}} {snap["spec_rounds_total"]}',
+            f'dankattn_accepted_drafts_total{{model="{model_id}"}} {snap["accepted_drafts_total"]}',
+            f'dankattn_spec_acceptance_per_round{{model="{model_id}"}} {snap["spec_acceptance_per_round"]}',
+            f'dankattn_prefix_reuse_ratio{{model="{model_id}"}} {snap["prefix_reuse_ratio"]}',
+            f'dankattn_last_decode_tps{{model="{model_id}"}} {snap["last_decode_tps"]}',
+            f'dankattn_last_prefill_tps{{model="{model_id}"}} {snap["last_prefill_tps"]}',
+        ]
+        return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
+
     @app.post("/tokenize")
     async def tokenize(request: Request):
         try:
@@ -687,9 +788,84 @@ def parse_chat_params(body, *, default_max_new=4096, default_temp=1.0, default_t
             stop_strs = [s for s in raw_stop if s]
         else:
             raise BadRequest("stop must be a string or list of up to 16 strings")
+    logprobs = bool(body.get("logprobs"))
+    top_logprobs = num(body, "top_logprobs", int, 0, 0, 20) if logprobs else None
+    rf = parse_response_format(body)
     return {
         "max_new": max_new, "temp": temp, "top_p": top_p, "top_k": top_k,
         "min_p": min_p, "seed": seed, "thinking_budget": tb, "stop_strs": stop_strs,
+        "logprobs": logprobs, "top_logprobs": top_logprobs, "response_format": rf,
+    }
+
+
+_MASKER_CACHE: dict[int, VocabMasker] = {}
+_MASKER_LOCK = threading.Lock()
+
+
+def get_vocab_masker(tok) -> VocabMasker:
+    key = id(tok)
+    with _MASKER_LOCK:
+        m = _MASKER_CACHE.get(key)
+        if m is None:
+            m = VocabMasker(tok)
+            _MASKER_CACHE[key] = m
+        return m
+
+
+class ConstrainedDriver:
+    """Drives OPMK token-level JSON-schema masks from the demux thread on every emitted token."""
+
+    def __init__(self, eng: EngineProc, tok, rf: dict, eos_ids: tuple[int, ...], thinking: bool = False,
+                 think_close: str = ""):
+        self.eng = eng
+        self.tok = tok
+        self.masker = get_vocab_masker(tok)
+        self.dfa = JsonSchemaDFA(rf.get("schema"))
+        self.eos_ids = tuple(int(x) for x in eos_ids if x is not None)
+        self.in_think = bool(thinking and think_close)
+        self.think_close = think_close
+        self._think_buf = ""
+        self.rid: int | None = None
+
+    def start(self, rid: int):
+        self.rid = rid
+        if self.in_think:
+            self.eng.send_mask(rid, ())
+        else:
+            self.eng.send_mask(rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
+
+    def on_token(self, tok_id: int):
+        if self.rid is None:
+            return
+        if tok_id in self.eos_ids:
+            return
+        piece = self.tok.decode([tok_id], skip_special_tokens=False)
+        if self.in_think:
+            self._think_buf += piece
+            if self.think_close in self._think_buf:
+                idx = self._think_buf.find(self.think_close) + len(self.think_close)
+                tail = self._think_buf[idx:]
+                self.in_think = False
+                self._think_buf = ""
+                if tail:
+                    self.dfa.advance_str(tail)
+                self.eng.send_mask(self.rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
+            else:
+                self.eng.send_mask(self.rid, ())
+            return
+        self.dfa.advance_str(piece)
+        self.eng.send_mask(self.rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
+
+
+def format_logprob_entry(tok, tok_id: int, lp: float, tops) -> dict:
+    s = tok.decode([tok_id], skip_special_tokens=False)
+    top_list = []
+    for tid, tlp in tops:
+        ts = tok.decode([tid], skip_special_tokens=False)
+        top_list.append({"token": ts, "logprob": round(float(tlp), 6), "bytes": list(ts.encode("utf-8"))})
+    return {
+        "token": s, "logprob": round(float(lp), 6), "bytes": list(s.encode("utf-8")),
+        "top_logprobs": top_list,
     }
 
 
@@ -706,10 +882,13 @@ def finish_reason_of(item, calls, max_new: int) -> str:
     return "tool_calls" if calls else ("length" if item.get("length") or item["generated"] >= max_new else "stop")
 
 
-def make_sse_chunk(rid: str, created: int, model_id: str, delta: dict, finish=None, usage=None) -> str:
+def make_sse_chunk(rid: str, created: int, model_id: str, delta: dict, finish=None, usage=None, logprobs=None) -> str:
+    choice = {"index": 0, "delta": delta, "finish_reason": finish}
+    if logprobs is not None:
+        choice["logprobs"] = logprobs
     d = {
         "id": rid, "object": "chat.completion.chunk", "created": created, "model": model_id,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        "choices": [choice],
     }
     if usage:
         d["usage"] = usage
@@ -755,11 +934,15 @@ async def run_chat_completion(
     watch = Watch(q, request)
     max_stop_len = max((len(s) for s in stop_strs), default=0)
 
-    def chunk(delta, finish=None, usage=None):
-        return make_sse_chunk(rid, created, model_id, delta, finish, usage)
+    def chunk(delta, finish=None, usage=None, lp=None):
+        return make_sse_chunk(rid, created, model_id, delta, finish, usage, logprobs=lp)
 
     def usage_of(st):
         return make_usage(st, sp.n_reasoning)
+
+    tok_ref = getattr(sp, "tok", None)
+    want_lp = bool(body.get("logprobs")) and tok_ref is not None
+    lp_content: list[dict] = []
 
     if body.get("stream"):
         try:
@@ -781,8 +964,13 @@ async def run_chat_completion(
                 in_tool_call = False
                 stopped_by_str = False
                 pending = [first]
+                pending_lp = None
                 while True:
                     item = pending.pop() if pending else await q.get()
+                    if isinstance(item, tuple) and item and item[0] == "logprob":
+                        if want_lp:
+                            pending_lp = format_logprob_entry(tok_ref, item[1], item[2], item[3])
+                        continue
                     if isinstance(item, dict):
                         if "error" in item:
                             yield "data: " + json.dumps({"error": api_error(item["error"])[1]}, ensure_ascii=False) + "\n\n"
@@ -809,15 +997,18 @@ async def run_chat_completion(
                     if stopped_by_str:
                         continue
                     r, c = sp.push(item)
+                    lp_obj = {"content": [pending_lp]} if pending_lp is not None else None
+                    pending_lp = None
                     if r:
-                        yield chunk({"reasoning_content": r})
+                        yield chunk({"reasoning_content": r}, lp=lp_obj)
+                        lp_obj = None
                     if c:
                         held += c
                         if stop_strs:
                             cut_at = find_stop_cut(held, stop_strs)
                             if cut_at is not None:
                                 if cut_at > 0:
-                                    yield chunk({"content": held[:cut_at]})
+                                    yield chunk({"content": held[:cut_at]}, lp=lp_obj)
                                 held = ""
                                 stopped_by_str = True
                                 eng.cancel(eid)
@@ -833,7 +1024,7 @@ async def run_chat_completion(
                             if len(held) > keep:
                                 emit_s = held[:-keep] if keep else held
                                 held = held[-keep:] if keep else ""
-                                yield chunk({"content": emit_s})
+                                yield chunk({"content": emit_s}, lp=lp_obj)
                 done = True
             finally:
                 if not done:
@@ -845,6 +1036,10 @@ async def run_chat_completion(
     try:
         while True:
             item = await watch.get()
+            if isinstance(item, tuple) and item and item[0] == "logprob":
+                if want_lp:
+                    lp_content.append(format_logprob_entry(tok_ref, item[1], item[2], item[3]))
+                continue
             if isinstance(item, dict):
                 if "error" in item:
                     return error_response(item["error"])
@@ -889,9 +1084,14 @@ async def run_chat_completion(
     usage = usage_of(item)
     if schema_meta is not None:
         usage["dankattn"]["schema"] = schema_meta
+    choice_obj = {
+        "index": 0, "message": msg,
+        "finish_reason": "stop" if stopped_by_str else finish_reason_of(item, calls, max_new),
+    }
+    if want_lp:
+        choice_obj["logprobs"] = {"content": lp_content}
     return {
         "id": rid, "object": "chat.completion", "created": created, "model": model_id,
-        "choices": [{"index": 0, "message": msg,
-                     "finish_reason": "stop" if stopped_by_str else finish_reason_of(item, calls, max_new)}],
+        "choices": [choice_obj],
         "usage": usage,
     }

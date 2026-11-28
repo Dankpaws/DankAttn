@@ -18,7 +18,7 @@ from fastapi.responses import Response, StreamingResponse
 import uvicorn
 
 from engine_frontend import (
-    BadRequest, EngineProc, PayloadTooLarge, PrefixSplicer, Splitter, Unavailable,
+    BadRequest, ConstrainedDriver, EngineProc, PayloadTooLarge, PrefixSplicer, Splitter, Unavailable,
     add_security_args, bad_request, install_security_middleware,
     json_body, make_jinja_env, normalize_messages, parse_chat_params, payload_too_large,
     register_common_routes, run_chat_completion, safe_template_kwargs, unavailable,
@@ -188,17 +188,26 @@ async def chat(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     held_ids = list(ids)
 
+    rf = p["response_format"]
+    top_lp = p["top_logprobs"]
+    cdrv = ConstrainedDriver(eng, tok, rf, tuple(eng.default_stops) + tuple(extra_stops), thinking, THINK_CLOSE) if rf else None
+
     def track(item):
         if isinstance(item, int):
             held_ids.append(item)
-        elif "error" not in item:
+            if cdrv is not None:
+                cdrv.on_token(item)
+        elif isinstance(item, dict) and "error" not in item:
             splicer.hold(held_ids)
         loop.call_soon_threadsafe(q.put_nowait, item)
 
     cb = eng.metered(track)
     try:
         eid = eng.submit(ids, max_new, spec, temp, top_p, top_k, seed, cb,
-                         think_budget=budget, min_p=min_p, extra_stops=extra_stops, vision_imgs=vision_imgs)
+                         think_budget=budget, min_p=min_p, extra_stops=extra_stops, vision_imgs=vision_imgs,
+                         constrained=(cdrv is not None), top_logprobs=top_lp)
+        if cdrv is not None:
+            cdrv.start(eid)
     except Unavailable as e:
         cb({"error": str(e)})
         return unavailable(str(e))

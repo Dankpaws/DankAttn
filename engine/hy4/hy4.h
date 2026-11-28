@@ -333,6 +333,7 @@ struct Model {
     uint32_t pos = 0, ring_floor = 0;
     std::vector<uint32_t> history;
     std::vector<id<MTLBuffer>> lat, tokring, bk;
+    std::vector<uint32_t> kv_blocks;
   };
   PrefixSnap snapshot_prefix(int slot) const;
   bool save_prefix_snap(const PrefixSnap& snap, const std::string& path, double* ms = nullptr,
@@ -345,7 +346,7 @@ struct Model {
     double ms = 0.0;
     bool ok = false;
   };
-  bool load_prefix_into(int slot, const std::string& path, PrefixLoad& out) const;
+  bool load_prefix_into(int slot, const std::string& path, PrefixLoad& out);
   uint32_t apply_prefix_load(int slot, PrefixLoad&& pl);
   uint32_t load_prefix(const std::string& path, double* ms = nullptr);
   // a file's history (header check only) and the lowest length it can be truncated to after loading; false

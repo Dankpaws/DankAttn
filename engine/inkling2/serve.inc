@@ -903,11 +903,12 @@ int main(ink2::Model& m) {
       }
       if (active.empty()) continue;
 
-      // 1) One prefill chunk for the first prefilling request (smaller while other lanes decode, to bound ITL)
-      bool any_decoding = false;
-      for (const auto& a : active) if (!a.prefilling) { any_decoding = true; break; }
+      // 1) One prefill chunk for the first prefilling request (adaptive chunk cap while other lanes decode)
+      uint32_t n_decoding = 0;
+      for (const auto& a : active) if (!a.prefilling) n_decoding++;
       const uint32_t max_pf = ink2::eco_mode() ? std::min<uint32_t>(ink2::MP, 256u) : ink2::MP;
-      const uint32_t chunk = any_decoding ? std::max<uint32_t>(ink2::MAXM + 1u, std::min(max_pf, pf_dec_chunk)) : max_pf;
+      const uint32_t dec_cap = (n_decoding >= 2u) ? std::max<uint32_t>(64u, pf_dec_chunk / 2u) : pf_dec_chunk;
+      const uint32_t chunk = n_decoding > 0u ? std::max<uint32_t>(ink2::MAXM + 1u, std::min(max_pf, dec_cap)) : max_pf;
       for (auto& a : active) {
         if (!a.prefilling) continue;
         const size_t end = std::min(a.rest.size(), a.pref_off + chunk);
