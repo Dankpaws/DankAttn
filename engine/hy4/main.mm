@@ -4,6 +4,7 @@
 //   opus-hy4 <pack> prof <ids.bin>                  per-op GPU ms of one decode step after the prompt
 //   opus-hy4 <pack> vtest <ids.bin>                 rows of a 16-row step == the same tokens one at a time
 #include "hy4.h"
+#include "../core/cli.h"
 #include <map>
 #include "spec.inc"
 #include "serve.inc"
@@ -12,12 +13,7 @@
 #include <chrono>
 #include <cmath>
 
-static std::vector<uint32_t> read_ids(const char* p) {
-  std::string s = mtl::slurp(p);
-  std::vector<uint32_t> v(s.size() / 4);
-  memcpy(v.data(), s.data(), v.size() * 4);
-  return v;
-}
+using dankattn::cli::read_ids;
 
 static void prefill(hy4::Model& m, const std::vector<uint32_t>& ids, double* ms, uint32_t chunk = 0) {
   double t = 0;

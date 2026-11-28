@@ -3,6 +3,7 @@
 //   opus <pack> score <ids.bin> <logits_out.f16>   all-position logits (f16) for fidelity checks
 //   opus <pack> gen <ids.bin> <n>                    prefill in 16-row steps, then greedy decode
 #include "model.h"
+#include "core/cli.h"
 #include <chrono>
 #include <memory>
 #include <cmath>
@@ -14,12 +15,7 @@
 #include <mutex>
 #include <thread>
 
-static std::vector<uint32_t> read_ids(const char* p) {
-  std::string s = mtl::slurp(p);
-  std::vector<uint32_t> v(s.size() / 4);
-  memcpy(v.data(), s.data(), v.size() * 4);
-  return v;
-}
+using dankattn::cli::read_ids;
 
 #include "serve.inc"
 

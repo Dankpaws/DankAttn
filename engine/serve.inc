@@ -30,20 +30,18 @@
 // Thinking budget: the reply starts inside a thinking block; after `budget` thinking tokens without the
 // end-of-thinking token, the `force` tokens (the front end's closing text) are fed and emitted in place of
 // the model's next tokens, and the answer follows.
+#include "core/proto.h"
+
 namespace serve {
 
-constexpr uint32_t END = 0xFFFFFFFFu, ERR = 0xFFFFFFFEu, READY = 0xFFFFFFFDu;
+using dankattn::proto::END;
+using dankattn::proto::ERR;
+using dankattn::proto::READY;
 
-struct Req {
-  uint32_t rid = 0, max_new = 0, flags = 0, gid = 0, gsize = 0, gindex = 0;
-  std::vector<uint32_t> ids, stops;
-  uint32_t think_budget = 0, think_end = 0;  // flags & 4
+struct Req : dankattn::proto::OpusReq {
+  uint32_t gid = 0, gsize = 0, gindex = 0;
+  uint32_t think_budget = 0;
   std::vector<uint32_t> think_force;
-  float temp = 0, top_p = 1;
-  uint32_t top_k = 0;
-  uint64_t seed = 0;
-  std::atomic<bool> cancel{false};
-  std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now();
 };
 using ReqP = std::shared_ptr<Req>;
 
@@ -54,29 +52,17 @@ std::map<uint32_t, ReqP> live;  // rid -> request, for cancels
 bool closed = false;
 
 std::mutex out_mu;
-void put(uint32_t rid, uint32_t w) {
-  uint32_t r[2] = {rid, w};
-  fwrite(r, 4, 2, stdout);
-}
+void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
 void flush() { fflush(stdout); }
 void error(const Req& q, const std::string& msg) {
   std::lock_guard<std::mutex> g(out_mu);
-  put(q.rid, ERR);
-  const uint32_t n = uint32_t(msg.size());
-  fwrite(&n, 4, 1, stdout);
-  fwrite(msg.data(), 1, n, stdout);
-  flush();
+  dankattn::proto::send_err(q.rid, msg);
   fprintf(stderr, "opus: rid %u refused: %s\n", q.rid, msg.c_str());
 }
 void end(const Req& q, uint32_t reused, uint32_t n, uint32_t rounds, uint32_t accepted, float prefill_ms, float wall_ms,
          bool length = false) {
   std::lock_guard<std::mutex> g(out_mu);
-  put(q.rid, END);
-  uint32_t s6[6] = {reused, uint32_t(q.ids.size()), n, rounds, accepted, length ? 1u : 0u};
-  float f2[2] = {prefill_ms, wall_ms};
-  fwrite(s6, 4, 6, stdout);
-  fwrite(f2, 4, 2, stdout);
-  flush();
+  dankattn::proto::send_end(q.rid, reused, uint32_t(q.ids.size()), n, rounds, accepted, length ? 1u : 0u, prefill_ms, wall_ms);
 }
 void forget(uint32_t rid) {
   std::lock_guard<std::mutex> g(mu);
@@ -84,50 +70,21 @@ void forget(uint32_t rid) {
 }
 
 void reader() {
-  auto rd = [](void* p, size_t n) { return fread(p, 1, n, stdin) == n; };
   for (;;) {
-    uint32_t magic;
-    if (!rd(&magic, 4)) break;
-    if (magic == 0x5843504F) {  // 'OPCX'
-      uint32_t rid;
-      if (!rd(&rid, 4)) break;
+    auto q = std::make_shared<Req>();
+    uint32_t cancel_rid = 0;
+    const auto kind = dankattn::proto::read_packet(*q, cancel_rid);
+    if (kind == dankattn::proto::PacketKind::Eof) break;
+    if (kind == dankattn::proto::PacketKind::Cancel) {
       std::lock_guard<std::mutex> g(mu);
-      if (auto it = live.find(rid); it != live.end()) it->second->cancel = true;
+      if (auto it = live.find(cancel_rid); it != live.end()) it->second->cancel = true;
       continue;
     }
-    if (magic != 0x5355504F) break;
-    auto q = std::make_shared<Req>();
-    uint32_t hdr[2];
-    if (!rd(hdr, 8)) break;
-    q->rid = hdr[0];
-    q->ids.resize(hdr[1]);
-    uint32_t tail[3];
-    if (!rd(q->ids.data(), q->ids.size() * 4) || !rd(tail, 12)) break;
-    q->max_new = tail[0];
-    q->flags = tail[1];
-    q->stops.resize(tail[2]);
-    if (!rd(q->stops.data(), q->stops.size() * 4)) break;
-    struct { float temp, top_p; uint32_t top_k; uint64_t seed; } __attribute__((packed)) sp;
-    if (!rd(&sp, sizeof sp)) break;
-    q->temp = sp.temp;
-    q->top_p = sp.top_p;
-    q->top_k = sp.top_k;
-    q->seed = sp.seed;
-    if (q->flags & 2) {
-      uint32_t g3[3];
-      if (!rd(g3, 12)) break;
-      q->gid = g3[0];
-      q->gsize = g3[1];
-      q->gindex = g3[2];
-    }
-    if (q->flags & 4) {
-      uint32_t t3[3];
-      if (!rd(t3, 12)) break;
-      q->think_budget = t3[0];
-      q->think_end = t3[1];
-      q->think_force.resize(t3[2]);
-      if (!rd(q->think_force.data(), q->think_force.size() * 4)) break;
-    }
+    q->gid = q->grp0;
+    q->gsize = q->grp1;
+    q->gindex = q->grp2;
+    q->think_budget = q->budget;
+    q->think_force = std::move(q->force);
     std::lock_guard<std::mutex> g(mu);
     live[q->rid] = q;
     inbox.push_back(q);

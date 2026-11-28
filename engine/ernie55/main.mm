@@ -5,6 +5,8 @@
 //   dankattn-ernie55 <pack_or_http_url> suite <suite_dir>
 //   dankattn-ernie55 <pack_or_http_url> serve
 #include "ernie55.h"
+#include "../core/cli.h"
+#include "../core/proto.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -18,12 +20,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-static std::vector<uint32_t> read_ids(const char* p) {
-  std::string s = mtl::slurp(p);
-  std::vector<uint32_t> v(s.size() / 4);
-  memcpy(v.data(), s.data(), v.size() * 4);
-  return v;
-}
+using dankattn::cli::read_ids;
 
 static uint32_t argmax(const float* p, uint32_t n) {
   float m0 = p[0], m1 = p[0], m2 = p[0], m3 = p[0];
@@ -177,10 +174,6 @@ static const float* prefill_fast(ernie55::Model& m, const std::vector<uint32_t>&
 }
 
 // Binary framing helpers for serve mode (matches server/engine_frontend.py)
-static bool read_exact(FILE* f, void* dst, size_t n) {
-  return fread(dst, 1, n, f) == n;
-}
-
 struct ServeReq {
   uint32_t rid = 0;
   std::vector<uint32_t> ids;
@@ -194,27 +187,11 @@ struct ServeReq {
   std::vector<uint32_t> think_force;
 };
 
-static void send_u32_pair(uint32_t a, uint32_t b) {
-  uint32_t buf[2] = {a, b};
-  fwrite(buf, 4, 2, stdout);
-  fflush(stdout);
-}
-
-static void send_error(uint32_t rid, const std::string& msg) {
-  uint32_t hdr[3] = {rid, 0xFFFFFFFEu, uint32_t(msg.size())};
-  fwrite(hdr, 4, 3, stdout);
-  if (!msg.empty()) fwrite(msg.data(), 1, msg.size(), stdout);
-  fflush(stdout);
-}
-
+static void send_u32_pair(uint32_t a, uint32_t b) { dankattn::proto::put(a, b, true); }
+static void send_error(uint32_t rid, const std::string& msg) { dankattn::proto::send_err(rid, msg); }
 static void send_done(uint32_t rid, uint32_t reused, uint32_t prompt, uint32_t generated,
                       uint32_t rounds, uint32_t accepted, uint32_t dflags, float prefill_ms, float wall_ms) {
-  struct {
-    uint32_t rid, tag, reused, prompt, generated, rounds, accepted, dflags;
-    float prefill_ms, wall_ms;
-  } pkt{rid, 0xFFFFFFFFu, reused, prompt, generated, rounds, accepted, dflags, prefill_ms, wall_ms};
-  fwrite(&pkt, sizeof(pkt), 1, stdout);
-  fflush(stdout);
+  dankattn::proto::send_end(rid, reused, prompt, generated, rounds, accepted, dflags, prefill_ms, wall_ms);
 }
 
 static int run_serve(ernie55::Model& m) {
@@ -226,57 +203,32 @@ static int run_serve(ernie55::Model& m) {
   std::atomic<uint32_t> cancel_rid{0};
 
   // Signal ready to engine_frontend.py
-  send_u32_pair(0u, 0xFFFFFFFDu);
+  send_u32_pair(0u, dankattn::proto::READY);
 
   std::thread reader([&]() {
     while (true) {
-      uint32_t magic = 0;
-      if (!read_exact(stdin, &magic, 4)) break;
-      if (magic == 0x5843504Fu) {
-        uint32_t rid = 0;
-        if (!read_exact(stdin, &rid, 4)) break;
-        cancel_rid.store(rid, std::memory_order_relaxed);
+      dankattn::proto::OpusReq raw;
+      uint32_t crid = 0;
+      const auto kind = dankattn::proto::read_packet(raw, crid);
+      if (kind == dankattn::proto::PacketKind::Eof) break;
+      if (kind == dankattn::proto::PacketKind::Cancel) {
+        cancel_rid.store(crid, std::memory_order_relaxed);
         continue;
       }
-      if (magic != 0x5355504Fu) {
-        fprintf(stderr, "ernie55 serve: bad magic 0x%08x\n", magic);
-        break;
-      }
       ServeReq r;
-      uint32_t n_ids = 0, n_stops = 0;
-      if (!read_exact(stdin, &r.rid, 4) || !read_exact(stdin, &n_ids, 4)) break;
-      r.ids.resize(n_ids);
-      if (n_ids && !read_exact(stdin, r.ids.data(), size_t(n_ids) * 4)) break;
-      if (!read_exact(stdin, &r.max_new, 4) || !read_exact(stdin, &r.flags, 4) || !read_exact(stdin, &n_stops, 4)) break;
-      r.stops.resize(n_stops);
-      if (n_stops && !read_exact(stdin, r.stops.data(), size_t(n_stops) * 4)) break;
-      if (!read_exact(stdin, &r.sc.temp, 4) || !read_exact(stdin, &r.sc.top_p, 4) ||
-          !read_exact(stdin, &r.sc.top_k, 4) || !read_exact(stdin, &r.seed, 8)) break;
-      if (r.flags & 2u) {
-        uint32_t grp[3];
-        if (!read_exact(stdin, grp, 12)) break;
-      }
-      if (r.flags & 4u) {
-        uint32_t nf = 0;
-        if (!read_exact(stdin, &r.think_budget, 4) || !read_exact(stdin, &r.think_end, 4) || !read_exact(stdin, &nf, 4)) break;
-        r.think_force.resize(nf);
-        if (nf && !read_exact(stdin, r.think_force.data(), size_t(nf) * 4)) break;
-      }
-      if (r.flags & 16u) {
-        if (!read_exact(stdin, &r.sc.min_p, 4)) break;
-      }
-      if (r.flags & 32u) {
-        // Drain vision payload so stream stays aligned, then mark error
-        uint32_t nv = 0;
-        if (!read_exact(stdin, &nv, 4)) break;
-        for (uint32_t vi = 0; vi < nv; vi++) {
-          struct { uint32_t T, h, w, tok_off; uint64_t hash; } vh;
-          if (!read_exact(stdin, &vh, sizeof(vh))) break;
-          size_t nb = size_t(vh.T) * vh.h * vh.w * 3 * 2;
-          std::vector<uint8_t> skip(nb);
-          if (!read_exact(stdin, skip.data(), nb)) break;
-        }
-      }
+      r.rid = raw.rid;
+      r.ids = std::move(raw.ids);
+      r.max_new = raw.max_new;
+      r.flags = raw.flags;
+      r.stops = std::move(raw.stops);
+      r.sc.temp = raw.temp;
+      r.sc.top_p = raw.top_p;
+      r.sc.top_k = raw.top_k;
+      r.sc.min_p = (raw.flags & 16u) ? raw.min_p : 0.0f;
+      r.seed = raw.seed;
+      r.think_budget = raw.budget;
+      r.think_end = raw.think_end;
+      r.think_force = std::move(raw.force);
       {
         std::lock_guard<std::mutex> lk(mu);
         q.push_back(std::move(r));

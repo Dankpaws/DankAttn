@@ -1,5 +1,6 @@
 // DankAttn (Inkling-2-Mini) CLI driver: smoke, vtest, dprof, pfbench, spec, bench, vbench, gen.
 #import "inkling2.h"
+#include "../core/cli.h"
 #include "../lookup.h"
 #include <algorithm>
 #include <chrono>
@@ -13,15 +14,7 @@
 
 #include "serve.inc"
 
-static std::vector<uint32_t> read_ids_bin(const std::string& p) {
-  std::ifstream f(p, std::ios::binary | std::ios::ate);
-  if (!f) mtl::die(("cannot read " + p).c_str());
-  size_t sz = size_t(f.tellg());
-  f.seekg(0);
-  std::vector<uint32_t> ids(sz / 4);
-  f.read((char*)ids.data(), sz);
-  return ids;
-}
+static std::vector<uint32_t> read_ids_bin(const std::string& p) { return dankattn::cli::read_ids(p); }
 
 int main(int argc, char** argv) {
   @autoreleasepool {

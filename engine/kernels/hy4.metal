@@ -47,17 +47,7 @@ static inline uint frag_off(uint m, uint k, uint K) {
 static inline float sigm(float x) { return 1.0f / (1.0f + exp(-x)); }
 static inline float silu(float x) { return x / (1.0f + exp(-x)); }
 
-// threadgroup sum of one float (any power-of-two size <= 1024); every thread gets the total
-static inline float tg_sum(float v, threadgroup float* sh, ushort tid, ushort ntg) {
-  v = simd_sum(v);
-  const ushort sg = tid / 32, ns = (ntg + 31) / 32;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if ((tid & 31) == 0) sh[sg] = v;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float s = 0.0f;
-  for (ushort i = 0; i < ns; i++) s += sh[i];
-  return s;
-}
+#include "sampling.metal"
 
 // ------------------------------------------------------------------ embedding
 struct EmbArgs { uint M, H, HC; };
@@ -549,7 +539,6 @@ kernel void h4_idx_score_mma(device const float* iq [[buffer(0)]], device const 
 // Top (511) groups by score among g < G, ties to the lower index; emits the selected token positions
 // in ascending order: the picked groups' 4 tokens each, then the query's own group up to pos.
 // One threadgroup (1024) per row. Rows inside the dense range emit 0..pos.
-static inline uint fkey(float f) { const uint u = as_type<uint>(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
 struct TopArgs { uint M, p0, dense_max, gmax, ktop, selmax, row0; };
 kernel void h4_idx_topk(device const float* scores [[buffer(0)]], device uint* sel [[buffer(1)]],
                         device uint* nsel [[buffer(2)]], device uint* mark [[buffer(3)]], constant TopArgs& a [[buffer(4)]],
@@ -1287,116 +1276,7 @@ kernel void h4_add_frag(device const float* x [[buffer(0)]], device const float*
 // Gumbel-max: token = argmax_t(logit_t / T + G(seed, pos, t)), G from a counter hash, so a position's
 // draw is fixed by (seed, position) alone: exact categorical sampling at temperature T, deterministic per
 // seed, and speculation stays exact (a draft is accepted iff it equals the token drawn here).
-static inline uint hmix(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
-static inline float gumbel(uint s0, uint s1, uint pos, uint t) {
-  const uint h = hmix(hmix(hmix(s0 ^ 0x9E3779B9u) ^ s1) ^ hmix(pos * 0x85EBCA6Bu + 0x27d4eb2fu) ^ (t * 0xC2B2AE35u));
-  const float u = (float(h >> 8) + 0.5f) * (1.0f / 16777216.0f);  // (0, 1)
-  return -log(-log(u));
-}
-static inline float fkey_inv(uint k) { return as_type<float>((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
-
-// Compute the logit floor (in scaled-logit space r[i] * it) for min_p, top_k, and top_p.
-// top_k uses a 4-pass 8-bit MSB radix select (exact, any range); top_p uses 1 pass of a 256-bin
-// probability histogram (0.125 log-prob bins) to bracket the cutoff, then 8 binary-search passes.
-static inline float trunc_floor(device const float* r, uint N, float it, float M_, float lmin,
-                                float top_p, uint top_k, threadgroup float* bm,
-                                threadgroup atomic_uint* hist, threadgroup uint* pref_need,
-                                ushort tid, ushort ntg) {
-  float floor_ = M_ + lmin;
-  if (top_k > 0 && top_k < N) {
-    if (tid == 0) { pref_need[0] = 0; pref_need[1] = top_k; }
-    uint mask = 0;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-      for (uint i = tid; i < 256; i += ntg) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const uint p = pref_need[0];
-      for (uint i = tid; i < N; i += ntg) {
-        const uint k = fkey(r[i] * it);
-        if ((k & mask) == p) atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (tid == 0) {
-        uint acc = 0, nd = pref_need[1];
-        for (int b = 255; b >= 0; b--) {
-          const uint h = atomic_load_explicit(&hist[b], memory_order_relaxed);
-          if (acc + h >= nd) { pref_need[0] = p | (uint(b) << shift); pref_need[1] = nd - acc; break; }
-          acc += h;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      mask |= 255u << shift;
-    }
-    floor_ = max(floor_, fkey_inv(pref_need[0]));
-  }
-  if (top_p > 0.0f && top_p < 1.0f) {
-    // Pass 1: coarse 256-bin probability histogram (0.125 log-prob bins, covering [M_-32, M_])
-    for (uint i = tid; i < 256; i += ntg) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float z = 0.0f;
-    for (uint i = tid; i < N; i += ntg) {
-      const float l = r[i] * it;
-      if (l >= floor_) {
-        const float w = exp(l - M_);
-        z += w;
-        const uint b = uint(clamp(int((M_ - l) * 8.0f), 0, 255));
-        atomic_fetch_add_explicit(&hist[b], uint(w * 65536.0f + 0.5f), memory_order_relaxed);
-      }
-    }
-    const float Z = tg_sum(z, bm, tid, ntg);
-    const float target = top_p * Z;
-    if (tid == 0) {
-      const ulong tgt_q = ulong(target * 65536.0f);
-      ulong acc = 0;
-      uint bstar = 255;
-      for (uint b = 0; b < 256; b++) {
-        const ulong h = atomic_load_explicit(&hist[b], memory_order_relaxed);
-        if (acc + h >= tgt_q) { bstar = b; break; }
-        acc += h;
-      }
-      pref_need[0] = bstar;
-      pref_need[1] = uint(min(acc, ulong(0xFFFFFFFFu)));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint bstar = pref_need[0];
-    const float lo = bstar < 255 ? max(floor_, M_ - float(bstar + 1) * 0.125f) : max(floor_, M_ - 40.0f);
-    const float hi = M_ - float(bstar) * 0.125f;
-    if (hi > lo) {
-      // Pass 2: fine 256-bin probability histogram inside [lo, hi] (step 0.000488, matching 8 binary search steps in 1 pass)
-      for (uint i = tid; i < 256; i += ntg) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const float inv_w = 256.0f / (hi - lo);
-      float above = 0.0f;
-      for (uint i = tid; i < N; i += ntg) {
-        const float l = r[i] * it;
-        if (l >= hi) {
-          above += exp(l - M_);
-        } else if (l >= lo) {
-          const float w = exp(l - M_);
-          const uint b = uint(clamp(int((hi - l) * inv_w), 0, 255));
-          atomic_fetch_add_explicit(&hist[b], uint(w * 16777216.0f + 0.5f), memory_order_relaxed);
-        }
-      }
-      const float A = tg_sum(above, bm, tid, ntg);
-      if (tid == 0) {
-        const float rem = max(0.0f, target - A);
-        const ulong rem_q = ulong(rem * 16777216.0f);
-        ulong acc = 0;
-        uint fstar = 255;
-        for (uint b = 0; b < 256; b++) {
-          acc += atomic_load_explicit(&hist[b], memory_order_relaxed);
-          if (acc >= rem_q) { fstar = b; break; }
-        }
-        pref_need[0] = fstar;
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const float fine_lo = hi - float(pref_need[0] + 1) * ((hi - lo) / 256.0f);
-      floor_ = max(floor_, fine_lo);
-    } else {
-      floor_ = max(floor_, lo);
-    }
-  }
-  return floor_;
-}
+// (hmix, gumbel, fkey_inv, trunc_floor live in sampling.metal included above.)
 
 struct SampArgs { uint M, N, p0, s0, s1; float inv_t; float lmin; float top_p; uint top_k; };  // lmin: log(min_p), -inf off
 kernel void h4_sample(device const float* y [[buffer(0)]], device uint* out [[buffer(1)]],

@@ -22,23 +22,8 @@ namespace serve {
 using dankattn::proto::END;
 using dankattn::proto::ERR;
 using dankattn::proto::READY;
-
-struct VisImg {
-  uint32_t T = 0, h = 0, w = 0, tok_off = 0;
-  uint64_t hash = 0;
-  std::vector<uint16_t> pixels;  // bf16 [T * h * w * 768]
-};
-
-struct Req {
-  uint32_t rid = 0, max_new = 0, flags = 0;
-  std::vector<uint32_t> ids, stops, force;
-  std::vector<VisImg> imgs;
-  uint32_t budget = 0, think_end = 0;
-  float temp = 0, top_p = 1, min_p = -1.0f;
-  uint32_t top_k = 0;
-  uint64_t seed = 0;
-  std::atomic<bool> cancel{false};
-};
+using dankattn::proto::VisImg;
+using Req = dankattn::proto::OpusReq;
 using ReqP = std::shared_ptr<Req>;
 
 std::mutex mu;
@@ -47,69 +32,23 @@ std::deque<ReqP> inbox;
 std::map<uint32_t, ReqP> live;
 bool closed = false;
 
-void put(uint32_t rid, uint32_t w) { uint32_t r[2] = {rid, w}; fwrite(r, 4, 2, stdout); }
+void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
 void error(uint32_t rid, const std::string& msg) {
-  put(rid, ERR);
-  const uint32_t n = uint32_t(msg.size());
-  fwrite(&n, 4, 1, stdout);
-  fwrite(msg.data(), 1, n, stdout);
-  fflush(stdout);
+  dankattn::proto::send_err(rid, msg);
   fprintf(stderr, "hy4: rid %u refused: %s\n", rid, msg.c_str());
 }
 
 void reader() {
-  auto rd = [](void* p, size_t n) { return fread(p, 1, n, stdin) == n; };
+  const dankattn::proto::ReadOpts ropts{.keep_images = true, .parse_fpr_suffixes = false};
   for (;;) {
-    uint32_t magic;
-    if (!rd(&magic, 4)) break;
-    if (magic == 0x5843504F) {  // 'OPCX'
-      uint32_t rid;
-      if (!rd(&rid, 4)) break;
-      std::lock_guard<std::mutex> g(mu);
-      if (auto it = live.find(rid); it != live.end()) it->second->cancel = true;
-      continue;
-    }
-    if (magic != 0x5355504F) break;
     auto q = std::make_shared<Req>();
-    uint32_t hdr[2], tail[3];
-    if (!rd(hdr, 8)) break;
-    q->rid = hdr[0];
-    q->ids.resize(hdr[1]);
-    if (!rd(q->ids.data(), q->ids.size() * 4) || !rd(tail, 12)) break;
-    q->max_new = tail[0];
-    q->flags = tail[1];
-    q->stops.resize(tail[2]);
-    if (!rd(q->stops.data(), q->stops.size() * 4)) break;
-    struct { float temp, top_p; uint32_t top_k; uint64_t seed; } __attribute__((packed)) sp;
-    if (!rd(&sp, sizeof sp)) break;
-    q->temp = sp.temp; q->top_p = sp.top_p; q->top_k = sp.top_k; q->seed = sp.seed;
-    if (q->flags & 2) { uint32_t g3[3]; if (!rd(g3, 12)) break; }
-    if (q->flags & 4) {
-      uint32_t t3[3];
-      if (!rd(t3, 12)) break;
-      q->budget = t3[0]; q->think_end = t3[1];
-      q->force.resize(t3[2]);
-      if (!rd(q->force.data(), q->force.size() * 4)) break;
-    }
-    if (q->flags & 16) {
-      if (!rd(&q->min_p, 4)) break;
-    }
-    if (q->flags & 32) {
-      uint32_t n_imgs = 0;
-      if (!rd(&n_imgs, 4)) break;
-      q->imgs.resize(n_imgs);
-      bool ok = true;
-      for (uint32_t k = 0; k < n_imgs; k++) {
-        uint32_t hdr4[4];
-        uint64_t ih = 0;
-        if (!rd(hdr4, 16) || !rd(&ih, 8)) { ok = false; break; }
-        auto& im = q->imgs[k];
-        im.T = hdr4[0]; im.h = hdr4[1]; im.w = hdr4[2]; im.tok_off = hdr4[3]; im.hash = ih;
-        const size_t npix = size_t(im.T) * im.h * im.w * 768;
-        im.pixels.resize(npix);
-        if (npix && !rd(im.pixels.data(), npix * 2)) { ok = false; break; }
-      }
-      if (!ok) break;
+    uint32_t cancel_rid = 0;
+    const auto kind = dankattn::proto::read_packet(*q, cancel_rid, ropts);
+    if (kind == dankattn::proto::PacketKind::Eof) break;
+    if (kind == dankattn::proto::PacketKind::Cancel) {
+      std::lock_guard<std::mutex> g(mu);
+      if (auto it = live.find(cancel_rid); it != live.end()) it->second->cancel = true;
+      continue;
     }
     std::lock_guard<std::mutex> g(mu);
     live[q->rid] = q;
