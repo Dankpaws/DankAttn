@@ -127,6 +127,7 @@ using dankattn::sched::Req;
 using dankattn::sched::ReqP;
 
 static dankattn::sched::Inbox& inbox_state() { static dankattn::sched::Inbox in; return in; }
+static dankattn::GpuSampler& gpu_sampler() { static dankattn::GpuSampler gs; return gs; }
 
 void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
 void error(uint32_t rid, const std::string& msg) {
@@ -853,22 +854,14 @@ int main(ink2::Model& m) {
       for (auto& a : active) {
         if (!a.prefilling) continue;
         const bool need_lg = (a.q->flags & (64u | 128u)) != 0u;
-        size_t end = std::min(a.rest.size(), a.pref_off + chunk);
-        if (need_lg && end == a.rest.size() && end - a.pref_off > 1) end = a.rest.size() - 1;
+        const size_t end = std::min(a.rest.size(), a.pref_off + chunk);
         std::vector<uint32_t> c(a.rest.begin() + long(a.pref_off), a.rest.begin() + long(end));
-        if (need_lg && end >= a.rest.size() && c.size() == 1) {
-          m.use_lane(a.lane);
-          double g = 0;
-          std::vector<float> step_lg;
-          a.b = m.step(c, &g, &step_lg).back();
-          a.pms += g;
-          if (m.has_mtp) m.mtp_commit(1u);
-          lane_hist()[a.lane].push_back(c[0]);
-          if (!step_lg.empty()) {
-            dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab_valid, 0.0f, m.pos, a.b);
-          }
-        } else {
-          a.b = feed(m, a, c, &a.pms);
+        a.b = feed(m, a, c, &a.pms);
+        if (need_lg && end >= a.rest.size()) {
+          const size_t row_i = (c.size() > ink2::MAXM) ? 0u : (c.size() - 1u);
+          const size_t lg_off = row_i * size_t(m.vocab_pad) * 4u;
+          dankattn::sched::sample_masked_or_logprobs_gpu(
+              in, *a.q, gpu_sampler(), m.C, m.b_logits, lg_off, m.vocab_valid, 0.0f, m.pos, a.b);
         }
         a.pref_off = end;
         if (a.pref_off >= a.rest.size()) {
@@ -912,19 +905,18 @@ int main(ink2::Model& m) {
       }
       fflush(stdout);
 
-      // 3b) Constrained-decoding (OPMK) or logprobs lanes run 1-row exact logit steps
+      // 3b) Constrained-decoding (OPMK) or logprobs lanes run 1-row GPU bitmask/logprobs steps
       for (size_t idx : lg_idx) {
         Active& a = active[idx];
         m.use_lane(a.lane);
-        std::vector<float> step_lg;
         const uint32_t tok_in = a.b;
-        a.b = m.step({tok_in}, nullptr, &step_lg).back();
+        a.b = m.step({tok_in}).back();
         if (m.has_mtp) m.mtp_commit(1u);
         lane_hist()[a.lane].push_back(tok_in);
         a.rounds++;
         a.accepted++;
-        if (!step_lg.empty() &&
-            !dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab_valid, 0.0f, m.pos, a.b)) {
+        if (!dankattn::sched::sample_masked_or_logprobs_gpu(
+                in, *a.q, gpu_sampler(), m.C, m.b_logits, 0u, m.vocab_valid, 0.0f, m.pos, a.b)) {
           done[idx] = true;
         }
       }

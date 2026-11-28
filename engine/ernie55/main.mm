@@ -182,6 +182,7 @@ static void send_done(uint32_t rid, uint32_t reused, uint32_t prompt, uint32_t g
 static int run_serve(ernie55::Model& m) {
   const uint32_t k_draft = getenv("E5_DRAFT_K") ? uint32_t(atoi(getenv("E5_DRAFT_K"))) : 7u;
   dankattn::sched::Inbox in;
+  dankattn::GpuSampler gs;
 
   // Signal ready to engine_frontend.py
   send_u32_pair(0u, dankattn::proto::READY);
@@ -276,7 +277,8 @@ static int run_serve(ernie55::Model& m) {
       ok_out = true;
       if (!constrained && !want_lp) return sample_logits(logits_ptr, m.vocab, sc, rng, cand);
       uint32_t t = m.eos;
-      ok_out = dankattn::sched::sample_masked_or_logprobs(in, r, logits_ptr, m.vocab, 0.0f, m.pos, t);
+      ok_out = dankattn::sched::sample_masked_or_logprobs_gpu(
+          in, r, gs, m.C, m.logits_buf, 0u, m.vocab, 0.0f, m.pos, t);
       return t;
     };
 

@@ -18,7 +18,7 @@
 ### API & Serving
 - **Anthropic Messages API (`server/anthropic_compat.py`):** native `/v1/messages` (non-streaming + SSE streaming) and `/v1/messages/count_tokens` registered automatically across all DankAttn servers.
 - **Zero-dependency structured outputs (`server/json_schema_dfa.py`, C++ `OPMK` masking):** `response_format: {"type": "json_schema", ...}` with first-character bucketed `VocabMasker` and engine-side `OPMK` logit masking on `/v1/chat/completions`.
-- **Observability & logprobs:** added Prometheus `/metrics` endpoint and OpenAI `logprobs` / `top_logprobs` support across Hy4, ERNIE-5.5, and Inkling2 (along with `OPMK` JSON-schema constrained decoding in Inkling2).
+- **Zero-copy UMA + GPU `OPMK`/logprobs sampling (`engine/core/sample.h`, `engine/core/gpu_sample.h`, `engine/kernels/sampling.metal`, `bench/sample_test.mm`):** eliminated the per-token 800 KB logits copy, extra 1-row prefill step, and 1.6 MB `partial_sort` allocation on `OPMK`/logprobs requests across Hy4, ERNIE-5.5, and Inkling2 (stack top-K + `-24` tail cut on direct UMA `logits_buf.contents`; optional GPU bitmask kernel `dank_sample_masked_lp` behind `DANKATTN_GPU_SAMPLE=1`, verified bit-exact in `sample_test`).
 - **Single-port multi-model router (`server/router.py`):** serves multiple DankAttn engines behind one port with on-demand backend switching.
 - **Consolidated pack auto-detection (`hy4/serve_hy4.sh`):** auto-detects `models/pack-dfly2b6` vs `models/pack-v4-h128-w6` and sets matching `HY4_CAP` / `HY4_SIDE_CAP`.
 

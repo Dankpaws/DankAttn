@@ -61,6 +61,7 @@ case "$target" in
     build_one "build/quant_test"    "$@" bench/quant_test.mm $FRAMEWORKS
     build_one "build/kv_radix_test" "$@" bench/kv_radix_test.mm $FRAMEWORKS
     build_one "build/mtl4_floor"    "$@" bench/mtl4_floor.mm $FRAMEWORKS
+    build_one "build/sample_test"   "$@" bench/sample_test.mm $FRAMEWORKS
     ;;
   *)
     echo "usage: sh build.sh [all|hy4|inkling2|ernie55|flash|bench] [out] [extra clang flags...]" >&2

@@ -1,6 +1,7 @@
 // Shared serving inbox, OPMK mask queue, cancellation, adaptive prefill chunking,
 // masked/logprobs sampling, and request completion helpers for all DankAttn engines.
 #pragma once
+#include "gpu_sample.h"
 #include "proto.h"
 #include "sample.h"
 #include <algorithm>
@@ -153,6 +154,42 @@ inline bool sample_masked_or_logprobs(
       (req.top_p > 0.0f && req.top_p <= 1.0f) ? req.top_p : 1.0f,
       req.top_k, req.min_p >= 0.0f ? req.min_p : default_min_p,
       req.seed, pos, want_lp, req.top_logprobs, lp_val, tops);
+  if (want_lp) proto::send_logprob(req.rid, out_tok, lp_val, tops);
+  return true;
+}
+
+// Zero-copy UMA fast-path masked-logit sampling (OPMK, flags & 64) and/or exact logprobs (flags & 128).
+// Reads directly from the engine's shared GPU logits buffer (zero 800 KB memcpy, zero extra prefill row).
+// Defaults to zero-copy UMA CPU scan (~5 us sparse OPMK, ~0.3-0.6 ms full V=200k logprobs, avoiding the
+// ~0.2-0.3 ms separate Metal command-buffer round-trip); set DANKATTN_GPU_SAMPLE=1 to run the GPU kernel.
+inline bool sample_masked_or_logprobs_gpu(
+    Inbox& inbox, const Req& req, GpuSampler& gs, mtl::Ctx& C,
+    id<MTLBuffer> logits_buf, size_t logits_byte_off, uint32_t vocab,
+    float default_min_p, uint32_t pos, uint32_t& out_tok) {
+  const bool constrained = (req.flags & 64u) != 0u;
+  const bool want_lp = (req.flags & 128u) != 0u;
+  std::vector<uint32_t> allowed;
+  if (constrained && !inbox.pop_mask(req.rid, req.cancel, allowed)) return false;
+
+  static const bool use_gpu = getenv("DANKATTN_GPU_SAMPLE") && atoi(getenv("DANKATTN_GPU_SAMPLE")) != 0;
+  float lp_val = 0.0f;
+  std::vector<std::pair<uint32_t, float>> tops;
+  const float eff_temp = req.temp > 0.0f ? req.temp : 0.0f;
+  const float eff_top_p = (req.top_p > 0.0f && req.top_p <= 1.0f) ? req.top_p : 1.0f;
+  const float eff_min_p = req.min_p >= 0.0f ? req.min_p : default_min_p;
+  if (use_gpu) {
+    out_tok = gs.sample(
+        C, logits_buf, logits_byte_off, vocab,
+        constrained ? &allowed : nullptr,
+        eff_temp, eff_top_p, req.top_k, eff_min_p,
+        req.seed, pos, want_lp, req.top_logprobs, lp_val, tops);
+  } else {
+    const float* lg = (const float*)((const uint8_t*)logits_buf.contents + logits_byte_off);
+    out_tok = sample::sample_and_logprobs(
+        lg, vocab, constrained ? &allowed : nullptr,
+        eff_temp, eff_top_p, req.top_k, eff_min_p,
+        req.seed, pos, want_lp, req.top_logprobs, lp_val, tops);
+  }
   if (want_lp) proto::send_logprob(req.rid, out_tok, lp_val, tops);
   return true;
 }

@@ -21,6 +21,7 @@ using dankattn::sched::Req;
 using dankattn::sched::ReqP;
 
 static dankattn::sched::Inbox& inbox_state() { static dankattn::sched::Inbox in; return in; }
+static dankattn::GpuSampler& gpu_sampler() { static dankattn::GpuSampler gs; return gs; }
 
 void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
 void error(uint32_t rid, const std::string& msg) {
@@ -513,26 +514,24 @@ int main(hy4::Model& m) {
           a.vis_ready = true;
         }
         const bool need_logits = (a.q->flags & (64u | 128u)) != 0u;
-        // When constrained or logprobs is requested, keep the final prompt token in its own 1-row step
-        // so we get full float[V] logits for masked sampling / logprobs.
-        size_t end = std::min(a.rest.size(), a.pref_off + pf_chunk);
-        if (need_logits && end == a.rest.size() && end - a.pref_off > 1) end = a.rest.size() - 1;
+        const size_t end = std::min(a.rest.size(), a.pref_off + pf_chunk);
         std::vector<uint32_t> c(a.rest.begin() + long(a.pref_off), a.rest.begin() + long(end));
         if (end < a.rest.size())
           m.next_hint.assign(a.rest.begin() + long(end), a.rest.begin() + long(std::min(a.rest.size(), end + pf_chunk)));
         double g = 0;
         const size_t g_off = a.reused + a.pref_off;
-        std::vector<float> step_lg;
-        const bool want_step_lg = need_logits && (end >= a.rest.size()) && c.size() == 1;
         if (!a.req_pos3d.empty()) {
           const uint32_t n_vis = uint32_t(a.vis_embeds.size() / m.H);
-          a.b = m.step(c, &g, want_step_lg ? &step_lg : nullptr, nullptr, n_vis ? a.vis_embeds.data() : nullptr, n_vis,
+          a.b = m.step(c, &g, nullptr, nullptr, n_vis ? a.vis_embeds.data() : nullptr, n_vis,
                        n_vis ? a.vis_idx.data() + g_off : nullptr, a.req_pos3d.data() + g_off).back();
         } else {
-          a.b = m.step(c, &g, want_step_lg ? &step_lg : nullptr).back();
+          a.b = m.step(c, &g).back();
         }
-        if (want_step_lg && !step_lg.empty()) {
-          dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab, m.default_min_p, m.pos, a.b);
+        if (need_logits && end >= a.rest.size()) {
+          const size_t row_i = (c.size() > hy4::MAXM) ? 0u : (c.size() - 1u);
+          const size_t lg_off = row_i * size_t(m.lm_head.N) * 4u;
+          dankattn::sched::sample_masked_or_logprobs_gpu(
+              in, *a.q, gpu_sampler(), m.C, m.logits, lg_off, m.vocab, m.default_min_p, m.pos, a.b);
         }
         a.pms += g;
         a.pref_off = end;
@@ -590,9 +589,9 @@ int main(hy4::Model& m) {
           if (!stop) {
             const bool need_lg = (a.q->flags & (64u | 128u)) != 0u;
             if (need_lg) {
-              std::vector<float> step_lg;
-              a.b = m.step({a.b}, nullptr, &step_lg).back();
-              if (!dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab, m.default_min_p, m.pos, a.b)) {
+              a.b = m.step({a.b}).back();
+              if (!dankattn::sched::sample_masked_or_logprobs_gpu(
+                      in, *a.q, gpu_sampler(), m.C, m.logits, 0u, m.vocab, m.default_min_p, m.pos, a.b)) {
                 stop = true;
               }
             } else {
