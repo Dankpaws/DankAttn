@@ -6,18 +6,13 @@
 //   dankattn-ernie55 <pack_or_http_url> serve
 #include "ernie55.h"
 #include "../core/cli.h"
-#include "../core/proto.h"
-#include "../core/sample.h"
+#include "../core/scheduler.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
-#include <deque>
-#include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -155,7 +150,7 @@ struct NgramTable {
 
 // Fast chunked prefill of toks[start..end-1]; returns last token's logits [vocab] (or nullptr if cancelled).
 static const float* prefill_fast(ernie55::Model& m, const std::vector<uint32_t>& toks, size_t start, double& pms,
-                                 const std::atomic<uint32_t>* cancel_rid = nullptr, uint32_t rid = 0) {
+                                 const std::atomic<bool>* cancel = nullptr) {
   static const size_t chunk_sz = []() -> size_t {
     if (const char* e = getenv("E5_CHUNK")) {
       size_t v = size_t(atoi(e));
@@ -165,7 +160,7 @@ static const float* prefill_fast(ernie55::Model& m, const std::vector<uint32_t>&
   }();
   const float* lg = nullptr;
   for (size_t i = start; i < toks.size(); i += chunk_sz) {
-    if (cancel_rid && rid && cancel_rid->load(std::memory_order_relaxed) == rid) return nullptr;
+    if (cancel && cancel->load(std::memory_order_relaxed)) return nullptr;
     const size_t e = std::min(toks.size(), i + chunk_sz);
     const bool is_last = (e == toks.size());
     std::vector<uint32_t> chunk(toks.begin() + i, toks.begin() + e);
@@ -177,20 +172,6 @@ static const float* prefill_fast(ernie55::Model& m, const std::vector<uint32_t>&
 }
 
 // Binary framing helpers for serve mode (matches server/engine_frontend.py)
-struct ServeReq {
-  uint32_t rid = 0;
-  std::vector<uint32_t> ids;
-  uint32_t max_new = 4096;
-  uint32_t flags = 0;
-  std::vector<uint32_t> stops;
-  SampleCfg sc;
-  uint64_t seed = 0;
-  uint32_t think_budget = 0;
-  uint32_t think_end = 0;
-  std::vector<uint32_t> think_force;
-  uint32_t top_logprobs = 0;
-};
-
 static void send_u32_pair(uint32_t a, uint32_t b) { dankattn::proto::put(a, b, true); }
 static void send_error(uint32_t rid, const std::string& msg) { dankattn::proto::send_err(rid, msg); }
 static void send_done(uint32_t rid, uint32_t reused, uint32_t prompt, uint32_t generated,
@@ -200,72 +181,11 @@ static void send_done(uint32_t rid, uint32_t reused, uint32_t prompt, uint32_t g
 
 static int run_serve(ernie55::Model& m) {
   const uint32_t k_draft = getenv("E5_DRAFT_K") ? uint32_t(atoi(getenv("E5_DRAFT_K"))) : 7u;
-  std::mutex mu;
-  std::condition_variable cv;
-  std::deque<ServeReq> q;
-  std::unordered_map<uint32_t, std::deque<std::vector<uint32_t>>> mask_q;
-  std::atomic<bool> eof{false};
-  std::atomic<uint32_t> cancel_rid{0};
-
-  auto pop_mask = [&](uint32_t rid, std::vector<uint32_t>& out) -> bool {
-    std::unique_lock<std::mutex> lk(mu);
-    cv.wait(lk, [&]() {
-      if (eof.load() || cancel_rid.load(std::memory_order_relaxed) == rid) return true;
-      auto it = mask_q.find(rid);
-      return it != mask_q.end() && !it->second.empty();
-    });
-    auto it = mask_q.find(rid);
-    if (it == mask_q.end() || it->second.empty()) return false;
-    out = std::move(it->second.front());
-    it->second.pop_front();
-    return true;
-  };
+  dankattn::sched::Inbox in;
 
   // Signal ready to engine_frontend.py
   send_u32_pair(0u, dankattn::proto::READY);
-
-  std::thread reader([&]() {
-    while (true) {
-      dankattn::proto::OpusReq raw;
-      uint32_t crid = 0;
-      std::vector<uint32_t> mask_ids;
-      const auto kind = dankattn::proto::read_packet(raw, crid, {}, stdin, &mask_ids);
-      if (kind == dankattn::proto::PacketKind::Eof) break;
-      if (kind == dankattn::proto::PacketKind::Cancel) {
-        cancel_rid.store(crid, std::memory_order_relaxed);
-        cv.notify_all();
-        continue;
-      }
-      if (kind == dankattn::proto::PacketKind::Mask) {
-        std::lock_guard<std::mutex> lk(mu);
-        mask_q[crid].push_back(std::move(mask_ids));
-        cv.notify_all();
-        continue;
-      }
-      ServeReq r;
-      r.rid = raw.rid;
-      r.ids = std::move(raw.ids);
-      r.max_new = raw.max_new;
-      r.flags = raw.flags;
-      r.stops = std::move(raw.stops);
-      r.sc.temp = raw.temp;
-      r.sc.top_p = raw.top_p;
-      r.sc.top_k = raw.top_k;
-      r.sc.min_p = (raw.flags & 16u) ? raw.min_p : 0.0f;
-      r.seed = raw.seed;
-      r.think_budget = raw.budget;
-      r.think_end = raw.think_end;
-      r.think_force = std::move(raw.force);
-      r.top_logprobs = raw.top_logprobs;
-      {
-        std::lock_guard<std::mutex> lk(mu);
-        q.push_back(std::move(r));
-      }
-      cv.notify_all();
-    }
-    eof.store(true);
-    cv.notify_all();
-  });
+  in.start_reader();
 
   std::vector<uint32_t> cached_ids;
   NgramTable ngram;
@@ -273,26 +193,40 @@ static int run_serve(ernie55::Model& m) {
   std::vector<std::pair<float, uint32_t>> cand;
 
   while (true) {
-    ServeReq r;
+    if (!in.wait_for_work()) break;
+    dankattn::sched::ReqP qp;
     {
-      std::unique_lock<std::mutex> lk(mu);
-      cv.wait(lk, [&]() { return !q.empty() || eof.load(); });
-      if (q.empty()) break;
-      r = std::move(q.front());
-      q.pop_front();
+      std::lock_guard<std::mutex> lk(in.mu);
+      if (in.queue.empty()) continue;
+      qp = std::move(in.queue.front());
+      in.queue.pop_front();
+    }
+    auto& r = *qp;
+    if (r.cancel.load()) {
+      in.forget(r.rid);
+      continue;
     }
     if (r.flags & 32u) {
       send_error(r.rid, "ERNIE-5.5 text engine does not support vision inputs");
+      in.forget(r.rid);
       continue;
     }
     if (r.ids.empty()) {
       send_error(r.rid, "empty prompt");
+      in.forget(r.rid);
       continue;
     }
     if (r.ids.size() >= m.cap) {
       send_error(r.rid, "prompt exceeds context capacity");
+      in.forget(r.rid);
       continue;
     }
+
+    SampleCfg sc;
+    sc.temp = r.temp;
+    sc.top_p = r.top_p;
+    sc.top_k = r.top_k;
+    sc.min_p = (r.flags & 16u) ? r.min_p : 0.0f;
 
     auto tw0 = std::chrono::steady_clock::now();
     // Exact prefix reuse (safe when rollback distance < COMP_RING - 128 so HCA comp/swa rings are intact)
@@ -311,11 +245,11 @@ static int run_serve(ernie55::Model& m) {
     }
 
     double pms = 0.0;
-    const float* lg = prefill_fast(m, r.ids, lcp, pms, &cancel_rid, r.rid);
+    const float* lg = prefill_fast(m, r.ids, lcp, pms, &r.cancel);
     if (!lg) {
       m.reset();
       cached_ids.clear();
-      { std::lock_guard<std::mutex> lk(mu); mask_q.erase(r.rid); }
+      in.forget(r.rid);
       float wall_ms = float(std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count() * 1e3);
       send_done(r.rid, uint32_t(lcp), uint32_t(r.ids.size()), 0, 0, 0, 0, float(pms), wall_ms);
       continue;
@@ -335,21 +269,14 @@ static int run_serve(ernie55::Model& m) {
 
     uint32_t generated = 0, rounds = 0, accepted = 0, dflags = 0;
     bool hit_stop = false;
-    bool in_think = (r.think_budget > 0);
+    bool in_think = (r.budget > 0);
     uint32_t think_toks = 0;
 
     auto sample_step = [&](const float* logits_ptr, bool& ok_out) -> uint32_t {
       ok_out = true;
-      if (!constrained && !want_lp) return sample_logits(logits_ptr, m.vocab, r.sc, rng, cand);
-      std::vector<uint32_t> allowed;
-      if (constrained && !pop_mask(r.rid, allowed)) { ok_out = false; return m.eos; }
-      float lp_val = 0.0f;
-      std::vector<std::pair<uint32_t, float>> tops;
-      uint32_t t = dankattn::sample::sample_and_logprobs(
-          logits_ptr, m.vocab, constrained ? &allowed : nullptr,
-          r.sc.temp, r.sc.top_p, r.sc.top_k, r.sc.min_p,
-          r.seed, m.pos, want_lp, r.top_logprobs, lp_val, tops);
-      if (want_lp) dankattn::proto::send_logprob(r.rid, t, lp_val, tops);
+      if (!constrained && !want_lp) return sample_logits(logits_ptr, m.vocab, sc, rng, cand);
+      uint32_t t = m.eos;
+      ok_out = dankattn::sched::sample_masked_or_logprobs(in, r, logits_ptr, m.vocab, 0.0f, m.pos, t);
       return t;
     };
 
@@ -368,14 +295,14 @@ static int run_serve(ernie55::Model& m) {
 
     if (sok && emit_tok(next_tok)) {
       while (generated < r.max_new && m.pos + 1 < m.cap && !hit_stop) {
-        if (cancel_rid.load(std::memory_order_relaxed) == r.rid) break;
+        if (r.cancel.load(std::memory_order_relaxed)) break;
 
         // Enforce thinking budget if configured
-        if (in_think && think_toks >= r.think_budget && !r.think_force.empty()) {
+        if (in_think && think_toks >= r.budget && !r.force.empty()) {
           in_think = false;
           std::vector<uint32_t> fseq;
           fseq.push_back(next_tok);
-          for (uint32_t ft : r.think_force) {
+          for (uint32_t ft : r.force) {
             if (generated >= r.max_new) break;
             send_u32_pair(r.rid, ft);
             generated++;
@@ -388,7 +315,7 @@ static int run_serve(ernie55::Model& m) {
           if (use_spec && cached_ids.size() >= 3) {
             ngram.index_range(cached_ids, cached_ids.size() - fseq.size(), cached_ids.size() - 1);
           }
-          next_tok = sample_logits(lg, m.vocab, r.sc, rng, cand);
+          next_tok = sample_logits(lg, m.vocab, sc, rng, cand);
           if (!emit_tok(next_tok)) break;
           continue;
         }
@@ -427,7 +354,7 @@ static int run_serve(ernie55::Model& m) {
           bool all_acc = true;
           for (uint32_t i = 0; i < draft_toks.size(); i++) {
             const float* row = lg + size_t(i) * m.vocab;
-            if (r.sc.temp <= 0.0f) {
+            if (sc.temp <= 0.0f) {
               uint32_t t = argmax(row, m.vocab);
               if (t == draft_toks[i]) {
                 n_acc++;
@@ -438,19 +365,19 @@ static int run_serve(ernie55::Model& m) {
               }
             } else {
               float p_sum = 0.0f;
-              build_probs(row, m.vocab, r.sc, cand, p_sum);
+              build_probs(row, m.vocab, sc, cand, p_sum);
               float pd = prob_of(cand, p_sum, draft_toks[i]);
               if (rng.next_f32() < pd) {
                 n_acc++;
               } else {
-                bonus_tok = sample_logits(row, m.vocab, r.sc, rng, cand, draft_toks[i]);
+                bonus_tok = sample_logits(row, m.vocab, sc, rng, cand, draft_toks[i]);
                 all_acc = false;
                 break;
               }
             }
           }
           if (all_acc) {
-            bonus_tok = sample_logits(lg + size_t(draft_toks.size()) * m.vocab, m.vocab, r.sc, rng, cand);
+            bonus_tok = sample_logits(lg + size_t(draft_toks.size()) * m.vocab, m.vocab, sc, rng, cand);
           }
           accepted += n_acc;
           // Roll back unaccepted draft tokens (at most k_draft <= 7, always inside HCA_RING)
@@ -472,12 +399,12 @@ static int run_serve(ernie55::Model& m) {
     }
 
     if (!hit_stop && generated >= r.max_new) dflags |= 1u;
-    { std::lock_guard<std::mutex> lk(mu); mask_q.erase(r.rid); }
+    in.forget(r.rid);
     float wall_ms = float(std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count() * 1e3);
     send_done(r.rid, uint32_t(lcp), uint32_t(r.ids.size()), generated, rounds, accepted, dflags, float(pms), wall_ms);
   }
 
-  reader.join();
+  in.join();
   return 0;
 }
 

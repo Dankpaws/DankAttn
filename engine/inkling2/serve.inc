@@ -17,13 +17,7 @@
 // land on the checkpoint. Anything else re-prefills from zero.
 #include "../core/env.h"
 #include "../core/pcache.h"
-#include "../core/proto.h"
-#include <atomic>
-#include <condition_variable>
-#include <deque>
-#include <memory>
-#include <mutex>
-#include <thread>
+#include "../core/scheduler.h"
 #include <unistd.h>
 
 namespace iserve {
@@ -129,47 +123,15 @@ using dankattn::proto::CAND_SEP;
 using dankattn::proto::END;
 using dankattn::proto::ERR;
 using dankattn::proto::READY;
+using dankattn::sched::Req;
+using dankattn::sched::ReqP;
 
-struct Req : dankattn::proto::OpusReq {
-  uint32_t fpr_lanes = 0, fpr_quorum = 0, fpr_opts = 0;  // flags & 2: Fork-Prune-Resolve / Parallel Fill
-};
-using ReqP = std::shared_ptr<Req>;
-
-std::mutex mu;
-std::condition_variable cv;
-std::deque<ReqP> inbox;
-std::map<uint32_t, ReqP> live;
-bool closed = false;
+static dankattn::sched::Inbox& inbox_state() { static dankattn::sched::Inbox in; return in; }
 
 void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
 void error(uint32_t rid, const std::string& msg) {
   dankattn::proto::send_err(rid, msg);
   fprintf(stderr, "inkling2: rid %u refused: %s\n", rid, msg.c_str());
-}
-
-void reader() {
-  const dankattn::proto::ReadOpts ropts{.keep_images = false, .parse_fpr_suffixes = true};
-  for (;;) {
-    auto q = std::make_shared<Req>();
-    uint32_t cancel_rid = 0;
-    const auto kind = dankattn::proto::read_packet(*q, cancel_rid, ropts);
-    if (kind == dankattn::proto::PacketKind::Eof) break;
-    if (kind == dankattn::proto::PacketKind::Cancel) {
-      std::lock_guard<std::mutex> g(mu);
-      if (auto it = live.find(cancel_rid); it != live.end()) it->second->cancel = true;
-      continue;
-    }
-    q->fpr_lanes = q->grp0;
-    q->fpr_quorum = q->grp1;
-    q->fpr_opts = q->grp2;
-    std::lock_guard<std::mutex> g(mu);
-    live[q->rid] = q;
-    inbox.push_back(q);
-    cv.notify_one();
-  }
-  std::lock_guard<std::mutex> g(mu);
-  closed = true;
-  cv.notify_one();
 }
 
 struct Active {
@@ -185,7 +147,7 @@ struct Active {
   uint32_t nthink = 0, n = 0, rounds = 0, accepted = 0;
   std::unique_ptr<opus_lookup::Lookup> lk;
   bool is_stop(const ink2::Model& m, uint32_t t) const {
-    return t == m.eos || std::find(q->stops.begin(), q->stops.end(), t) != q->stops.end();
+    return dankattn::sched::is_stop_token(m.eos, *q, t);
   }
 };
 
@@ -220,21 +182,12 @@ static bool emit_tok(ink2::Model& m, Active& a, uint32_t t) {
 }
 
 static void finish_active(Active& a, std::vector<bool>& busy) {
-  const float wall = std::chrono::duration<float>(std::chrono::steady_clock::now() - a.t0).count() * 1e3f;
-  put(a.q->rid, END);
-  uint32_t s6[6] = {a.reused, uint32_t(a.q->ids.size()), a.n, a.rounds, a.accepted, a.length ? 1u : 0u};
-  float f2[2] = {float(a.pms), wall};
-  fwrite(s6, 4, 6, stdout);
-  fwrite(f2, 4, 2, stdout);
-  fflush(stdout);
   char sb[160] = "";
   if (a.spec && a.rounds)
     snprintf(sb, sizeof sb, " spec %u rounds, %.2f tok/round", a.rounds, double(a.accepted) / a.rounds);
-  fprintf(stderr, "inkling2: rid %u lane %d prompt %zu (reused %u, prefill %.0f ms) gen %u in %.0f ms%s\n",
-          a.q->rid, a.lane, a.q->ids.size(), a.reused, a.pms, a.n, wall, sb);
+  dankattn::sched::finish_request(inbox_state(), *a.q, a.reused, a.n, a.rounds, a.accepted, a.length, a.pms, a.t0,
+                                  "inkling2", "lane", a.lane, sb);
   if (a.lane >= 0) busy[a.lane] = false;
-  std::lock_guard<std::mutex> g(mu);
-  live.erase(a.q->rid);
 }
 
 // Highest fork_pos among currently active side lanes reading Lane 0's global KV.
@@ -338,10 +291,10 @@ static int pick_lane(const ink2::Model& m, const std::vector<uint32_t>& ids, con
 
 static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t draft_k, float draft_cut, bool use_lookup) {
   const auto t0 = std::chrono::steady_clock::now();
-  const uint32_t K = std::max(2u, std::min(q->fpr_lanes ? q->fpr_lanes : n_lanes, n_lanes));
-  const uint32_t Q = (q->fpr_quorum == 0u) ? K : std::max(1u, std::min(q->fpr_quorum, K));
-  const uint32_t mode = q->fpr_opts & 0xFu;        // 0 = select, 1 = candidates
-  const uint32_t prune_lvl = (q->fpr_opts >> 4) & 0xFu;
+  const uint32_t K = std::max(2u, std::min(q->grp0 ? q->grp0 : n_lanes, n_lanes));
+  const uint32_t Q = (q->grp1 == 0u) ? K : std::max(1u, std::min(q->grp1, K));
+  const uint32_t mode = q->grp2 & 0xFu;        // 0 = select, 1 = candidates
+  const uint32_t prune_lvl = (q->grp2 >> 4) & 0xFu;
   const bool spec = (q->flags & 1) && m.has_mtp;
   auto is_stop = [&](uint32_t t) {
     return t == m.eos || std::find(q->stops.begin(), q->stops.end(), t) != q->stops.end();
@@ -399,11 +352,8 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
   }
   if (q->cancel.load()) {
     const float wall = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count() * 1e3f;
-    put(q->rid, END);
-    uint32_t s6[6] = {reuse, uint32_t(q->ids.size()), 0u, 0u, 0u, 0u};
-    float f2[2] = {float(pms), wall};
-    fwrite(s6, 4, 6, stdout); fwrite(f2, 4, 2, stdout); fflush(stdout);
-    std::lock_guard<std::mutex> g(mu); live.erase(q->rid);
+    dankattn::proto::send_end(q->rid, reuse, uint32_t(q->ids.size()), 0u, 0u, 0u, 0u, float(pms), wall);
+    inbox_state().forget(q->rid);
     return;
   }
 
@@ -732,32 +682,27 @@ static void run_fpr(ink2::Model& m, const ReqP& q, uint32_t n_lanes, uint32_t dr
     lane_ckpt()[k] = {};
   }
   const float wall = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count() * 1e3f;
-  put(q->rid, END);
-  uint32_t s6[6] = {reuse, uint32_t(q->ids.size()), n_emit, tot_rounds, tot_acc, out_len ? 1u : 0u};
-  float f2[2] = {float(pms), wall};
-  fwrite(s6, 4, 6, stdout);
-  fwrite(f2, 4, 2, stdout);
-  fflush(stdout);
+  dankattn::proto::send_end(q->rid, reuse, uint32_t(q->ids.size()), n_emit, tot_rounds, tot_acc, out_len ? 1u : 0u, float(pms), wall);
   fprintf(stderr, "inkling2: rid %u FPR(%s) K=%u Q=%u pruned=%u prompt %zu (reused %u, prefill %.0f ms) emit %u (agg %u) in %.0f ms (win=L%d sc=%.2f)\n",
           q->rid, mode == 0u ? "select" : (mode == 2u ? "fast" : "cands"), K, Q, n_pruned, q->ids.size(), reuse, pms, n_emit, tot_acc, wall, win_lane, win_conf);
-  std::lock_guard<std::mutex> g(mu);
-  live.erase(q->rid);
+  inbox_state().forget(q->rid);
 }
 
 static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vector<bool>& busy,
                            uint32_t n_lanes, uint32_t draft_k, float draft_cut, bool use_lookup) {
+  auto& in = inbox_state();
   for (;;) {
     ReqP q;
     {
-      std::lock_guard<std::mutex> g(mu);
-      if (inbox.empty()) return;
-      if (inbox.front()->flags & 2) {
+      std::lock_guard<std::mutex> g(in.mu);
+      if (in.queue.empty()) return;
+      if (in.queue.front()->flags & 2) {
         if (!active.empty()) return;  // wait until all lanes are idle for FPR
       } else {
         if (std::find(busy.begin(), busy.end(), false) == busy.end()) return;
       }
-      q = inbox.front();
-      inbox.pop_front();
+      q = in.queue.front();
+      in.queue.pop_front();
     }
     std::string why;
     if (q->cancel.load()) why = "";
@@ -767,8 +712,7 @@ static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vec
       why = "prompt of " + std::to_string(q->ids.size()) + " tokens exceeds the context capacity of " + std::to_string(m.cap);
     if (q->cancel.load() || !why.empty()) {
       if (!why.empty()) error(q->rid, why);
-      std::lock_guard<std::mutex> g(mu);
-      live.erase(q->rid);
+      in.forget(q->rid);
       continue;
     }
     if (q->flags & 2) {
@@ -780,8 +724,7 @@ static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vec
     int fork_mode = 0;
     const int ln = pick_lane(m, q->ids, busy, &reuse, &rw, &fork_mode);
     if (ln < 0) {
-      std::lock_guard<std::mutex> g(mu);
-      inbox.push_front(q);
+      in.push_front(q);
       return;
     }
     auto& h = lane_hist()[ln];
@@ -839,7 +782,7 @@ static void admit_requests(ink2::Model& m, std::vector<Active>& active, std::vec
     a.t0 = std::chrono::steady_clock::now();
     a.reused = reuse;
     a.rest.assign(q->ids.begin() + reuse, q->ids.end());
-    a.spec = (q->flags & 1) && m.has_mtp;
+    a.spec = (q->flags & 1) && !(q->flags & (64u | 128u)) && m.has_mtp;
     a.thinking = (q->flags & 4) != 0;
     a.lk = std::make_unique<opus_lookup::Lookup>();
     busy[ln] = true;
@@ -879,7 +822,8 @@ int main(ink2::Model& m) {
   fprintf(stderr, "inkling2: serving %u lanes (L0=%u, side=%u, rewind slack %u), GPU state %.2f GB, DSpark %s, power %s\n", n_lanes,
           m.cap, side_cap ? side_cap : m.cap, m.rewind_slack(), m.C.allocated / 1e9, m.has_mtp ? "on" : "off",
           ink2::power_mode_name());
-  std::thread rt(reader);
+  auto& in = inbox_state();
+  in.start_reader(dankattn::proto::ReadOpts{.keep_images = false, .parse_fpr_suffixes = true});
   put(0, READY);
   fflush(stdout);
 
@@ -889,9 +833,7 @@ int main(ink2::Model& m) {
   for (;;) {
     admit_requests(m, active, busy, n_lanes, draft_k, draft_cut, use_lookup);
     if (active.empty()) {
-      std::unique_lock<std::mutex> g(mu);
-      cv.wait(g, [&] { return closed || !inbox.empty(); });
-      if (inbox.empty() && closed) break;
+      if (!in.wait_for_work()) break;
       continue;
     }
     @autoreleasepool {
@@ -907,13 +849,27 @@ int main(ink2::Model& m) {
       uint32_t n_decoding = 0;
       for (const auto& a : active) if (!a.prefilling) n_decoding++;
       const uint32_t max_pf = ink2::eco_mode() ? std::min<uint32_t>(ink2::MP, 256u) : ink2::MP;
-      const uint32_t dec_cap = (n_decoding >= 2u) ? std::max<uint32_t>(64u, pf_dec_chunk / 2u) : pf_dec_chunk;
-      const uint32_t chunk = n_decoding > 0u ? std::max<uint32_t>(ink2::MAXM + 1u, std::min(max_pf, dec_cap)) : max_pf;
+      const uint32_t chunk = dankattn::sched::adaptive_pf_chunk(max_pf, pf_dec_chunk, ink2::MAXM + 1u, n_decoding);
       for (auto& a : active) {
         if (!a.prefilling) continue;
-        const size_t end = std::min(a.rest.size(), a.pref_off + chunk);
+        const bool need_lg = (a.q->flags & (64u | 128u)) != 0u;
+        size_t end = std::min(a.rest.size(), a.pref_off + chunk);
+        if (need_lg && end == a.rest.size() && end - a.pref_off > 1) end = a.rest.size() - 1;
         std::vector<uint32_t> c(a.rest.begin() + long(a.pref_off), a.rest.begin() + long(end));
-        a.b = feed(m, a, c, &a.pms);
+        if (need_lg && end >= a.rest.size() && c.size() == 1) {
+          m.use_lane(a.lane);
+          double g = 0;
+          std::vector<float> step_lg;
+          a.b = m.step(c, &g, &step_lg).back();
+          a.pms += g;
+          if (m.has_mtp) m.mtp_commit(1u);
+          lane_hist()[a.lane].push_back(c[0]);
+          if (!step_lg.empty()) {
+            dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab_valid, 0.0f, m.pos, a.b);
+          }
+        } else {
+          a.b = feed(m, a, c, &a.pms);
+        }
         a.pref_off = end;
         if (a.pref_off >= a.rest.size()) {
           a.prefilling = false;
@@ -948,12 +904,30 @@ int main(ink2::Model& m) {
 
       // 3) Emit every decoding lane's pending token; lanes that stop on it leave the round
       std::vector<bool> done(active.size(), false);
-      std::vector<size_t> step_idx;
+      std::vector<size_t> step_idx, lg_idx;
       for (size_t i : dec) {
         if (emit_tok(m, active[i], active[i].b)) done[i] = true;
+        else if (active[i].q->flags & (64u | 128u)) lg_idx.push_back(i);
         else step_idx.push_back(i);
       }
       fflush(stdout);
+
+      // 3b) Constrained-decoding (OPMK) or logprobs lanes run 1-row exact logit steps
+      for (size_t idx : lg_idx) {
+        Active& a = active[idx];
+        m.use_lane(a.lane);
+        std::vector<float> step_lg;
+        const uint32_t tok_in = a.b;
+        a.b = m.step({tok_in}, nullptr, &step_lg).back();
+        if (m.has_mtp) m.mtp_commit(1u);
+        lane_hist()[a.lane].push_back(tok_in);
+        a.rounds++;
+        a.accepted++;
+        if (!step_lg.empty() &&
+            !dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab_valid, 0.0f, m.pos, a.b)) {
+          done[idx] = true;
+        }
+      }
 
       if (!step_idx.empty()) {
         // 4) Batched drafts across lanes, one joint verify
@@ -1034,7 +1008,7 @@ int main(ink2::Model& m) {
   }
   m.use_lane(0);
   pcache().save(m, lane_hist()[0]);
-  rt.join();
+  in.join();
   return 0;
 }
 

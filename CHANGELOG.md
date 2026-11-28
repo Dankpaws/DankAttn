@@ -3,10 +3,10 @@
 ## [Unreleased]
 
 ### Engine Core & Refactoring
-- **Shared C++ runtime (`engine/core/`):** extracted `env.h`, `pack.h`, `runtime.h`, `proto.h`, `cli.h`, `sample.h`, and `pcache.h`, deduplicating `Lin`, `Raw`, `jload`, `parse_json`, `mmap_file`, `host_now`, `new_sample_buffer`, `Rec`, `PrefixCache`, the `OPUS`/`OPCX` binary protocol parser, and CLI helpers across Hy4, Inkling2, ERNIE-5.5, and Flash-Next.
+- **Shared C++ runtime (`engine/core/`):** extracted `env.h`, `pack.h`, `runtime.h`, `proto.h`, `cli.h`, `sample.h`, `pcache.h`, and `scheduler.h`, deduplicating `Lin`, `Raw`, `jload`, `parse_json`, `mmap_file`, `host_now`, `new_sample_buffer`, `Rec`, `PrefixCache`, the `OPUS`/`OPCX`/`OPMK` reader/inbox/cancel/mask-queue loop, adaptive prefill chunking, masked/logprobs sampling, and CLI helpers across Hy4, Inkling2, ERNIE-5.5, and Flash-Next.
 - **Unified multi-engine build (`build.sh`):** `sh build.sh [all|hy4|inkling2|ernie55|flash|bench]` builds all four engines and GPU unit tests from one script; per-model `build_*.sh` wrappers delegate to it.
 - **Modular Metal shaders (`engine/mtl.h`, `engine/kernels/mm2_epilogues.metal`, `engine/kernels/sampling.metal`):** added recursive local `#include "..."` expansion in `mtl::slurp()`, split model-specific epilogues (`EPI=1..5`, `epi3_regs`) out of `engine/kernels/mm2.metal`, and consolidated GPU top-k/top-p/min-p sampling into `engine/kernels/sampling.metal`.
-- **Opt-in Metal 4 command encoding (`engine/core/mtl4.h`, `DANKATTN_MTL4=1`):** `MTL4CommandQueue` + `MTL4CommandBuffer` + `MTL4ArgumentTable` (`MTL4VisibilityOptionNone`) backend for ERNIE-5.5 and Hy4 (100% bit-exact, off by default; includes `bench/mtl4_floor.mm`).
+- **Opt-in Metal 4 command encoding (`engine/core/mtl4.h`, `DANKATTN_MTL4=1`):** `MTL4CommandQueue` + `MTL4CommandBuffer` + `MTL4ArgumentTable` (`MTL4VisibilityOptionNone`) backend across ERNIE-5.5, Hy4, and Inkling2 (100% bit-exact, off by default; includes `bench/mtl4_floor.mm`).
 - **Unified Python chat frontend (`server/engine_frontend.py`):** consolidated `parse_chat_params`, `find_stop_cut`, `finish_reason_of`, `make_sse_chunk`, `make_usage`, and `run_chat_completion` across `hy4_server.py`, `ernie55_server.py`, `inkling2_server.py`, and `dankattn_server.py`.
 
 ### Shader Cache, Quantization & Paged KV
@@ -18,7 +18,7 @@
 ### API & Serving
 - **Anthropic Messages API (`server/anthropic_compat.py`):** native `/v1/messages` (non-streaming + SSE streaming) and `/v1/messages/count_tokens` registered automatically across all DankAttn servers.
 - **Zero-dependency structured outputs (`server/json_schema_dfa.py`, C++ `OPMK` masking):** `response_format: {"type": "json_schema", ...}` with first-character bucketed `VocabMasker` and engine-side `OPMK` logit masking on `/v1/chat/completions`.
-- **Observability & logprobs:** added Prometheus `/metrics` endpoint and OpenAI `logprobs` / `top_logprobs` support across Hy4 and ERNIE-5.5.
+- **Observability & logprobs:** added Prometheus `/metrics` endpoint and OpenAI `logprobs` / `top_logprobs` support across Hy4, ERNIE-5.5, and Inkling2 (along with `OPMK` JSON-schema constrained decoding in Inkling2).
 - **Single-port multi-model router (`server/router.py`):** serves multiple DankAttn engines behind one port with on-demand backend switching.
 - **Consolidated pack auto-detection (`hy4/serve_hy4.sh`):** auto-detects `models/pack-dfly2b6` vs `models/pack-v4-h128-w6` and sets matching `HY4_CAP` / `HY4_SIDE_CAP`.
 

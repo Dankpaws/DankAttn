@@ -30,26 +30,17 @@
 // Thinking budget: the reply starts inside a thinking block; after `budget` thinking tokens without the
 // end-of-thinking token, the `force` tokens (the front end's closing text) are fed and emitted in place of
 // the model's next tokens, and the answer follows.
-#include "core/proto.h"
+#include "core/scheduler.h"
 
 namespace serve {
 
 using dankattn::proto::END;
 using dankattn::proto::ERR;
 using dankattn::proto::READY;
+using dankattn::sched::Req;
+using dankattn::sched::ReqP;
 
-struct Req : dankattn::proto::OpusReq {
-  uint32_t gid = 0, gsize = 0, gindex = 0;
-  uint32_t think_budget = 0;
-  std::vector<uint32_t> think_force;
-};
-using ReqP = std::shared_ptr<Req>;
-
-std::mutex mu;
-std::condition_variable cv;
-std::deque<ReqP> inbox;
-std::map<uint32_t, ReqP> live;  // rid -> request, for cancels
-bool closed = false;
+static dankattn::sched::Inbox& inbox_state() { static dankattn::sched::Inbox in; return in; }
 
 std::mutex out_mu;
 void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
@@ -64,42 +55,13 @@ void end(const Req& q, uint32_t reused, uint32_t n, uint32_t rounds, uint32_t ac
   std::lock_guard<std::mutex> g(out_mu);
   dankattn::proto::send_end(q.rid, reused, uint32_t(q.ids.size()), n, rounds, accepted, length ? 1u : 0u, prefill_ms, wall_ms);
 }
-void forget(uint32_t rid) {
-  std::lock_guard<std::mutex> g(mu);
-  live.erase(rid);
-}
-
-void reader() {
-  for (;;) {
-    auto q = std::make_shared<Req>();
-    uint32_t cancel_rid = 0;
-    const auto kind = dankattn::proto::read_packet(*q, cancel_rid);
-    if (kind == dankattn::proto::PacketKind::Eof) break;
-    if (kind == dankattn::proto::PacketKind::Cancel) {
-      std::lock_guard<std::mutex> g(mu);
-      if (auto it = live.find(cancel_rid); it != live.end()) it->second->cancel = true;
-      continue;
-    }
-    q->gid = q->grp0;
-    q->gsize = q->grp1;
-    q->gindex = q->grp2;
-    q->think_budget = q->budget;
-    q->think_force = std::move(q->force);
-    std::lock_guard<std::mutex> g(mu);
-    live[q->rid] = q;
-    inbox.push_back(q);
-    cv.notify_one();
-  }
-  std::lock_guard<std::mutex> g(mu);
-  closed = true;
-  cv.notify_one();
-}
+void forget(uint32_t rid) { inbox_state().forget(rid); }
 
 // Where a reply stands in its thinking block, for the budget.
 struct Think {
   bool on = false;  // still thinking under a budget
   uint32_t n = 0, budget = 0, end = 0;
-  explicit Think(const Req& q) : on(q.flags & 4), budget(q.think_budget), end(q.think_end) {}
+  explicit Think(const Req& q) : on(q.flags & 4), budget(q.budget), end(q.think_end) {}
   // after emitting t: true when the budget is spent (the caller feeds the force tokens next)
   bool spent(uint32_t t) {
     if (!on) return false;
@@ -219,7 +181,7 @@ struct Server {
   bool emit(Run& r) {
     if (!r.force.empty()) { r.x = r.force.front(); r.force.pop_front(); }
     put(r.q->rid, r.x);
-    if (r.th.spent(r.x)) r.force.assign(r.q->think_force.begin(), r.q->think_force.end());
+    if (r.th.spent(r.x)) r.force.assign(r.q->force.begin(), r.q->force.end());
     const bool stop = r.force.empty() && (r.x == lanes[0]->eos ||
                       std::find(r.q->stops.begin(), r.q->stops.end(), r.x) != r.q->stops.end());
     return !(stop || ++r.n >= r.max_new || r.q->cancel);
@@ -302,7 +264,7 @@ struct Server {
         for (uint32_t t : o) {  // the cut guarantees an ending token is the round's last
           r.x = t;
           put(r.q->rid, t);
-          if (r.th.spent(t)) r.force.assign(r.q->think_force.begin(), r.q->think_force.end());
+          if (r.th.spent(t)) r.force.assign(r.q->force.begin(), r.q->force.end());
           if ((r.force.empty() && is_stop(r, t)) || ++r.n >= r.max_new || r.q->cancel) on = false;
         }
         if (!on) done.push_back(&r);
@@ -468,12 +430,12 @@ struct Server {
     // what the slot holds, so nothing is prefilled again). generate does not count the token its
     // callback refused, so count what was emitted.
     if (spent) n = uint32_t(said.size());
-    if (spent && !q.cancel && n + q.think_force.size() < max_new) {
+    if (spent && !q.cancel && n + q.force.size() < max_new) {
       std::vector<uint32_t> p2 = q.ids;
       p2.insert(p2.end(), said.begin(), said.end());
-      p2.insert(p2.end(), q.think_force.begin(), q.think_force.end());
-      for (uint32_t t : q.think_force) say(t);
-      n += uint32_t(q.think_force.size());
+      p2.insert(p2.end(), q.force.begin(), q.force.end());
+      for (uint32_t t : q.force) say(t);
+      n += uint32_t(q.force.size());
       opus::SpecStats st2;
       n += m.generate(p2, max_new - n, q.flags & 1, [&](uint32_t t) {
         say(t);
@@ -497,7 +459,7 @@ struct Server {
   }
 
   void group(std::vector<ReqP> g) {
-    std::sort(g.begin(), g.end(), [](const ReqP& a, const ReqP& b) { return a->gindex < b->gindex; });
+    std::sort(g.begin(), g.end(), [](const ReqP& a, const ReqP& b) { return a->grp2 < b->grp2; });
     const uint32_t N = uint32_t(g.size());
     auto refuse = [&](const std::string& why) { for (auto& q : g) error(*q, "group of " + std::to_string(N) + " refused: " + why); };
     if (N > lanes.size()) { refuse("the server has " + std::to_string(lanes.size()) + " lanes (OPUS_LANES)"); return; }
@@ -553,7 +515,7 @@ struct Server {
     auto emit = [&](uint32_t k) {  // x[k] is lane k's next token
       if (!force[k].empty()) { x[k] = force[k].front(); force[k].pop_front(); }
       put(g[k]->rid, x[k]);
-      if (th[k].spent(x[k])) force[k].assign(g[k]->think_force.begin(), g[k]->think_force.end());
+      if (th[k].spent(x[k])) force[k].assign(g[k]->force.begin(), g[k]->force.end());
       if ((force[k].empty() && stop_tok(k, x[k])) || ++n[k] >= max_new[k] || g[k]->cancel) on[k] = false;
     };
     uint32_t steps = 0;
@@ -593,27 +555,28 @@ struct Server {
     const double ms_dec = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
     fprintf(stderr, "opus: group %u x%u: shared prefix %zu (reused %u), prefix %.0f ms, fork %.0f ms, tails %.0f ms; "
                     "%zu tokens in %u joint steps, %.1f ms/step, decode %.1f tok/s aggregate, %.1f tok/s overall\n",
-            g[0]->gid, N, P, reused, ms_prefix, ms_fork, ms_tails, total, steps, ms_dec / std::max(1u, steps),
+            g[0]->grp0, N, P, reused, ms_prefix, ms_fork, ms_tails, total, steps, ms_dec / std::max(1u, steps),
             total / std::max(1e-9, ms_dec * 1e-3),
             total / std::max(1e-9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()));
   }
 
   void run_pool() {
+    auto& in = inbox_state();
     std::deque<ReqP> slot_q, lane_q;
     std::map<uint32_t, std::vector<ReqP>> pending;  // group id -> members so far
     auto drop = [](const ReqP& q) { end(*q, 0, 0, 0, 0, 0, 0); forget(q->rid); };
     for (;;) {
       std::vector<ReqP> fresh;
       {
-        std::unique_lock<std::mutex> lk(mu);
+        std::unique_lock<std::mutex> lk(in.mu);
         const bool busy = !runs.empty() || !slot_q.empty() || !lane_q.empty();
-        if (inbox.empty() && !busy && !closed) cv.wait_for(lk, std::chrono::seconds(pending.empty() ? 3600 : 1));
-        if (closed && inbox.empty() && !busy) break;
-        for (auto& q : inbox) {
-          if (q->flags & 2) pending[q->gid].push_back(q);
+        if (in.queue.empty() && !busy && !in.closed) in.cv.wait_for(lk, std::chrono::seconds(pending.empty() ? 3600 : 1));
+        if (in.closed && in.queue.empty() && !busy) break;
+        for (auto& q : in.queue) {
+          if (q->flags & 2) pending[q->grp0].push_back(q);
           else fresh.push_back(q);
         }
-        inbox.clear();
+        in.queue.clear();
       }
       // several new requests at once (a lead's subagents): none takes the slot, which would hold the lanes
       // for its whole reply
@@ -626,7 +589,7 @@ struct Server {
         bool ran = false;
         for (auto it = pending.begin(); it != pending.end(); ++it) {
           auto& m = it->second;
-          if (m.size() < m[0]->gsize) continue;
+          if (m.size() < m[0]->grp1) continue;
           auto grp = std::move(m);
           pending.erase(it);
           group(grp);
@@ -665,8 +628,8 @@ struct Server {
         const bool gone = std::all_of(m.begin(), m.end(), [](const ReqP& q) { return q->cancel.load(); });
         if (stale || gone) {
           for (auto& q : m) {
-            error(*q, "group " + std::to_string(q->gid) + ": " + std::to_string(m.size()) + " of " +
-                          std::to_string(q->gsize) + " members arrived");
+            error(*q, "group " + std::to_string(q->grp0) + ": " + std::to_string(m.size()) + " of " +
+                          std::to_string(q->grp1) + " members arrived");
             forget(q->rid);
           }
           it = pending.erase(it);
@@ -676,27 +639,28 @@ struct Server {
   }
 
   void run() {
-    std::thread(reader).detach();
-    if (pool) { run_pool(); return; }
+    auto& in = inbox_state();
+    in.start_reader();
+    if (pool) { run_pool(); in.join(); return; }
     std::deque<ReqP> lone_q;
     std::map<uint32_t, std::vector<ReqP>> pending;  // group id -> members so far
     for (;;) {
       {
-        std::unique_lock<std::mutex> lk(mu);
-        if (inbox.empty() && lone_q.empty() && !closed)
-          cv.wait_for(lk, std::chrono::seconds(pending.empty() ? 3600 : 1));
-        if (closed && inbox.empty() && lone_q.empty()) break;
-        for (auto& q : inbox) {
-          if (q->flags & 2) pending[q->gid].push_back(q);
+        std::unique_lock<std::mutex> lk(in.mu);
+        if (in.queue.empty() && lone_q.empty() && !in.closed)
+          in.cv.wait_for(lk, std::chrono::seconds(pending.empty() ? 3600 : 1));
+        if (in.closed && in.queue.empty() && lone_q.empty()) break;
+        for (auto& q : in.queue) {
+          if (q->flags & 2) pending[q->grp0].push_back(q);
           else lone_q.push_back(q);
         }
-        inbox.clear();
+        in.queue.clear();
       }
       // a complete group first: its members are all waiting; then one lone request
       bool ran = false;
       for (auto it = pending.begin(); it != pending.end(); ++it) {
         auto& m = it->second;
-        if (m.size() < m[0]->gsize) continue;
+        if (m.size() < m[0]->grp1) continue;
         auto grp = std::move(m);
         pending.erase(it);
         group(grp);
@@ -719,14 +683,15 @@ struct Server {
         const bool gone = std::all_of(m.begin(), m.end(), [](const ReqP& q) { return q->cancel.load(); });
         if (stale || gone) {
           for (auto& q : m) {
-            error(*q, "group " + std::to_string(q->gid) + ": " + std::to_string(m.size()) + " of " +
-                          std::to_string(q->gsize) + " members arrived");
+            error(*q, "group " + std::to_string(q->grp0) + ": " + std::to_string(m.size()) + " of " +
+                          std::to_string(q->grp1) + " members arrived");
             forget(q->rid);
           }
           it = pending.erase(it);
         } else ++it;
       }
     }
+    in.join();
   }
 };
 

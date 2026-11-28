@@ -1,4 +1,5 @@
 // DankAttn (Inkling-2-Mini): model loader, kv8 global KV, Wave 2A forward step, rollback, and DSpark MTP drafter.
+#define DANKATTN_MTL4_IMPL
 #import "inkling2.h"
 #import <Foundation/Foundation.h>
 #import <IOKit/ps/IOPowerSources.h>
@@ -280,6 +281,7 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
   dir = pack_dir;
   cap = max_cap;
   use_kv8 = kv8;
+  if (dankattn::env_b("DANKATTN_MTL4", false)) C.track = true;
   {
     NSString* dname = [C.dev name];
     big_gpu = dname && ([dname containsString:@"Ultra"] || [dname containsString:@"Max"]);
@@ -931,6 +933,13 @@ void Model::load(const std::string& pack_dir, uint32_t max_cap, uint32_t passes_
       [C.q addResidencySet:rs];
     }
   }
+  if (dankattn::env_b("DANKATTN_MTL4", false)) {
+    mtl4.init(C.dev);
+    mtl4.add_residency_set(rs);
+    mtl4.add_heap(scratch_heap);
+    mtl4.add_buffers(C.made);
+    fprintf(stderr, "inkling2: Metal 4 command encoding enabled (DANKATTN_MTL4=1, %zu tracked bufs)\n", C.made.size());
+  }
 
   reset();
   // Compute 64-bit FNV-1a fingerprint of pack & KV layout for SSD prefix cache validation.
@@ -989,6 +998,7 @@ void Model::alloc_state(std::vector<LogicalState>& SS, uint32_t global_cap) {
 
 int Model::add_lane(uint32_t global_cap) {
   const uint32_t gcap = global_cap ? global_cap : cap;
+  const size_t prev_made = C.made.size();
   Lane ln;
   const size_t before = C.allocated;
   alloc_state(ln.S, gcap);
@@ -1023,6 +1033,9 @@ int Model::add_lane(uint32_t global_cap) {
     }
     ln.mtp_f_rnn = C.buf(MP * H * sizeof(float));
     if (rs) [rs commit];
+  }
+  if (mtl4.enabled && C.made.size() > prev_made) {
+    mtl4.add_buffers(std::vector<id<MTLBuffer>>(C.made.begin() + long(prev_made), C.made.end()));
   }
   lanes_.push_back(std::move(ln));
   return int(lanes_.size()) - 1;
@@ -1377,13 +1390,15 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   const uint32_t pos = *lanes[0].pos;
   memcpy([b_ids contents], ids.data(), M * sizeof(uint32_t));
 
-  id<MTLCommandBuffer> cb = [C.q commandBuffer];
+  const bool use_m4 = mtl4.enabled && (prof == nullptr);
+  id<MTLCommandBuffer> cb = use_m4 ? nil : [C.q commandBuffer];
+  const double m4_t0 = use_m4 ? dankattn::host_now() : 0.0;
   const bool conc = (prof == nullptr);
   auto new_enc = [&]() -> id<MTLComputeCommandEncoder> {
     return conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder];
   };
-  id<MTLComputeCommandEncoder> enc = new_enc();
+  id<MTLComputeCommandEncoder> enc = use_m4 ? mtl4.begin(/*auto_barrier=*/false) : new_enc();
   // INK_XBAR=n (screen only): n extra empty dispatch + barrier phases after every barrier, to price one phase.
   static const uint32_t xbar = getenv("INK_XBAR") ? uint32_t(atoi(getenv("INK_XBAR"))) : 0u;
   // INK_SKIP=mask (screen only, wrong output): drop op groups + their barriers from the stream to time them.
@@ -1437,7 +1452,7 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   static const bool route_fast = !(getenv("INK_ROUTE_FAST") && atoi(getenv("INK_ROUTE_FAST")) == 0);
   std::vector<id<MTLCommandBuffer>> done_cbs;
   auto early_commit = [&]() {
-    if (prof || !early) return;
+    if (prof || !early || use_m4) return;
     [enc endEncoding];
     [cb commit];
     done_cbs.push_back(cb);
@@ -2563,15 +2578,20 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
     enc_sample(M, 0u);
   }
 
-  [enc endEncoding];
-  [cb commit];
-  [cb waitUntilCompleted];
-  for (id<MTLCommandBuffer> d : done_cbs) {
-    [d waitUntilCompleted];
-    if (d.error) mtl::die("GPU step error", d.error);
+  if (use_m4) {
+    mtl4.commit_and_wait();
+    if (gpu_ms) *gpu_ms = (dankattn::host_now() - m4_t0) * 1000.0;
+  } else {
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    for (id<MTLCommandBuffer> d : done_cbs) {
+      [d waitUntilCompleted];
+      if (d.error) mtl::die("GPU step error", d.error);
+    }
+    if (cb.error) mtl::die("GPU step error", cb.error);
+    if (gpu_ms) *gpu_ms = (cb.GPUEndTime - (done_cbs.empty() ? cb : done_cbs.front()).GPUStartTime) * 1000.0;
   }
-  if (cb.error) mtl::die("GPU step error", cb.error);
-  if (gpu_ms) *gpu_ms = (cb.GPUEndTime - (done_cbs.empty() ? cb : done_cbs.front()).GPUStartTime) * 1000.0;
 
   for (const auto& lr : lanes) *lr.pos += lr.m;
   std::vector<uint32_t> out(M, 0u);

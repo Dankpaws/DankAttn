@@ -5,6 +5,7 @@
 #include "../core/pack.h"
 #include "../lookup.h"
 #include "../mtl.h"
+#include "../core/mtl4.h"
 #include "../mm_args.h"
 #include <algorithm>
 #include <cstdint>
@@ -384,6 +385,7 @@ struct Model {
   id<MTLComputePipelineState> p_df2_topk16_p1, p_df2_topk16_p2, p_df2_select, p_df2_w6_gu;
   id<MTLResidencySet> rs = nil;
   id<MTLHeap> scratch_heap = nil;
+  dankattn::Mtl4Runtime mtl4;
 
   // Scratch buffers (sized for MAXM = 16)
   id<MTLBuffer> b_ids, b_h, b_pre_h, b_prev_h, b_blocks, b_pre_blocks, b_prev_blocks;

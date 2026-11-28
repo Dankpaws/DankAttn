@@ -9,14 +9,7 @@
 // 1 active request uses full DFly2 + context-lookup speculation; 2+ active requests speculate jointly: each lane
 // drafts, one step_lanes() verifies every lane's rows (HY4_JS=0: plain one-row lanes).
 #include "../core/pcache.h"
-#include "../core/proto.h"
-#include "../core/sample.h"
-#include <atomic>
-#include <condition_variable>
-#include <deque>
-#include <memory>
-#include <mutex>
-#include <thread>
+#include "../core/scheduler.h"
 
 namespace serve {
 
@@ -24,64 +17,15 @@ using dankattn::proto::END;
 using dankattn::proto::ERR;
 using dankattn::proto::READY;
 using dankattn::proto::VisImg;
-using Req = dankattn::proto::OpusReq;
-using ReqP = std::shared_ptr<Req>;
+using dankattn::sched::Req;
+using dankattn::sched::ReqP;
 
-std::mutex mu;
-std::condition_variable cv;
-std::deque<ReqP> inbox;
-std::map<uint32_t, ReqP> live;
-std::map<uint32_t, std::deque<std::vector<uint32_t>>> mask_q;  // rid -> pending OPMK allowed-ID lists
-bool closed = false;
+static dankattn::sched::Inbox& inbox_state() { static dankattn::sched::Inbox in; return in; }
 
 void put(uint32_t rid, uint32_t w) { dankattn::proto::put(rid, w, false); }
 void error(uint32_t rid, const std::string& msg) {
   dankattn::proto::send_err(rid, msg);
   fprintf(stderr, "hy4: rid %u refused: %s\n", rid, msg.c_str());
-}
-
-static bool pop_mask(uint32_t rid, const std::atomic<bool>& cancel, std::vector<uint32_t>& out) {
-  std::unique_lock<std::mutex> g(mu);
-  cv.wait(g, [&] {
-    if (closed || cancel.load()) return true;
-    auto it = mask_q.find(rid);
-    return it != mask_q.end() && !it->second.empty();
-  });
-  auto it = mask_q.find(rid);
-  if (it == mask_q.end() || it->second.empty()) return false;
-  out = std::move(it->second.front());
-  it->second.pop_front();
-  return true;
-}
-
-void reader() {
-  const dankattn::proto::ReadOpts ropts{.keep_images = true, .parse_fpr_suffixes = false};
-  for (;;) {
-    auto q = std::make_shared<Req>();
-    uint32_t ctrl_rid = 0;
-    std::vector<uint32_t> mask_ids;
-    const auto kind = dankattn::proto::read_packet(*q, ctrl_rid, ropts, stdin, &mask_ids);
-    if (kind == dankattn::proto::PacketKind::Eof) break;
-    if (kind == dankattn::proto::PacketKind::Cancel) {
-      std::lock_guard<std::mutex> g(mu);
-      if (auto it = live.find(ctrl_rid); it != live.end()) it->second->cancel = true;
-      cv.notify_all();
-      continue;
-    }
-    if (kind == dankattn::proto::PacketKind::Mask) {
-      std::lock_guard<std::mutex> g(mu);
-      mask_q[ctrl_rid].push_back(std::move(mask_ids));
-      cv.notify_all();
-      continue;
-    }
-    std::lock_guard<std::mutex> g(mu);
-    live[q->rid] = q;
-    inbox.push_back(q);
-    cv.notify_all();
-  }
-  std::lock_guard<std::mutex> g(mu);
-  closed = true;
-  cv.notify_all();
 }
 
 // feed toks (prefill chunks or one verify / decode step); returns the next token and where the source
@@ -138,8 +82,8 @@ struct PrefixCache {
     load_res = hy4::Model::PrefixLoad{};
     auto do_read = [this, &m, path]() {
       m.load_prefix_into(0, path, load_res);
-      { std::lock_guard<std::mutex> g(mu); loading.store(false); }
-      cv.notify_one();
+      { std::lock_guard<std::mutex> g(inbox_state().mu); loading.store(false); }
+      inbox_state().notify_all();
     };
     if (async) {
       loading.store(true);
@@ -241,8 +185,8 @@ struct PrefixCache {
         fprintf(stderr, "hy4: pcache: saved %u tokens (%.2f GB) in %.0f ms; %zu files, %.2f GB, %.1f GB free\n",
                 snap->pos, en.bytes / 1e9, ms, nfiles, tot / 1e9, fdsk / 1e9);
       }
-      { std::lock_guard<std::mutex> g(mu); saving.store(false); }
-      cv.notify_one();
+      { std::lock_guard<std::mutex> g(inbox_state().mu); saving.store(false); }
+      inbox_state().notify_all();
     };
     if (async) {
       saving.store(true);
@@ -277,7 +221,7 @@ struct Active {
   uint32_t nthink = 0, n = 0;
   hy4spec::Stats st;
   bool is_stop(const hy4::Model& m, uint32_t t) const {
-    return t == m.eos || std::find(q->stops.begin(), q->stops.end(), t) != q->stops.end();
+    return dankattn::sched::is_stop_token(m.eos, *q, t);
   }
 };
 
@@ -300,25 +244,15 @@ static bool emit_tok(hy4::Model& m, Active& a, uint32_t t) {
 }
 
 static void finish_active(Active& a, std::vector<bool>& slot_busy) {
-  const float wall = std::chrono::duration<float>(std::chrono::steady_clock::now() - a.t0).count() * 1e3f;
-  put(a.q->rid, END);
   const auto& st = a.st;
-  uint32_t s6[6] = {a.reused, uint32_t(a.q->ids.size()), a.n, st.rounds, st.accepted, a.length ? 1u : 0u};
-  float f2[2] = {float(a.pms), wall};
-  fwrite(s6, 4, 6, stdout);
-  fwrite(f2, 4, 2, stdout);
-  fflush(stdout);
   char sb[256] = "";
   if (a.spec && st.rounds)
     snprintf(sb, sizeof sb, " spec %u rounds, %u accepted, %.1f rows/round, draft %.1f / verify %.1f ms/round, %u lookup-only, lookup %u/%u",
              st.rounds, st.accepted, double(st.rows) / st.rounds, st.draft_ms / st.rounds, st.verify_ms / st.rounds, st.lk_only,
              st.lk_accepted, st.lk_tested);
-  fprintf(stderr, "hy4: rid %u slot %d prompt %zu (reused %u, prefill %.0f ms) gen %u in %.0f ms%s\n",
-          a.q->rid, a.slot, a.q->ids.size(), a.reused, a.pms, a.n, wall, sb);
+  dankattn::sched::finish_request(inbox_state(), *a.q, a.reused, a.n, st.rounds, st.accepted, a.length, a.pms, a.t0,
+                                  "hy4", "slot", a.slot, sb);
   if (a.slot >= 0) slot_busy[a.slot] = false;
-  std::lock_guard<std::mutex> g(mu);
-  live.erase(a.q->rid);
-  mask_q.erase(a.q->rid);
 }
 
 static void apply_sampling(hy4::Model& m, const Req& q) {
@@ -353,48 +287,54 @@ static int pick_free_slot(hy4::Model& m, const Req& q, const std::vector<bool>& 
 }
 
 static void admit_requests(hy4::Model& m, std::vector<Active>& active, std::vector<bool>& slot_busy) {
+  auto& in = inbox_state();
   for (;;) {
     ReqP q;
     {
-      std::lock_guard<std::mutex> g(mu);
-      if (inbox.empty()) return;
+      std::lock_guard<std::mutex> g(in.mu);
+      if (in.queue.empty()) return;
       // Validate front request or find first request that fits a free slot
       bool found = false;
-      for (auto it = inbox.begin(); it != inbox.end();) {
+      for (auto it = in.queue.begin(); it != in.queue.end();) {
         ReqP cand = *it;
         if (cand->cancel.load()) {
-          live.erase(cand->rid);
-          it = inbox.erase(it);
+          in.live.erase(cand->rid);
+          in.mask_q.erase(cand->rid);
+          it = in.queue.erase(it);
           continue;
         }
         if (cand->flags & 2) {
           error(cand->rid, "hy4: fanout groups (flags & 2) are not supported");
-          live.erase(cand->rid);
-          it = inbox.erase(it);
+          in.live.erase(cand->rid);
+          in.mask_q.erase(cand->rid);
+          it = in.queue.erase(it);
           continue;
         }
         if ((cand->flags & 32) && !cand->imgs.empty() && !m.has_vision) {
           error(cand->rid, "hy4: pack has no vision tower");
-          live.erase(cand->rid);
-          it = inbox.erase(it);
+          in.live.erase(cand->rid);
+          in.mask_q.erase(cand->rid);
+          it = in.queue.erase(it);
           continue;
         }
         if (cand->ids.empty()) {
           error(cand->rid, "empty prompt");
-          live.erase(cand->rid);
-          it = inbox.erase(it);
+          in.live.erase(cand->rid);
+          in.mask_q.erase(cand->rid);
+          it = in.queue.erase(it);
           continue;
         }
         if (cand->ids.size() + 1 > m.slots_[0].cap) {
           error(cand->rid, "prompt of " + std::to_string(cand->ids.size()) + " tokens exceeds the context capacity of " +
                                std::to_string(m.slots_[0].cap));
-          live.erase(cand->rid);
-          it = inbox.erase(it);
+          in.live.erase(cand->rid);
+          in.mask_q.erase(cand->rid);
+          it = in.queue.erase(it);
           continue;
         }
         if (pick_free_slot(m, *cand, slot_busy) >= 0) {
           q = cand;
-          inbox.erase(it);
+          in.queue.erase(it);
           found = true;
           break;
         }
@@ -404,8 +344,7 @@ static void admit_requests(hy4::Model& m, std::vector<Active>& active, std::vect
     }
     const int sl = pick_free_slot(m, *q, slot_busy);
     if (sl < 0) {
-      std::lock_guard<std::mutex> g(mu);
-      inbox.push_front(q);
+      in.push_front(q);
       return;
     }
     PrefixCache& pc = pcache();
@@ -421,8 +360,7 @@ static void admit_requests(hy4::Model& m, std::vector<Active>& active, std::vect
         const bool use_async = !active.empty();
         if (pc.save(m, restore ? pc.ents[e].path : "", use_async)) {
           slot_busy[0] = true;
-          std::lock_guard<std::mutex> g(mu);
-          inbox.push_front(q);
+          in.push_front(q);
           return;
         }
       }
@@ -432,8 +370,7 @@ static void admit_requests(hy4::Model& m, std::vector<Active>& active, std::vect
           const bool use_async = !active.empty();
           if (pc.start_load(m, pc.ents[ei].path, q->rid, c0, use_async)) {
             slot_busy[0] = true;
-            std::lock_guard<std::mutex> g(mu);
-            inbox.push_front(q);
+            in.push_front(q);
             return;
           }
         }
@@ -487,7 +424,8 @@ int main(hy4::Model& m) {
     mtl::check_wired_limit(m.mapped_bytes + m.C.allocated, m.C.dev);
   }
   pcache().init(m, mtl::tree_root() + "/pcache");
-  std::thread rt(reader);
+  auto& in = inbox_state();
+  in.start_reader(dankattn::proto::ReadOpts{.keep_images = true, .parse_fpr_suffixes = false});
   put(0, READY);
   fflush(stdout);
 
@@ -508,9 +446,7 @@ int main(hy4::Model& m) {
     }
     admit_requests(m, active, slot_busy);
     if (active.empty()) {
-      std::unique_lock<std::mutex> g(mu);
-      cv.wait(g, [&] { return closed || (!inbox.empty() && !pcache().saving.load() && !pcache().loading.load()); });
-      if (inbox.empty() && closed) break;
+      if (!in.wait_for_work([&] { return !pcache().saving.load() && !pcache().loading.load(); })) break;
       continue;
     }
     @autoreleasepool {
@@ -526,12 +462,8 @@ int main(hy4::Model& m) {
       // 2) Prefill one chunk for the first prefilling request (adaptive chunk cap when decode lanes are active)
       uint32_t n_decoding = 0;
       for (const auto& a : active) if (!a.prefilling) n_decoding++;
-      const uint32_t base_dec_chunk = (n_decoding >= 2u)
-          ? std::max<uint32_t>(64u, hy4::cfg().pf_dec_chunk / 2u)
-          : hy4::cfg().pf_dec_chunk;
-      const uint32_t pf_chunk = n_decoding > 0u
-          ? std::min(m.MR, std::max<uint32_t>(hy4::MAXM + 1, (base_dec_chunk / 16) * 16))
-          : m.MR;
+      const uint32_t pf_chunk = dankattn::sched::adaptive_pf_chunk(
+          m.MR, hy4::cfg().pf_dec_chunk, hy4::MAXM + 1u, n_decoding, 16u);
       for (size_t i = 0; i < active.size(); i++) {
         if (!active[i].prefilling) continue;
         Active& a = active[i];
@@ -600,20 +532,7 @@ int main(hy4::Model& m) {
           a.b = m.step(c, &g, want_step_lg ? &step_lg : nullptr).back();
         }
         if (want_step_lg && !step_lg.empty()) {
-          std::vector<uint32_t> allowed;
-          const bool constrained = (a.q->flags & 64u) != 0u;
-          if (!constrained || pop_mask(a.q->rid, a.q->cancel, allowed)) {
-            float lp_val = 0.0f;
-            std::vector<std::pair<uint32_t, float>> tops;
-            const bool want_lp = (a.q->flags & 128u) != 0u;
-            a.b = dankattn::sample::sample_and_logprobs(
-                step_lg.data(), m.vocab, constrained ? &allowed : nullptr,
-                a.q->temp > 0 ? a.q->temp : 0.0f,
-                (a.q->top_p > 0.0f && a.q->top_p <= 1.0f) ? a.q->top_p : 1.0f,
-                a.q->top_k, a.q->min_p >= 0.0f ? a.q->min_p : m.default_min_p,
-                a.q->seed, m.pos, want_lp, a.q->top_logprobs, lp_val, tops);
-            if (want_lp) dankattn::proto::send_logprob(a.q->rid, a.b, lp_val, tops);
-          }
+          dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab, m.default_min_p, m.pos, a.b);
         }
         a.pms += g;
         a.pref_off = end;
@@ -673,21 +592,8 @@ int main(hy4::Model& m) {
             if (need_lg) {
               std::vector<float> step_lg;
               a.b = m.step({a.b}, nullptr, &step_lg).back();
-              std::vector<uint32_t> allowed;
-              const bool constrained = (a.q->flags & 64u) != 0u;
-              if (constrained && !pop_mask(a.q->rid, a.q->cancel, allowed)) {
+              if (!dankattn::sched::sample_masked_or_logprobs(in, *a.q, step_lg.data(), m.vocab, m.default_min_p, m.pos, a.b)) {
                 stop = true;
-              } else {
-                float lp_val = 0.0f;
-                std::vector<std::pair<uint32_t, float>> tops;
-                const bool want_lp = (a.q->flags & 128u) != 0u;
-                a.b = dankattn::sample::sample_and_logprobs(
-                    step_lg.data(), m.vocab, constrained ? &allowed : nullptr,
-                    a.q->temp > 0 ? a.q->temp : 0.0f,
-                    (a.q->top_p > 0.0f && a.q->top_p <= 1.0f) ? a.q->top_p : 1.0f,
-                    a.q->top_k, a.q->min_p >= 0.0f ? a.q->min_p : m.default_min_p,
-                    a.q->seed, m.pos, want_lp, a.q->top_logprobs, lp_val, tops);
-                if (want_lp) dankattn::proto::send_logprob(a.q->rid, a.b, lp_val, tops);
               }
             } else {
               a.b = m.step({a.b}).back();
@@ -778,7 +684,7 @@ int main(hy4::Model& m) {
       }
     }
   }
-  rt.join();
+  in.join();
   // a clean stop (stdin closed) keeps the main conversation for the next start
   pcache().wait_save();
   pcache().wait_load();

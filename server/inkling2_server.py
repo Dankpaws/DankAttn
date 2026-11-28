@@ -20,8 +20,8 @@ from fastapi.responses import Response, StreamingResponse
 import uvicorn
 
 from engine_frontend import (
-    BadRequest, ClientGone, EngineProc, PayloadTooLarge, PrefixSplicer, Unavailable, Watch,
-    add_security_args, api_error, bad_request, error_response, install_security_middleware,
+    BadRequest, ClientGone, ConstrainedDriver, EngineProc, PayloadTooLarge, PrefixSplicer, Unavailable, Watch,
+    add_security_args, api_error, bad_request, error_response, format_logprob_entry, install_security_middleware,
     json_body, make_jinja_env, normalize_messages, num, parse_chat_params, payload_too_large,
     register_common_routes, safe_template_kwargs, unavailable,
 )
@@ -718,18 +718,33 @@ async def chat(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     held_ids = list(ids)
 
+    rf = p["response_format"]
+    top_lp = p["top_logprobs"]
+    group_arg = (fpr["lanes"], fpr["quorum"], 0 | (fpr["prune"] << 4)) if (fpr and fpr["mode"] == "select") else None
+    cdrv = (
+        ConstrainedDriver(
+            eng, tok, rf, tuple(STOPS) + tuple(extra_stops),
+            prompt.endswith("<|content_thinking|>"), "<|content_text|>",
+        )
+        if (rf and group_arg is None) else None
+    )
+
     def track(item):
         if isinstance(item, int):
             held_ids.append(item)
+            if cdrv is not None:
+                cdrv.on_token(item)
         elif isinstance(item, dict) and "error" not in item:
             splicer.hold(held_ids)
         loop.call_soon_threadsafe(q.put_nowait, item)
 
     cb = eng.metered(track)
-    group_arg = (fpr["lanes"], fpr["quorum"], 0 | (fpr["prune"] << 4)) if (fpr and fpr["mode"] == "select") else None
     try:
         eid = eng.submit(ids, max_new, not args.no_spec, temp, top_p, top_k, seed, cb,
-                         group=group_arg, think_budget=budget, min_p=min_p, extra_stops=extra_stops)
+                         group=group_arg, think_budget=budget, min_p=min_p, extra_stops=extra_stops,
+                         constrained=(cdrv is not None), top_logprobs=(top_lp if group_arg is None else None))
+        if cdrv is not None:
+            cdrv.start(eid)
     except Unavailable as e:
         cb({"error": str(e)})
         return unavailable(str(e))
@@ -769,9 +784,12 @@ async def chat(request: Request):
         if isinstance(first, dict) and "error" in first:
             return error_response(first["error"])
 
-        def chunk(delta, finish=None, usage=None):
+        def chunk(delta, finish=None, usage=None, logprobs=None):
+            choice = {"index": 0, "delta": delta, "finish_reason": finish}
+            if logprobs is not None:
+                choice["logprobs"] = logprobs
             d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": resp_model,
-                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                 "choices": [choice]}
             if usage:
                 d["usage"] = usage
             return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
@@ -781,6 +799,7 @@ async def chat(request: Request):
             try:
                 yield chunk({"role": "assistant", "content": ""})
                 held, stopped, n_calls = "", False, 0
+                pending_lp = None
                 pending = [first]
                 while True:
                     item = pending.pop() if pending else await q.get()
@@ -794,26 +813,35 @@ async def chat(request: Request):
                         yield chunk({}, "stop" if stopped else finish_of(item), usage_of(item))
                         yield "data: [DONE]\n\n"
                         break
+                    if isinstance(item, tuple) and item[0] == "logprob":
+                        pending_lp = format_logprob_entry(tok, item[1], item[2], item[3])
+                        continue
                     if stopped:
                         continue
+                    lp_obj = {"content": [pending_lp]} if pending_lp is not None else None
+                    pending_lp = None
                     for kind, v in ps.push(item):
                         if kind == "reasoning":
-                            yield chunk({"reasoning_content": v})
+                            yield chunk({"reasoning_content": v}, logprobs=lp_obj)
+                            lp_obj = None
                         elif kind == "tool":
-                            yield chunk({"tool_calls": [dict(v, index=n_calls)]})
+                            yield chunk({"tool_calls": [dict(v, index=n_calls)]}, logprobs=lp_obj)
+                            lp_obj = None
                             n_calls += 1
                         else:
                             held += v
                             cut = first_stop(held) if stop_strs else None
                             if cut is not None:
                                 if cut > 0:
-                                    yield chunk({"content": held[:cut]})
+                                    yield chunk({"content": held[:cut]}, logprobs=lp_obj)
+                                    lp_obj = None
                                 held, stopped = "", True
                                 eng.cancel(eid)
                                 break
                             keep = max_stop_len - 1 if max_stop_len > 1 else 0
                             if len(held) > keep:
-                                yield chunk({"content": held[:len(held) - keep] if keep else held})
+                                yield chunk({"content": held[:len(held) - keep] if keep else held}, logprobs=lp_obj)
+                                lp_obj = None
                                 held = held[len(held) - keep:] if keep else ""
                 done = True
             finally:
@@ -823,6 +851,7 @@ async def chat(request: Request):
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     stopped = False
+    lp_entries = []
     try:
         while True:
             item = await watch.get()
@@ -830,6 +859,9 @@ async def chat(request: Request):
                 if "error" in item:
                     return error_response(item["error"])
                 break
+            if isinstance(item, tuple) and item[0] == "logprob":
+                lp_entries.append(format_logprob_entry(tok, item[1], item[2], item[3]))
+                continue
             if stopped:
                 continue
             ps.push(item)
@@ -850,8 +882,11 @@ async def chat(request: Request):
         msg["reasoning_content"] = ps.reasoning
     if ps.calls:
         msg["tool_calls"] = ps.calls
+    choice_out = {"index": 0, "message": msg, "finish_reason": "stop" if stopped else finish_of(item)}
+    if lp_entries:
+        choice_out["logprobs"] = {"content": lp_entries}
     return {"id": rid, "object": "chat.completion", "created": created, "model": resp_model,
-            "choices": [{"index": 0, "message": msg, "finish_reason": "stop" if stopped else finish_of(item)}],
+            "choices": [choice_out],
             "usage": usage_of(item)}
 
 
