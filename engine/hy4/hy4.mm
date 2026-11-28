@@ -2247,7 +2247,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   double m4_t0 = 0.0;
   if (use_m4) {
     m4_t0 = host_now();
-    rc.mtl4_e = mtl4.begin(/*auto_barrier=*/false);
+    rc.mtl4_e = mtl4.begin(/*auto_barrier=*/true);
   } else {
     rc.cb = [C.q commandBuffer];
   }
@@ -2358,8 +2358,9 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
     std::vector<uint32_t> out(MH);
     memcpy(out.data(), amax.contents, MH * 4);
     if (logits_out) {
-      logits_out->resize(size_t(MH) * lm_head.N);
-      memcpy(logits_out->data(), logits.contents, logits_out->size() * 4);
+      logits_out->resize(size_t(MH) * vocab);
+      for (uint32_t r = 0; r < MH; r++)
+        memcpy(logits_out->data() + size_t(r) * vocab, (float*)logits.contents + size_t(r) * lm_head.N, vocab * 4);
     }
     return out;
   }

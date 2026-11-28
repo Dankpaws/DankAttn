@@ -26,6 +26,7 @@
   size_t _cbuf_cap;
   bool _auto_barrier;  // true for serial-equivalent mode (barrier before every dispatch > 0)
   bool _dispatched;
+  bool _barrier_done;  // true if an explicit barrier was already emitted since the last dispatch
   bool _at_dirty;
 }
 - (void)resetState;
@@ -50,6 +51,7 @@
   _bound_pso = nil;
   _bound_mask = 0u;
   _dispatched = false;
+  _barrier_done = false;
   _at_dirty = true;
 }
 - (void)setBakedTable:(id<MTL4ArgumentTable>)table {
@@ -92,15 +94,17 @@
 }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
   (void)scope;
+  if (_barrier_done) return;
   [_enc barrierAfterEncoderStages:MTLStageDispatch
               beforeEncoderStages:MTLStageDispatch
-                visibilityOptions:MTL4VisibilityOptionNone];
+                visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
+  _barrier_done = true;
 }
 - (void)dispatchThreadgroups:(MTLSize)grid threadsPerThreadgroup:(MTLSize)tg {
-  if (_auto_barrier && _dispatched) {
+  if (_auto_barrier && _dispatched && !_barrier_done) {
     [_enc barrierAfterEncoderStages:MTLStageDispatch
                 beforeEncoderStages:MTLStageDispatch
-                  visibilityOptions:MTL4VisibilityOptionNone];
+                  visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
   }
   if (_baked_at) {
     [_enc setArgumentTable:_baked_at];
@@ -112,12 +116,13 @@
   }
   [_enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
   _dispatched = true;
+  _barrier_done = false;
 }
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tg {
-  if (_auto_barrier && _dispatched) {
+  if (_auto_barrier && _dispatched && !_barrier_done) {
     [_enc barrierAfterEncoderStages:MTLStageDispatch
                 beforeEncoderStages:MTLStageDispatch
-                  visibilityOptions:MTL4VisibilityOptionNone];
+                  visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
   }
   if (_baked_at) {
     [_enc setArgumentTable:_baked_at];
@@ -129,14 +134,15 @@
   }
   [_enc dispatchThreads:threads threadsPerThreadgroup:tg];
   _dispatched = true;
+  _barrier_done = false;
 }
 - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)buf
                           indirectBufferOffset:(NSUInteger)off
                          threadsPerThreadgroup:(MTLSize)tg {
-  if (_auto_barrier && _dispatched) {
+  if (_auto_barrier && _dispatched && !_barrier_done) {
     [_enc barrierAfterEncoderStages:MTLStageDispatch
                 beforeEncoderStages:MTLStageDispatch
-                  visibilityOptions:MTL4VisibilityOptionNone];
+                  visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
   }
   if (_baked_at) {
     [_enc setArgumentTable:_baked_at];
@@ -148,6 +154,7 @@
   }
   [_enc dispatchThreadgroupsWithIndirectBuffer:(buf.gpuAddress + off) threadsPerThreadgroup:tg];
   _dispatched = true;
+  _barrier_done = false;
 }
 - (void)endEncoding {
   if (_enc) {
@@ -280,11 +287,11 @@ struct Mtl4Runtime {
     if (!proxy->_enc) return;
     [proxy->_enc barrierAfterEncoderStages:MTLStageDispatch
                        beforeEncoderStages:MTLStageBlit
-                         visibilityOptions:MTL4VisibilityOptionNone];
+                         visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
     [proxy->_enc copyFromBuffer:src sourceOffset:soff toBuffer:dst destinationOffset:doff size:sz];
     [proxy->_enc barrierAfterEncoderStages:MTLStageBlit
                        beforeEncoderStages:MTLStageDispatch
-                         visibilityOptions:MTL4VisibilityOptionNone];
+                         visibilityOptions:(MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias)];
   }
 
   void commit_and_wait() {
