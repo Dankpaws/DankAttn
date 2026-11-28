@@ -1,4 +1,5 @@
 #include "hy4.h"
+#include "../core/runtime.h"
 #include "../mm_args.h"
 #include <cmath>
 #include <fcntl.h>
@@ -18,78 +19,14 @@
 
 namespace hy4 {
 
-static NSDictionary* jload(const std::string& p) {
-  NSData* d = [NSData dataWithContentsOfFile:@(p.c_str())];
-  if (!d) mtl::die(("read " + p).c_str());
-  NSError* e = nil;
-  NSDictionary* j = [NSJSONSerialization JSONObjectWithData:d options:0 error:&e];
-  if (!j) mtl::die(("parse " + p).c_str(), e);
-  return j;
-}
+using dankattn::host_now;
+using dankattn::jload;
 
-// per-op encoders with timestamps when profiling, else one serial encoder per command buffer
-static id<MTLCounterSampleBuffer> new_sample_buffer(id<MTLDevice> dev) {
-  MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
-  for (id<MTLCounterSet> cs in dev.counterSets)
-    if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) d.counterSet = cs;
-  d.storageMode = MTLStorageModeShared;
-  d.sampleCount = 4096;
-  NSError* err = nil;
-  id<MTLCounterSampleBuffer> sb = [dev newCounterSampleBufferWithDescriptor:d error:&err];
-  if (!sb) mtl::die("counter sample buffer", err);
-  return sb;
-}
-
-// host clock in seconds on the base of MTLCommandBuffer GPUStartTime / GPUEndTime (CACurrentMediaTime's)
-static double host_now() {
-  static mach_timebase_info_data_t tb;
-  if (!tb.denom) mach_timebase_info(&tb);
-  return double(mach_absolute_time()) * tb.numer / tb.denom / 1e9;
-}
-
-struct Rec {
-  id<MTLCommandBuffer> cb;
-  id<MTLComputeCommandEncoder> e = nil;
-  bool prof = false;
-  bool conc = cfg().conc;
-  std::vector<id<MTLCounterSampleBuffer>> pool;
-  std::vector<std::string> names;
-  id<MTLComputeCommandEncoder> op(const char* name, bool barrier = true) {
-    // timing ablation: HY4_SKIP=<op>[,<op>...] encodes those ops into a buffer that never runs (values go stale:
-    // bench / prof only; ops that steer routing or indexer selection can mislead)
+struct Rec : dankattn::Rec {
+  Rec() {
+    conc = cfg().conc;
     static const std::string skip = getenv("HY4_SKIP") ? "," + std::string(getenv("HY4_SKIP")) + "," : "";
-    if (!skip.empty() && !prof && skip.find("," + std::string(name) + ",") != std::string::npos) {
-      static id<MTLCommandBuffer> dcb = nil;
-      static id<MTLComputeCommandEncoder> de = nil;
-      if (!de) { dcb = [cb.commandQueue commandBuffer]; de = [dcb computeCommandEncoder]; }
-      return de;
-    }
-    if (!prof) {
-      if (!e) {
-        e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
-      } else if (conc && barrier) {
-        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-      }
-      return e;
-    }
-    if (e) [e endEncoding];
-    const size_t b = names.size() / 2048, i = names.size() % 2048;
-    while (pool.size() <= b) pool.push_back(new_sample_buffer(cb.device));
-    MTLComputePassDescriptor* d = [MTLComputePassDescriptor computePassDescriptor];
-    d.sampleBufferAttachments[0].sampleBuffer = pool[b];
-    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * i;
-    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * i + 1;
-    e = [cb computeCommandEncoderWithDescriptor:d];
-    names.push_back(name);
-    return e;
-  }
-  void resolve(std::map<std::string, double>& out) {
-    for (size_t b = 0; b * 2048 < names.size(); b++) {
-      const size_t n = std::min<size_t>(2048, names.size() - b * 2048);
-      NSData* d = [pool[b] resolveCounterRange:NSMakeRange(0, 2 * n)];
-      const MTLCounterResultTimestamp* ts = (const MTLCounterResultTimestamp*)d.bytes;
-      for (size_t i = 0; i < n; i++) out[names[b * 2048 + i]] += (ts[2 * i + 1].timestamp - ts[2 * i].timestamp) / 1e6;
-    }
+    skip_csv = &skip;
   }
 };
 

@@ -1,4 +1,5 @@
 #include "model.h"
+#include "core/runtime.h"
 #include "mm_args.h"
 #include "ngram.h"
 #include <cmath>
@@ -10,14 +11,8 @@
 
 namespace opus {
 
-static NSDictionary* jload(const std::string& p) {
-  NSData* d = [NSData dataWithContentsOfFile:@(p.c_str())];
-  if (!d) mtl::die(("read " + p).c_str());
-  NSError* e = nil;
-  NSDictionary* j = [NSJSONSerialization JSONObjectWithData:d options:0 error:&e];
-  if (!j) mtl::die(("parse " + p).c_str(), e);
-  return j;
-}
+using dankattn::jload;
+using dankattn::new_sample_buffer;
 
 struct Args4 { uint32_t N, K, M, ksplit, wstride, sstride, xstride, ystride, yfstride; };
 struct HcArgs { uint32_t M, H, HC, inject, Nd, R, topk; };
@@ -32,72 +27,13 @@ struct CombArgs { uint32_t M, split, H, topk, ssplit; };
 struct AttnArgs { uint32_t M, split, N, nh, nkv, hd, inh, ihd, rot, p0, ratio, cap, budget, row0 = 0, kv8 = 0; };
 struct PleArgs { uint32_t M, split, N, H, HC, par, hist, dil, ksz, mode; };
 
-// Per-op GPU timing: in profile mode every op gets its own encoder with timestamp
-// samples at encoder boundaries; otherwise all ops share one serial encoder.
-// Per-op timestamps: a counter sample buffer holds at most 4096 samples (2048 ops), so profiled steps
-// with more ops (lanes) take further buffers from the model's pool.
-static id<MTLCounterSampleBuffer> new_sample_buffer(id<MTLDevice> dev) {
-  MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
-  for (id<MTLCounterSet> cs in dev.counterSets)
-    if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) d.counterSet = cs;
-  d.storageMode = MTLStorageModeShared;
-  d.sampleCount = 4096;
-  NSError* err = nil;
-  id<MTLCounterSampleBuffer> sb = [dev newCounterSampleBufferWithDescriptor:d error:&err];
-  if (!sb) mtl::die("counter sample buffer", err);
-  return sb;
-}
-constexpr size_t PROF_OPS = 2048;  // ops per sample buffer
+constexpr size_t PROF_OPS = dankattn::Rec::PROF_OPS;
 
-struct Rec {
-  id<MTLCommandBuffer> cb;
-  id<MTLComputeCommandEncoder> e = nil;
-  std::vector<id<MTLCounterSampleBuffer>>* pool = nullptr;
-  std::vector<std::string> names;
-  bool prof = false;
-  bool conc = false;  // concurrent encoder: a buffer barrier before every op unless told otherwise
-  // Early commits: the command buffer is committed after its first chunk0 ops, then every chunk ops,
-  // and encoding continues in a new one on the same queue. The GPU starts (~260 us after a commit)
-  // while the host is still encoding the rest, instead of after all of it (~0.4 ms per step); the
-  // queue runs them in order, so the work and its results are unchanged. finish() waits for all.
-  uint32_t chunk0 = 0, chunk = 0, nops = 0;
-  std::vector<id<MTLCommandBuffer>> sent;
-  void flush() {
-    if (e) [e endEncoding];
-    e = nil;
-    [cb commit];
-    sent.push_back(cb);
-    cb = [cb.commandQueue commandBuffer];
-  }
-  id<MTLComputeCommandEncoder> op(const char* name, bool barrier = true) {
-    // timing ablation: OPUS_SKIP=<op name> encodes that op into a buffer that never runs
-    // (downstream values go stale, so ops that steer MoE routing can mislead)
-    static const char* skip = getenv("OPUS_SKIP");
-    if (skip && !prof && strcmp(skip, name) == 0) {
-      static id<MTLCommandBuffer> dcb = nil;
-      static id<MTLComputeCommandEncoder> de = nil;
-      if (!de) { dcb = [cb.commandQueue commandBuffer]; de = [dcb computeCommandEncoder]; }
-      return de;
-    }
-    if (!prof) {
-      if (chunk0 && e && (++nops == chunk0 || (chunk && nops > chunk0 && (nops - chunk0) % chunk == 0))) flush();
-      if (!e) {
-        e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
-      } else if (conc && barrier) {
-        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-      }
-      return e;
-    }
-    if (e) [e endEncoding];
-    MTLComputePassDescriptor* d = [MTLComputePassDescriptor computePassDescriptor];
-    const size_t b = names.size() / PROF_OPS, i = names.size() % PROF_OPS;
-    while (pool->size() <= b) pool->push_back(new_sample_buffer(cb.device));
-    d.sampleBufferAttachments[0].sampleBuffer = (*pool)[b];
-    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * i;
-    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * i + 1;
-    e = [cb computeCommandEncoderWithDescriptor:d];
-    names.push_back(name);
-    return e;
+struct Rec : dankattn::Rec {
+  Rec() {
+    conc = false;
+    static const std::string skip = getenv("OPUS_SKIP") ? "," + std::string(getenv("OPUS_SKIP")) + "," : "";
+    skip_csv = &skip;
   }
 };
 

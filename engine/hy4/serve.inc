@@ -8,19 +8,20 @@
 // temperature, min_p, top_k, and top_p are applied on GPU (both target sampling and DFly2 drafting).
 // 1 active request uses full DFly2 + context-lookup speculation; 2+ active requests speculate jointly: each lane
 // drafts, one step_lanes() verifies every lane's rows (HY4_JS=0: plain one-row lanes).
+#include "../core/pcache.h"
+#include "../core/proto.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/mount.h>
 
 namespace serve {
 
-constexpr uint32_t END = 0xFFFFFFFFu, ERR = 0xFFFFFFFEu, READY = 0xFFFFFFFDu;
+using dankattn::proto::END;
+using dankattn::proto::ERR;
+using dankattn::proto::READY;
 
 struct VisImg {
   uint32_t T = 0, h = 0, w = 0, tok_off = 0;
@@ -199,10 +200,7 @@ struct PrefixCache {
     return got;
   }
   static uint32_t common(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, size_t n) {
-    uint32_t c = 0;
-    const size_t lim = std::min({a.size(), b.size(), n});
-    while (c < lim && a[c] == b[c]) c++;
-    return c;
+    return dankattn::proto::common_prefix(a, b, n);
   }
   void init(const hy4::Model& m, const std::string& def) {
     dir = hy4::cfg().pcache_set ? hy4::cfg().pcache_dir : def;
@@ -210,30 +208,14 @@ struct PrefixCache {
     budget = size_t(hy4::cfg().pcache_gb * 1e9);
     reserve = size_t(hy4::cfg().pcache_free_gb * 1e9);
     if (!on) return;
-    mkdir(dir.c_str(), 0700);
-    chmod(dir.c_str(), 0700);
-    DIR* d = opendir(dir.c_str());
-    if (!d) { on = false; fprintf(stderr, "hy4: pcache: cannot open %s, off\n", dir.c_str()); return; }
-    std::vector<std::pair<double, Entry>> found;
-    while (dirent* de = readdir(d)) {
-      const std::string n = de->d_name;
-      if (n.size() < 6 || n.substr(n.size() - 5) != ".hy4p") {
-        if (n.size() > 4 && n.substr(n.size() - 4) == ".tmp") unlink((dir + "/" + n).c_str());  // an interrupted save
-        continue;
-      }
-      Entry en;
-      en.path = dir + "/" + n;
-      struct stat st;
-      if (!hy4::Model::prefix_tokens(en.path, m.fingerprint, en.toks, &en.bytes, &en.floor) || stat(en.path.c_str(), &st) != 0) {
-        unlink(en.path.c_str());  // another pack or layout
-        continue;
-      }
-      found.push_back({double(st.st_mtimespec.tv_sec) + st.st_mtimespec.tv_nsec * 1e-9, std::move(en)});
-    }
-    closedir(d);
-    std::sort(found.begin(), found.end(), [](auto& a, auto& b) { return a.first < b.first; });
     size_t tot = 0;
-    for (auto& [t, en] : found) { en.used = ++clock; tot += en.bytes; ents.push_back(std::move(en)); }
+    if (!dankattn::pcache::scan_dir(dir, ".hy4p", ents, clock, tot, [&](const std::string& p, Entry& en) {
+          return hy4::Model::prefix_tokens(p, m.fingerprint, en.toks, &en.bytes, &en.floor);
+        })) {
+      on = false;
+      fprintf(stderr, "hy4: pcache: cannot open %s, off\n", dir.c_str());
+      return;
+    }
     fprintf(stderr, "hy4: pcache %s: %zu files, %.2f GB, budget %.0f GB\n", dir.c_str(), ents.size(), tot / 1e9, budget / 1e9);
   }
   // the file a prompt can restore (the prompt continues its history at least to the file's floor) and the
@@ -264,25 +246,12 @@ struct PrefixCache {
           return false;
         }
       const size_t need = size_t(snap->pos) * 8600 + (size_t(140) << 20);
-      auto total = [&] { size_t t = 0; for (auto& e : ents) t += e.bytes; return t; };
-      auto free_disk = [&]() -> size_t { struct statfs f; return statfs(dir.c_str(), &f) == 0 ? size_t(f.f_bavail) * f.f_bsize : 0; };
-      auto drop_oldest = [&] {
-        long o = -1;
-        for (size_t i = 0; i < ents.size(); i++)
-          if (ents[i].path != protect && (o < 0 || ents[i].used < ents[size_t(o)].used)) o = long(i);
-        if (o < 0) return false;
-        unlink(ents[size_t(o)].path.c_str());
-        ents.erase(ents.begin() + o);
-        return true;
-      };
-      while ((total() + need > budget || free_disk() < reserve + need) && drop_oldest()) {}
-      if (total() + need > budget || free_disk() < reserve + need) {
+      if (!dankattn::pcache::make_room(ents, dir, need, budget, reserve, protect)) {
         fprintf(stderr, "hy4: pcache: no room for %u tokens (%.1f GB free, reserve %.0f GB), not saved\n",
-                snap->pos, free_disk() / 1e9, reserve / 1e9);
+                snap->pos, dankattn::pcache::free_disk_bytes(dir) / 1e9, reserve / 1e9);
         return false;
       }
-      uint64_t h = 1469598103934665603ull;
-      for (uint32_t i = 0; i < snap->pos; i++) { h ^= snap->history[i]; h *= 1099511628211ull; }
+      const uint64_t h = dankattn::proto::fnv1a_tokens(snap->history.data(), snap->pos);
       char nm[64];
       snprintf(nm, sizeof nm, "/%016llx-%u.hy4p", (unsigned long long)h, snap->pos);
       path = dir + nm;
@@ -300,17 +269,12 @@ struct PrefixCache {
         {
           std::lock_guard<std::mutex> lg(pc_mu);
           en.used = ++clock;
-          for (size_t i = 0; i < ents.size();)
-            if (ents[i].path != en.path && common(ents[i].toks, en.toks, ents[i].toks.size()) == ents[i].toks.size()) {
-              unlink(ents[i].path.c_str());
-              ents.erase(ents.begin() + long(i));
-            } else i++;
+          dankattn::pcache::prune_subprefixes(ents, en);
           ents.push_back(std::move(en));
           nfiles = ents.size();
-          for (auto& e : ents) tot += e.bytes;
+          tot = dankattn::pcache::total_bytes(ents);
         }
-        struct statfs f;
-        const size_t fdsk = statfs(dir.c_str(), &f) == 0 ? size_t(f.f_bavail) * f.f_bsize : 0;
+        const size_t fdsk = dankattn::pcache::free_disk_bytes(dir);
         fprintf(stderr, "hy4: pcache: saved %u tokens (%.2f GB) in %.0f ms; %zu files, %.2f GB, %.1f GB free\n",
                 snap->pos, en.bytes / 1e9, ms, nfiles, tot / 1e9, fdsk / 1e9);
       }

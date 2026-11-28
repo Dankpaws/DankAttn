@@ -72,23 +72,7 @@ std::string read_text(const std::string& p) {
   return ss.str();
 }
 
-id<MTLBuffer> mmap_file(id<MTLDevice> dev, const std::string& path, size_t& out_bytes) {
-  int fd = open(path.c_str(), O_RDONLY);
-  if (fd < 0) mtl::die(("open " + path).c_str());
-  struct stat st;
-  if (fstat(fd, &st) != 0) mtl::die(("stat " + path).c_str());
-  size_t sz = size_t(st.st_size);
-  size_t pg = size_t(getpagesize());
-  size_t msz = (sz + pg - 1) & ~(pg - 1);
-  void* ptr = mmap(nullptr, msz, PROT_READ, MAP_PRIVATE, fd, 0);
-  close(fd);
-  if (ptr == MAP_FAILED) mtl::die(("mmap " + path).c_str());
-  id<MTLBuffer> buf = [dev newBufferWithBytesNoCopy:ptr length:msz options:MTLResourceStorageModeShared
-                                        deallocator:^(void* p, NSUInteger l) { munmap(p, l); }];
-  if (!buf) mtl::die(("metal mmap buffer " + path).c_str());
-  out_bytes += sz;
-  return buf;
-}
+using dankattn::mmap_file;
 
 // Kernel argument structs matching engine/kernels/inkling2.metal
 struct AttnResArgs { uint32_t H, M, n_prev, b_stride; float eps; };

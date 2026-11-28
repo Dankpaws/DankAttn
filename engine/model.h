@@ -1,5 +1,6 @@
 // DankAttn: Qwen3.8-Flash-Next (qwen4_exp) on a DankAttn pack, M <= 16 rows per step.
 #pragma once
+#include "core/pack.h"
 #include "mtl.h"
 #include <cstdint>
 #include <string>
@@ -26,17 +27,8 @@ constexpr uint32_t MP = OPUS_MP;  // prefill rows per step
 constexpr int NSLOT = 16;       // per-call RoPE / token slots inside one command buffer
 constexpr uint32_t MAXD = 7;    // most MTP drafts per round
 
-struct Lin {  // register-direct matmul weight
-  id<MTLBuffer> w, s;
-  size_t woff = 0, soff = 0;
-  uint32_t N = 0, K = 0, bits = 0, gs = 0, experts = 1, ksplit = 1, sgs = 1;
-  std::map<std::string, std::pair<uint32_t, uint32_t>> rows;
-};
-
-struct Raw {
-  id<MTLBuffer> b;
-  size_t off = 0, bytes = 0;
-};
+using dankattn::Lin;
+using dankattn::Raw;
 
 struct Layer {
   bool attn = false, ple = false;

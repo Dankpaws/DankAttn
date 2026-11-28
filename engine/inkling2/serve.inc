@@ -15,14 +15,14 @@
 // its last prefill (sconv states are checkpointed there; the local KV rings must still hold the window before
 // it, so at most MP + INK_RING_SLACK tokens may have followed). Clients that drop reasoning from earlier turns
 // land on the checkpoint. Anything else re-prefills from zero.
+#include "../core/env.h"
+#include "../core/pcache.h"
+#include "../core/proto.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
-#include <dirent.h>
 #include <memory>
 #include <mutex>
-#include <sys/mount.h>
-#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 
@@ -40,45 +40,23 @@ struct PrefixCache {
   std::vector<Entry> ents;
 
   static uint32_t common(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, size_t n) {
-    uint32_t c = 0;
-    const size_t lim = std::min({a.size(), b.size(), n});
-    while (c < lim && a[c] == b[c]) c++;
-    return c;
+    return dankattn::proto::common_prefix(a, b, n);
   }
 
   void init(const ink2::Model& m, const std::string& def) {
-    const char* env_d = getenv("INK_PCACHE");
-    dir = env_d ? std::string(env_d) : def;
+    dir = dankattn::env_s("INK_PCACHE", def);
     on = !dir.empty() && dir != "0";
-    const double gb = getenv("INK_PCACHE_GB") ? atof(getenv("INK_PCACHE_GB")) : 20.0;
-    const double fgb = getenv("INK_PCACHE_FREE_GB") ? atof(getenv("INK_PCACHE_FREE_GB")) : 15.0;
-    budget = size_t(std::max(0.0, gb) * 1e9);
-    reserve = size_t(std::max(0.0, fgb) * 1e9);
+    budget = size_t(std::max(0.0, dankattn::env_f("INK_PCACHE_GB", 20.0)) * 1e9);
+    reserve = size_t(std::max(0.0, dankattn::env_f("INK_PCACHE_FREE_GB", 15.0)) * 1e9);
     if (!on) return;
-    mkdir(dir.c_str(), 0700);
-    chmod(dir.c_str(), 0700);
-    DIR* d = opendir(dir.c_str());
-    if (!d) { on = false; fprintf(stderr, "inkling2: pcache: cannot open %s, off\n", dir.c_str()); return; }
-    std::vector<std::pair<double, Entry>> found;
-    while (dirent* de = readdir(d)) {
-      const std::string n = de->d_name;
-      if (n.size() < 6 || n.substr(n.size() - 5) != ".inkp") {
-        if (n.size() > 4 && n.substr(n.size() - 4) == ".tmp") unlink((dir + "/" + n).c_str());
-        continue;
-      }
-      Entry en;
-      en.path = dir + "/" + n;
-      struct stat st{};
-      if (!ink2::Model::prefix_tokens(en.path, m.fingerprint, en.toks, &en.bytes) || stat(en.path.c_str(), &st) != 0) {
-        unlink(en.path.c_str());
-        continue;
-      }
-      found.push_back({double(st.st_mtimespec.tv_sec) + st.st_mtimespec.tv_nsec * 1e-9, std::move(en)});
-    }
-    closedir(d);
-    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     size_t tot = 0;
-    for (auto& [t, en] : found) { en.used = ++clock; tot += en.bytes; ents.push_back(std::move(en)); }
+    if (!dankattn::pcache::scan_dir(dir, ".inkp", ents, clock, tot, [&](const std::string& p, Entry& en) {
+          return ink2::Model::prefix_tokens(p, m.fingerprint, en.toks, &en.bytes);
+        })) {
+      on = false;
+      fprintf(stderr, "inkling2: pcache: cannot open %s, off\n", dir.c_str());
+      return;
+    }
     fprintf(stderr, "inkling2: pcache %s: %zu files, %.2f GB, budget %.0f GB\n", dir.c_str(), ents.size(), tot / 1e9, budget / 1e9);
   }
 
@@ -106,25 +84,12 @@ struct PrefixCache {
       }
     }
     const size_t need = size_t(m.pos) * 22000u + (size_t(190) << 20);
-    auto total = [&] { size_t t = 0; for (const auto& e : ents) t += e.bytes; return t; };
-    auto free_disk = [&]() -> size_t { struct statfs f{}; return statfs(dir.c_str(), &f) == 0 ? size_t(f.f_bavail) * f.f_bsize : 0; };
-    auto drop_oldest = [&] {
-      long o = -1;
-      for (size_t i = 0; i < ents.size(); i++)
-        if (ents[i].path != protect && (o < 0 || ents[i].used < ents[size_t(o)].used)) o = long(i);
-      if (o < 0) return false;
-      unlink(ents[size_t(o)].path.c_str());
-      ents.erase(ents.begin() + o);
-      return true;
-    };
-    while ((total() + need > budget || free_disk() < reserve + need) && drop_oldest()) {}
-    if (total() + need > budget || free_disk() < reserve + need) {
+    if (!dankattn::pcache::make_room(ents, dir, need, budget, reserve, protect)) {
       fprintf(stderr, "inkling2: pcache: no room for %u tokens (%.1f GB free, reserve %.0f GB)\n",
-              m.pos, free_disk() / 1e9, reserve / 1e9);
+              m.pos, dankattn::pcache::free_disk_bytes(dir) / 1e9, reserve / 1e9);
       return false;
     }
-    uint64_t h = 1469598103934665603ull;
-    for (uint32_t i = 0; i < m.pos; i++) { h ^= hist[i]; h *= 1099511628211ull; }
+    const uint64_t h = dankattn::proto::fnv1a_tokens(hist.data(), m.pos);
     char nm[64];
     snprintf(nm, sizeof nm, "/%016llx-%u.inkp", (unsigned long long)h, m.pos);
     Entry en;
@@ -136,16 +101,10 @@ struct PrefixCache {
     }
     en.toks.assign(hist.begin(), hist.begin() + m.pos);
     en.used = ++clock;
-    for (size_t i = 0; i < ents.size();) {
-      if (ents[i].path != en.path && ents[i].toks.size() < en.toks.size() &&
-          common(ents[i].toks, en.toks, ents[i].toks.size()) == ents[i].toks.size()) {
-        unlink(ents[i].path.c_str());
-        ents.erase(ents.begin() + long(i));
-      } else i++;
-    }
+    dankattn::pcache::prune_subprefixes(ents, en);
     ents.push_back(std::move(en));
     fprintf(stderr, "inkling2: pcache: saved %u tokens (%.2f GB) in %.0f ms (%zu files, %.2f GB)\n",
-            m.pos, ents.back().bytes / 1e9, ms, ents.size(), total() / 1e9);
+            m.pos, ents.back().bytes / 1e9, ms, ents.size(), dankattn::pcache::total_bytes(ents) / 1e9);
     return true;
   }
 

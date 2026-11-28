@@ -22,7 +22,7 @@ import uvicorn
 from engine_frontend import (
     BadRequest, ClientGone, EngineProc, PayloadTooLarge, PrefixSplicer, Unavailable, Watch,
     add_security_args, api_error, bad_request, error_response, install_security_middleware,
-    json_body, make_jinja_env, normalize_messages, num, payload_too_large,
+    json_body, make_jinja_env, normalize_messages, num, parse_chat_params, payload_too_large,
     register_common_routes, safe_template_kwargs, unavailable,
 )
 
@@ -303,25 +303,13 @@ async def chat(request: Request):
         return bad_request("messages must be a non-empty list")
     try:
         fpr = parse_fpr_opts(body)
-        max_new = num(body, "max_tokens", int, 0, 0, 0xFFFFFFFF) or num(body, "max_completion_tokens", int, 0, 0, 0xFFFFFFFF) or 8192
-        temp = num(body, "temperature", float, 1.0, 0.0, 100.0)
-        top_p = num(body, "top_p", float, 1.0, 0.0, 1.0)
-        top_k = max(0, num(body, "top_k", int, 0, -1, 0xFFFFFFFF))
-        min_p = num(body, "min_p", float, None, 0.0, 1.0)
-        if min_p is None:
-            min_p = args.min_p
-        seed = body.get("seed")
-        seed = (num(body, "seed", int, 0) if seed is not None else uuid.uuid4().int) & ((1 << 64) - 1)
-        tb = num(body, "thinking_budget", int, None, 0, 0xFFFFFFFF)
-        raw_stop = body.get("stop")
-        if raw_stop is None:
-            stop_strs = []
-        elif isinstance(raw_stop, str):
-            stop_strs = [raw_stop] if raw_stop else []
-        elif isinstance(raw_stop, list) and all(isinstance(s, str) for s in raw_stop) and len(raw_stop) <= 16:
-            stop_strs = [s for s in raw_stop if s]
-        else:
-            raise BadRequest("stop must be a string or list of up to 16 strings")
+        p = parse_chat_params(
+            body, default_max_new=8192, default_temp=1.0, default_top_p=1.0,
+            default_top_k=0, default_min_p=args.min_p,
+        )
+        max_new, temp, top_p, top_k, min_p, seed, tb, stop_strs = (
+            p["max_new"], p["temp"], p["top_p"], p["top_k"], p["min_p"], p["seed"], p["thinking_budget"], p["stop_strs"]
+        )
         prompt = render(body)
     except BadRequest as e:
         return bad_request(str(e))

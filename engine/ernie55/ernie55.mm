@@ -97,13 +97,7 @@ static id<MTLBuffer> http_get_buffer(id<MTLDevice> dev, const std::string& url, 
   return b;
 }
 
-static NSDictionary* parse_json(const std::string& s) {
-  NSData* d = [NSData dataWithBytes:s.data() length:s.size()];
-  NSError* e = nil;
-  id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:&e];
-  if (!obj) mtl::die("json parse", e);
-  return (NSDictionary*)obj;
-}
+using dankattn::parse_json;
 
 static void pick_split(uint32_t N, uint32_t K, uint32_t gs, uint32_t slots, uint32_t& sgs, uint32_t& ksplit) {
   const uint32_t G = K / gs;

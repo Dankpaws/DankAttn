@@ -5,7 +5,7 @@ import jinja2
 import numpy as np
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 
 class Unavailable(Exception):
@@ -651,3 +651,217 @@ def register_common_routes(app, eng: EngineProc, model_id: str, cap: int, lanes_
         except jinja2.exceptions.TemplateError as e:
             return bad_request(f"chat template: {e}")
         return {"tokens": ids, "count": len(ids), "max_model_len": cap}
+
+
+def parse_chat_params(body, *, default_max_new=4096, default_temp=1.0, default_top_p=1.0,
+                      default_top_k=0, default_min_p=None, parse_stops=True):
+    """Parse common OpenAI sampling, budget, and stop-sequence fields from a chat request body."""
+    max_new = num(body, "max_tokens", int, 0, 0, 0xFFFFFFFF) or num(body, "max_completion_tokens", int, 0, 0, 0xFFFFFFFF) or default_max_new
+    temp = num(body, "temperature", float, default_temp, 0.0, 100.0)
+    top_p = num(body, "top_p", float, default_top_p, 0.0, 1.0)
+    top_k = max(0, num(body, "top_k", int, default_top_k, -1, 0xFFFFFFFF))
+    min_p = num(body, "min_p", float, default_min_p, 0.0, 1.0)
+    seed = body.get("seed")
+    seed = (num(body, "seed", int, 0) if seed is not None else uuid.uuid4().int) & ((1 << 64) - 1)
+    tb = num(body, "thinking_budget", int, None, 0, 0xFFFFFFFF)
+    stop_strs = []
+    if parse_stops:
+        raw_stop = body.get("stop")
+        if raw_stop is None:
+            stop_strs = []
+        elif isinstance(raw_stop, str):
+            stop_strs = [raw_stop] if raw_stop else []
+        elif isinstance(raw_stop, list) and all(isinstance(s, str) for s in raw_stop) and len(raw_stop) <= 16:
+            stop_strs = [s for s in raw_stop if s]
+        else:
+            raise BadRequest("stop must be a string or list of up to 16 strings")
+    return {
+        "max_new": max_new, "temp": temp, "top_p": top_p, "top_k": top_k,
+        "min_p": min_p, "seed": seed, "thinking_budget": tb, "stop_strs": stop_strs,
+    }
+
+
+def find_stop_cut(text: str, stop_strs) -> int | None:
+    cut_at = None
+    for s in stop_strs:
+        pos_s = text.find(s)
+        if pos_s >= 0 and (cut_at is None or pos_s < cut_at):
+            cut_at = pos_s
+    return cut_at
+
+
+def finish_reason_of(item, calls, max_new: int) -> str:
+    return "tool_calls" if calls else ("length" if item.get("length") or item["generated"] >= max_new else "stop")
+
+
+def make_sse_chunk(rid: str, created: int, model_id: str, delta: dict, finish=None, usage=None) -> str:
+    d = {
+        "id": rid, "object": "chat.completion.chunk", "created": created, "model": model_id,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+    if usage:
+        d["usage"] = usage
+    return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
+
+
+def make_usage(st: dict, n_reasoning: int) -> dict:
+    return {
+        "prompt_tokens": st["prompt"],
+        "completion_tokens": st["generated"],
+        "total_tokens": st["prompt"] + st["generated"],
+        "completion_tokens_details": {"reasoning_tokens": n_reasoning},
+        "dankattn": {
+            "reused_prompt_tokens": st["reused"],
+            "prefill_ms": round(st["prefill_ms"], 1),
+            "wall_ms": round(st["wall_ms"], 1),
+            "spec_rounds": st["rounds"],
+            "accepted_drafts": st["accepted"],
+        },
+    }
+
+
+async def run_chat_completion(
+    request: Request,
+    body: dict,
+    eng: EngineProc,
+    eid: int,
+    q: asyncio.Queue,
+    sp,
+    *,
+    rid: str,
+    created: int,
+    model_id: str,
+    max_new: int,
+    stop_strs,
+    parse_tools_fn,
+    use_tools: bool,
+    tool_start: str | None = None,
+    tool_strip_re=None,
+    tool_lookback: int = 24,
+):
+    """Shared streaming and non-streaming OpenAI chat completion driver."""
+    watch = Watch(q, request)
+    max_stop_len = max((len(s) for s in stop_strs), default=0)
+
+    def chunk(delta, finish=None, usage=None):
+        return make_sse_chunk(rid, created, model_id, delta, finish, usage)
+
+    def usage_of(st):
+        return make_usage(st, sp.n_reasoning)
+
+    if body.get("stream"):
+        try:
+            first = await watch.get()
+        except ClientGone:
+            eng.cancel(eid)
+            return Response(status_code=499)
+        except asyncio.CancelledError:
+            eng.cancel(eid)
+            raise
+        if isinstance(first, dict) and "error" in first:
+            return error_response(first["error"])
+
+        async def gen():
+            done = False
+            try:
+                yield chunk({"role": "assistant", "content": ""})
+                held = ""
+                in_tool_call = False
+                stopped_by_str = False
+                pending = [first]
+                while True:
+                    item = pending.pop() if pending else await q.get()
+                    if isinstance(item, dict):
+                        if "error" in item:
+                            yield "data: " + json.dumps({"error": api_error(item["error"])[1]}, ensure_ascii=False) + "\n\n"
+                            done = True
+                            break
+                        if stopped_by_str:
+                            yield chunk({}, "stop", usage_of(item))
+                            yield "data: [DONE]\n\n"
+                            break
+                        _, calls = parse_tools_fn()
+                        if calls:
+                            if tool_strip_re is not None:
+                                rest = tool_strip_re.sub("", held).strip()
+                                if rest:
+                                    yield chunk({"content": rest})
+                            elif held:
+                                yield chunk({"content": held})
+                            yield chunk({"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]})
+                        elif held:
+                            yield chunk({"content": held})
+                        yield chunk({}, finish_reason_of(item, calls, max_new), usage_of(item))
+                        yield "data: [DONE]\n\n"
+                        break
+                    if stopped_by_str:
+                        continue
+                    r, c = sp.push(item)
+                    if r:
+                        yield chunk({"reasoning_content": r})
+                    if c:
+                        held += c
+                        if stop_strs:
+                            cut_at = find_stop_cut(held, stop_strs)
+                            if cut_at is not None:
+                                if cut_at > 0:
+                                    yield chunk({"content": held[:cut_at]})
+                                held = ""
+                                stopped_by_str = True
+                                eng.cancel(eid)
+                                continue
+                        if tool_start and use_tools and not in_tool_call and tool_start in held:
+                            in_tool_call = True
+                        if not in_tool_call:
+                            keep = 0
+                            if tool_start and use_tools and "<" in held[-tool_lookback:]:
+                                keep = max(keep, len(held) - held.rfind("<"))
+                            if max_stop_len > 1:
+                                keep = max(keep, max_stop_len - 1)
+                            if len(held) > keep:
+                                emit_s = held[:-keep] if keep else held
+                                held = held[-keep:] if keep else ""
+                                yield chunk({"content": emit_s})
+                done = True
+            finally:
+                if not done:
+                    eng.cancel(eid)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    stopped_by_str = False
+    try:
+        while True:
+            item = await watch.get()
+            if isinstance(item, dict):
+                if "error" in item:
+                    return error_response(item["error"])
+                break
+            if stopped_by_str:
+                continue
+            sp.push(item)
+            if stop_strs and sp.content:
+                cut_at = find_stop_cut(sp.content, stop_strs)
+                if cut_at is not None:
+                    sp.content = sp.content[:cut_at]
+                    stopped_by_str = True
+                    eng.cancel(eid)
+    except ClientGone:
+        eng.cancel(eid)
+        return Response(status_code=499)
+    except asyncio.CancelledError:
+        eng.cancel(eid)
+        raise
+
+    content, calls = parse_tools_fn()
+    msg = {"role": "assistant", "content": content or None}
+    if sp.reasoning:
+        msg["reasoning_content"] = sp.reasoning
+    if calls:
+        msg["tool_calls"] = calls
+    return {
+        "id": rid, "object": "chat.completion", "created": created, "model": model_id,
+        "choices": [{"index": 0, "message": msg,
+                     "finish_reason": "stop" if stopped_by_str else finish_reason_of(item, calls, max_new)}],
+        "usage": usage_of(item),
+    }

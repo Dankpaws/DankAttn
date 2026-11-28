@@ -1,6 +1,7 @@
 // DankAttn (ERNIE-5.5): Metal 4 engine for baidu/ERNIE-5.5-Flash-Preview (W2-g64 experts, W8 dense).
 // Supports local mmap packs AND zero-disk HTTP streaming packs (http://host:port) into unified RAM.
 #pragma once
+#include "../core/pack.h"
 #include "../mtl.h"
 #include "../mm_args.h"
 #include <cstdint>
@@ -17,16 +18,8 @@ constexpr uint32_t IDX_SUB = 16;     // sub-batch rows for DSA indexer scores (k
 constexpr uint32_t HCA_RING = 1152;  // >= 128 SWA + PREFILL_M
 constexpr uint32_t COMP_RING = 256;  // persistent per-layer HCA compressor ring (2 blocks of 128)
 
-struct Lin {
-  id<MTLBuffer> w = nil, s = nil;
-  size_t woff = 0, soff = 0;
-  uint32_t N = 0, K = 0, bits = 0, gs = 0, experts = 1, ksplit = 1, sgs = 1;
-};
-
-struct Raw {
-  id<MTLBuffer> b = nil;
-  size_t off = 0, bytes = 0;
-};
+using dankattn::Lin;
+using dankattn::Raw;
 
 struct Layer {
   bool is_dsa = false;

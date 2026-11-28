@@ -2,6 +2,7 @@
 // Shares the register-direct matmuls (kernels/mm2.metal) and the Metal runtime (mtl.h) with the
 // Flash-Next engine; everything model-specific is here and in kernels/hy4.metal.
 #pragma once
+#include "../core/pack.h"
 #include "../mtl.h"
 #include "config.h"
 #include <algorithm>
@@ -54,17 +55,8 @@ constexpr uint32_t ASPLITS = 32;  // attention key splits per row (fixed, so a r
 constexpr uint32_t HC_NP = 12;    // channel slices of the two-pass hyper-connection read-in
 constexpr uint32_t SB = 64;       // indexer score / top-k rows per block (scratch is SB x cap/4 floats)
 
-struct Lin {
-  id<MTLBuffer> w, s;
-  size_t woff = 0, soff = 0;
-  uint32_t N = 0, K = 0, bits = 0, gs = 0, experts = 1, ksplit = 1, sgs = 1;
-  std::map<std::string, std::pair<uint32_t, uint32_t>> rows;
-};
-
-struct Raw {
-  id<MTLBuffer> b;
-  size_t off = 0, bytes = 0;
-};
+using dankattn::Lin;
+using dankattn::Raw;
 
 struct Layer {
   bool sparse = false, dense = false, eng = false;

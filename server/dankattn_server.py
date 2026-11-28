@@ -18,10 +18,10 @@ from fastapi.responses import Response, StreamingResponse
 import uvicorn
 
 from engine_frontend import (
-    BadRequest, ClientGone, EngineProc, PayloadTooLarge, Splitter, Unavailable, Watch,
-    add_security_args, api_error, bad_request, error_response, install_security_middleware,
+    BadRequest, EngineProc, PayloadTooLarge, Splitter, Unavailable,
+    add_security_args, bad_request, install_security_middleware,
     json_body, make_jinja_env, normalize_messages, num, payload_too_large,
-    register_common_routes, safe_template_kwargs, unavailable,
+    register_common_routes, run_chat_completion, safe_template_kwargs, unavailable,
 )
 
 ap = argparse.ArgumentParser()
@@ -161,100 +161,12 @@ async def chat(request: Request):
         cb({"error": str(e)})
         return bad_request(f"request does not fit the engine protocol: {e}")
     sp = Splitter(tok, thinking, "</think>", ("<|im_end|>", "<|endoftext|>"))
-    watch = Watch(q, request)
-
-    def finish_of(item, calls):
-        return "tool_calls" if calls else ("length" if item.get("length") or item["generated"] >= max_new else "stop")
-
-    def chunk(delta, finish=None, usage=None):
-        d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": args.model_id,
-             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-        if usage:
-            d["usage"] = usage
-        return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
-
-    def usage_of(st):
-        return {"prompt_tokens": st["prompt"], "completion_tokens": st["generated"],
-                "total_tokens": st["prompt"] + st["generated"],
-                "completion_tokens_details": {"reasoning_tokens": sp.n_reasoning},
-                "dankattn": {"reused_prompt_tokens": st["reused"], "prefill_ms": round(st["prefill_ms"], 1),
-                         "wall_ms": round(st["wall_ms"], 1), "spec_rounds": st["rounds"], "accepted_drafts": st["accepted"]}}
-
-    if body.get("stream"):
-        try:
-            first = await watch.get()
-        except ClientGone:
-            eng.cancel(eid)
-            return Response(status_code=499)
-        except asyncio.CancelledError:
-            eng.cancel(eid)
-            raise
-        if isinstance(first, dict) and "error" in first:
-            return error_response(first["error"])
-
-        async def gen():
-            done = False
-            try:
-                yield chunk({"role": "assistant", "content": ""})
-                held = ""
-                pending = [first]
-                while True:
-                    item = pending.pop() if pending else await q.get()
-                    if isinstance(item, dict):
-                        if "error" in item:
-                            yield "data: " + json.dumps({"error": api_error(item["error"])[1]}, ensure_ascii=False) + "\n\n"
-                            done = True
-                            break
-                        content, calls = parse_tools(sp.content, use_tools)
-                        if calls:
-                            rest = TOOL_RE.sub("", held).strip()
-                            if rest:
-                                yield chunk({"content": rest})
-                            yield chunk({"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]})
-                        elif held:
-                            yield chunk({"content": held})
-                        yield chunk({}, finish_of(item, calls), usage_of(item))
-                        yield "data: [DONE]\n\n"
-                        break
-                    r, c = sp.push(item)
-                    if r:
-                        yield chunk({"reasoning_content": r})
-                    if c:
-                        held += c
-                        if not use_tools or ("<tool_call>" not in sp.content and "<" not in held[-12:]):
-                            yield chunk({"content": held})
-                            held = ""
-                done = True
-            finally:
-                if not done:
-                    eng.cancel(eid)
-
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-    try:
-        while True:
-            item = await watch.get()
-            if isinstance(item, dict):
-                if "error" in item:
-                    return error_response(item["error"])
-                break
-            sp.push(item)
-    except ClientGone:
-        eng.cancel(eid)
-        return Response(status_code=499)
-    except asyncio.CancelledError:
-        eng.cancel(eid)
-        raise
-    content, calls = parse_tools(sp.content, use_tools)
-    msg = {"role": "assistant", "content": content or None}
-    if sp.reasoning:
-        msg["reasoning_content"] = sp.reasoning
-    if calls:
-        msg["tool_calls"] = calls
-    return {"id": rid, "object": "chat.completion", "created": created, "model": args.model_id,
-            "choices": [{"index": 0, "message": msg,
-                         "finish_reason": finish_of(item, calls)}],
-            "usage": usage_of(item)}
+    return await run_chat_completion(
+        request, body, eng, eid, q, sp,
+        rid=rid, created=created, model_id=args.model_id, max_new=max_new,
+        stop_strs=(), parse_tools_fn=lambda: parse_tools(sp.content, use_tools),
+        use_tools=use_tools, tool_start="<tool_call>", tool_strip_re=TOOL_RE, tool_lookback=12,
+    )
 
 
 if __name__ == "__main__":

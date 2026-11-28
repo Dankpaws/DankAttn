@@ -123,15 +123,42 @@ inline bool keep_warm() {
   return win <= 0 || now_s() - last_use().load() < win;
 }
 
-inline std::string slurp(const std::string& path) {
+// Read a file (and recursively inline local `#include "..."` directives relative to its directory)
+// so Metal shader sources compiled via newLibraryWithSource can share modular headers.
+inline std::string slurp(const std::string& path, int depth = 0) {
+  if (depth > 8) die(("include cycle in " + path).c_str());
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) die(("open " + path).c_str());
-  std::string s;
+  std::string raw;
   char b[1 << 16];
   size_t n;
-  while ((n = fread(b, 1, sizeof b, f)) > 0) s.append(b, n);
+  while ((n = fread(b, 1, sizeof b, f)) > 0) raw.append(b, n);
   fclose(f);
-  return s;
+  if (raw.find("#include \"") == std::string::npos) return raw;
+  const size_t slash = path.rfind('/');
+  const std::string dir = (slash == std::string::npos) ? "." : path.substr(0, slash);
+  std::string out;
+  out.reserve(raw.size());
+  size_t pos = 0;
+  while (pos < raw.size()) {
+    size_t nl = raw.find('\n', pos);
+    const size_t end = (nl == std::string::npos) ? raw.size() : nl + 1;
+    size_t p = pos;
+    while (p < end && (raw[p] == ' ' || raw[p] == '\t')) p++;
+    if (end - p >= 11 && raw.compare(p, 10, "#include \"") == 0) {
+      size_t q = raw.find('"', p + 10);
+      if (q != std::string::npos && q < end) {
+        const std::string rel = raw.substr(p + 10, q - (p + 10));
+        out.append(slurp(dir + "/" + rel, depth + 1));
+        if (!out.empty() && out.back() != '\n') out.push_back('\n');
+        pos = end;
+        continue;
+      }
+    }
+    out.append(raw, pos, end - pos);
+    pos = end;
+  }
+  return out;
 }
 
 // GPU time of one command buffer in seconds.

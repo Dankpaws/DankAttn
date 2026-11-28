@@ -2,6 +2,7 @@
 // Shares register-direct matmuls (kernels/mm2.metal: W8, W6, native NVFP4 WBITS=40, native MXFP8 WBITS=80)
 // and mtl.h with Hy4 and Flash-Next.
 #pragma once
+#include "../core/pack.h"
 #include "../lookup.h"
 #include "../mtl.h"
 #include "../mm_args.h"
@@ -188,17 +189,8 @@ constexpr uint32_t PF_COMPACT = 6144;  // max compact padded MoE rows for MP=512
 constexpr uint32_t MAX_BLOCKS = 12;
 constexpr uint32_t ASPLITS = 64; // max attention key splits (fixed per layer -> bit-exact across M)
 
-struct Lin {
-  id<MTLBuffer> w = nil, s = nil;
-  size_t woff = 0, soff = 0;
-  uint32_t N = 0, K = 0, bits = 0, gs = 0, experts = 1, ksplit = 1, sgs = 1;
-  uint32_t pslot = 0;  // split-K scratch region: tensors that run concurrently (qgrs || k || v) need their own
-};
-
-struct Raw {
-  id<MTLBuffer> b = nil;
-  size_t off = 0, bytes = 0;
-};
+using dankattn::Lin;
+using dankattn::Raw;
 
 struct Ctrl {
   Raw down, forget, gain;

@@ -427,7 +427,7 @@ void Model::begin(Rec& rc, std::map<std::string, double>* profile) {
   rc.cb = [C.q commandBuffer];
   rc.prof = profile != nullptr;
   rc.conc = getenv("OPUS_CONC") != nullptr;
-  if (rc.prof) rc.pool = &prof_pool;
+  if (rc.prof) rc.ext_pool = &prof_pool;
   static const uint32_t chunk0 = getenv("OPUS_CHUNK0") ? atoi(getenv("OPUS_CHUNK0")) : 4;
   static const uint32_t chunk = getenv("OPUS_CHUNK") ? atoi(getenv("OPUS_CHUNK")) : 256;
   if (!rc.prof) { rc.chunk0 = chunk0; rc.chunk = chunk; }
