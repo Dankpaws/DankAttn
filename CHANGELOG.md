@@ -14,6 +14,7 @@
 - **`W3` and `MXFP4` quantization tiers (`engine/kernels/mm2.metal`, `convert/layout.py`, `bench/quant_test.mm`):** added `WBITS=3` (`gs=64/128`, 12 B/lane) and `WBITS=41` (`MXFP4`, E2M1, `gs=32`) kernels, packing layouts, and GPU unit tests verified bit-exact (`0.000e+00` error across `mm1`/`mm2`/`mmp`, `M1==M16` `0` bit diffs).
 - **Lossless Paged KV + Radix Prefix Tree (`engine/core/kv_radix.h`, `bench/kv_radix_test.mm`):** 128-token block-table pool with refcounted zero-copy prefix sharing, LRU leaf eviction, and `paged_kv` prefix cache save/restore; wired into Hy4 behind opt-in `HY4_PAGED_KV=1` (`0.000e+00` diff on `vtest`/`ntest 4`/`calib2048`).
 - **Adaptive prefill chunking:** scales prefill chunk size dynamically based on available memory headroom.
+- **Hy4 MoE split tuning & bandwidth probe (`engine/hy4/hy4.mm`, `bench/moe_bw.mm`):** added `bench/moe_bw.mm` (`sh build.sh bench`) to benchmark grouped MoE W4 unpack and geometry on M5 Ultra (confirming stock ALU unpack beats 256/16-entry LUTs and hits ~988 GB/s at `M=16`), added missing `moe_dn` `gs=128` (`sgs=1, ksplit=2`) override and bumped `moe_gu` `gs=64` to `sgs=4, ksplit=1`, cutting Hy4 12k decode/verify latency from `19.85 / 28.23 / 33.66 ms` to `19.58 / 27.90 / 33.25 ms` GPU (`1 / 5 / 8` rows, bit-exact `0` diffs on `vtest`).
 
 ### API & Serving
 - **Anthropic Messages API (`server/anthropic_compat.py`):** native `/v1/messages` (non-streaming + SSE streaming) and `/v1/messages/count_tokens` registered automatically across all DankAttn servers.

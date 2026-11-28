@@ -53,13 +53,15 @@ static std::vector<std::array<uint32_t, 6>> split_rows(bool use_split_tab) {
              {5120, 3072, 128, 0, 1, 6},
              {3072, 3072, 128, 0, 1, 8},
              {1536, 1536, 64, 1, 1, 2},
+             {1536, 1536, 128, 1, 1, 2},
              // measured 2026-11-20 on M5 Ultra (12k context, pack-g64-gptq-v3): attn.o, attn.in, moe.gu;
              // 1/5/8/16 rows 20.30/29.88/35.40/47.51 -> 20.09/29.13/35.01/47.15 ms (ksplit=1 keeps moe.gu epi3_regs)
+             // 2026-11-28 (pack-dfly2b6, moe_bw): moe.dn gs=128 1:2 + moe.gu gs=64 4:1 -> -0.33/-0.32/-0.43 ms at 1/5/8 rows
              {3072, 16384, 128, 0, 1, 8},
              {3072, 8192, 128, 0, 1, 8},
              {1760, 3072, 128, 0, 1, 8},
              {1600, 3072, 128, 0, 1, 8},
-             {3072, 1536, 64, 1, 2, 1},
+             {3072, 1536, 64, 1, 4, 1},
          })
       t.push_back(r);
   return t;
