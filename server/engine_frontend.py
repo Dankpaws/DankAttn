@@ -7,6 +7,9 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from anthropic_compat import register_anthropic_routes
+from json_schema_dfa import parse_response_format, schema_system_hint, validate_json_schema
+
 
 class Unavailable(Exception):
     pass
@@ -33,6 +36,8 @@ def make_jinja_env():
 
 def normalize_messages(body, keep_vision=False):
     msgs = []
+    rf = parse_response_format(body)
+    hint = schema_system_hint(rf) if rf else ""
     for m in body["messages"]:
         if not isinstance(m, dict):
             raise BadRequest("each message must be an object")
@@ -59,6 +64,11 @@ def normalize_messages(body, keep_vision=False):
                 except Exception:
                     f["arguments"] = {}
         msgs.append(m)
+    if hint:
+        if msgs and msgs[0].get("role") == "system" and isinstance(msgs[0].get("content"), str):
+            msgs[0] = dict(msgs[0], content=msgs[0]["content"] + "\n\n" + hint)
+        else:
+            msgs.insert(0, {"role": "system", "content": hint})
     return msgs
 
 
@@ -652,6 +662,8 @@ def register_common_routes(app, eng: EngineProc, model_id: str, cap: int, lanes_
             return bad_request(f"chat template: {e}")
         return {"tokens": ids, "count": len(ids), "max_model_len": cap}
 
+    register_anthropic_routes(app, model_id, render_fn, tok, json_body, payload_too_large, PayloadTooLarge)
+
 
 def parse_chat_params(body, *, default_max_new=4096, default_temp=1.0, default_top_p=1.0,
                       default_top_k=0, default_min_p=None, parse_stops=True):
@@ -854,14 +866,32 @@ async def run_chat_completion(
         raise
 
     content, calls = parse_tools_fn()
+    rf = parse_response_format(body)
+    schema_meta = None
+    if rf and content:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if len(lines) >= 3 and lines[-1].strip() == "```":
+                cleaned = "\n".join(lines[1:-1]).strip()
+        try:
+            parsed_obj = json.loads(cleaned)
+            ok, err = validate_json_schema(parsed_obj, rf.get("schema"))
+            content = cleaned
+            schema_meta = {"valid": ok, **({"error": err} if err else {})}
+        except Exception as e:
+            schema_meta = {"valid": False, "error": f"invalid json: {e}"}
     msg = {"role": "assistant", "content": content or None}
     if sp.reasoning:
         msg["reasoning_content"] = sp.reasoning
     if calls:
         msg["tool_calls"] = calls
+    usage = usage_of(item)
+    if schema_meta is not None:
+        usage["dankattn"]["schema"] = schema_meta
     return {
         "id": rid, "object": "chat.completion", "created": created, "model": model_id,
         "choices": [{"index": 0, "message": msg,
                      "finish_reason": "stop" if stopped_by_str else finish_reason_of(item, calls, max_new)}],
-        "usage": usage_of(item),
+        "usage": usage,
     }
