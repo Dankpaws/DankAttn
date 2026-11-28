@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## v2026.11.28
 
 ### Engine Core & Refactoring
 - **Shared C++ runtime (`engine/core/`):** extracted `env.h`, `pack.h`, `runtime.h`, `proto.h`, `cli.h`, `sample.h`, `pcache.h`, and `scheduler.h`, deduplicating `Lin`, `Raw`, `jload`, `parse_json`, `mmap_file`, `host_now`, `new_sample_buffer`, `Rec`, `PrefixCache`, the `OPUS`/`OPCX`/`OPMK` reader/inbox/cancel/mask-queue loop, adaptive prefill chunking, masked/logprobs sampling, and CLI helpers across Hy4, Inkling2, ERNIE-5.5, and Flash-Next.
