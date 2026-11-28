@@ -5,11 +5,20 @@
 # HY4_DRAFT_CUT (0.2), PYTHON (default python3). Engine defaults: HY4_LOOKUP (1), HY4_DBLOCK (8),
 # HY4_PCACHE (<tree>/pcache, 0 = off), HY4_PCACHE_GB (40), HY4_PCACHE_FREE_GB (15).
 T=$(cd "$(dirname "$0")/.." && pwd)
-PACK=${HY4_PACK:-$T/pack-v4-h128-w6}
+if [ -n "${HY4_PACK:-}" ]; then PACK="$HY4_PACK"
+elif [ -d "$T/models/pack-dfly2b6" ]; then PACK="$T/models/pack-dfly2b6"
+elif [ -d "$T/models/pack-v4-h128-w6" ]; then PACK="$T/models/pack-v4-h128-w6"
+else PACK="$T/pack-v4-h128-w6"; fi
 export HY4_SIDE_LANES=${HY4_SIDE_LANES:-3}
-export HY4_SIDE_CAP=${HY4_SIDE_CAP:-32768}
+case "$PACK" in
+  *dfly2b6*)
+    export HY4_SIDE_CAP=${HY4_SIDE_CAP:-16384}
+    export HY4_CAP=${HY4_CAP:-393216} ;;
+  *)
+    export HY4_SIDE_CAP=${HY4_SIDE_CAP:-32768}
+    export HY4_CAP=${HY4_CAP:-524288} ;;
+esac
 PORT=${HY4_PORT:-8341}
-export HY4_CAP=${HY4_CAP:-524288}
 export HY4_MP=${HY4_MP:-1024}
 if [ -n "${PYTHON:-}" ]; then PY="$PYTHON"
 elif [ -x "$T/.venv/bin/python" ]; then PY="$T/.venv/bin/python"
