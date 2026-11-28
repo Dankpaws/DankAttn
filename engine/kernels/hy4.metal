@@ -11,12 +11,31 @@ struct LaneState {
   device uchar* lat;
   device float* tokring;
   device bfloat* bk;
+  device const uint* kv_tab;
 };
 #define LANE_PARAMS , device const LaneState* lt [[buffer(12)]], device const uint* row_lane [[buffer(13)]], device const uint* row_pos [[buffer(14)]]
 #define ROW_POS(m) (row_pos[m])
+#ifdef PAGED_KV
+#define KV_TAB_PARAM
+#define PAGED_POS(t) ((kv_tab[(t) >> 7] << 7) | ((t) & 127u))
+#define PAGED_GRP(g) ((kv_tab[(g) >> 5] << 5) | ((g) & 31u))
+#else
+#define KV_TAB_PARAM
+#define PAGED_POS(t) (t)
+#define PAGED_GRP(g) (g)
+#endif
 #else
 #define LANE_PARAMS
 #define ROW_POS(m) (a.p0 + (m))
+#ifdef PAGED_KV
+#define KV_TAB_PARAM , device const uint* kv_tab [[buffer(15)]]
+#define PAGED_POS(t) ((kv_tab[(t) >> 7] << 7) | ((t) & 127u))
+#define PAGED_GRP(g) ((kv_tab[(g) >> 5] << 5) | ((g) & 31u))
+#else
+#define KV_TAB_PARAM
+#define PAGED_POS(t) (t)
+#define PAGED_GRP(g) (g)
+#endif
 #endif
 
 static inline uint frag_off(uint m, uint k, uint K) {
@@ -304,7 +323,7 @@ kernel void h4_attn_in(device const float* Y [[buffer(0)]], device const float* 
                        device uchar* lat [[buffer(6)]], device float* tokring [[buffer(7)]],
                        device float* iw [[buffer(8)]], constant KvArgs& a [[buffer(9)]],
                        uint m [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
-                       ushort ntg [[threads_per_threadgroup]] LANE_PARAMS) {
+                       ushort ntg [[threads_per_threadgroup]] LANE_PARAMS KV_TAB_PARAM) {
   threadgroup float kr[64];
   threadgroup float lv[576];
   threadgroup float gs[18];
@@ -313,6 +332,9 @@ kernel void h4_attn_in(device const float* Y [[buffer(0)]], device const float* 
 #ifdef LANES
   lat = lt[row_lane[m]].lat;
   if (a.sparse) tokring = lt[row_lane[m]].tokring;
+#ifdef PAGED_KV
+  device const uint* kv_tab = lt[row_lane[m]].kv_tab;
+#endif
 #endif
   // the three norms' sums of squares (q_a, kv latent, indexer key) behind one barrier, each summed as
   // tg_sum does (simd sums, then the simdgroups in order from 0.0f)
@@ -333,7 +355,7 @@ kernel void h4_attn_in(device const float* Y [[buffer(0)]], device const float* 
   for (uint i = tid; i < 1024; i += ntg) qa_frag[frag_off(m, i, 1024)] = bfloat(yr[i] * r * qa_w[i]);
   // kv latent
   r = rsqrt(s3[1] / 512.0f + a.eps);
-  const uint row = a.ring ? pos % a.ring : pos;
+  const uint row = a.ring ? pos % a.ring : PAGED_POS(pos);
   for (uint i = tid; i < 512; i += ntg) lv[i] = kv[i] * r * kva_w[i];
   device const float* rp = rope + size_t(m) * 64;
   if (tid < 32) {
@@ -413,7 +435,7 @@ kernel void h4_idx_pool(device const float* tokring [[buffer(0)]], device const 
                         device const float* kgp [[buffer(2)]], device const float* ape [[buffer(3)]],
                         device const float* knorm [[buffer(4)]], device const float* rope_tab [[buffer(5)]],
                         device bfloat* bk [[buffer(6)]], constant PoolArgs& a [[buffer(7)]],
-                        uint m [[threadgroup_position_in_grid]], ushort c [[thread_index_in_threadgroup]] LANE_PARAMS) {
+                        uint m [[threadgroup_position_in_grid]], ushort c [[thread_index_in_threadgroup]] LANE_PARAMS KV_TAB_PARAM) {
   threadgroup float tk[4][128];
   threadgroup float pooled[128];
   threadgroup float sh[32];
@@ -422,6 +444,9 @@ kernel void h4_idx_pool(device const float* tokring [[buffer(0)]], device const 
 #ifdef LANES
   tokring = lt[row_lane[m]].tokring;
   bk = lt[row_lane[m]].bk;
+#ifdef PAGED_KV
+  device const uint* kv_tab = lt[row_lane[m]].kv_tab;
+#endif
 #endif
   const uint g = pos / 4;
   for (uint s = 0; s < 4; s++) tk[s][c] = tokring[((4 * g + s) % TOKR) * 128 + c];
@@ -456,7 +481,7 @@ kernel void h4_idx_pool(device const float* tokring [[buffer(0)]], device const 
     const float x0 = pooled[64 + 2 * j], x1 = pooled[64 + 2 * j + 1];
     o = (c & 1) ? x1 * rp[j] + x0 * rp[32 + j] : x0 * rp[j] - x1 * rp[32 + j];
   }
-  bk[size_t(g) * 128 + c] = bfloat(o);
+  bk[size_t(PAGED_GRP(g)) * 128 + c] = bfloat(o);
 }
 
 // scores[m][g] = sum_h w_h relu(q_h . k_g) for g < pos / 4 on the matrix units: per simdgroup
@@ -467,11 +492,14 @@ kernel void h4_idx_score_mma(device const float* iq [[buffer(0)]], device const 
                              device const bfloat* bk [[buffer(2)]], device float* scores [[buffer(3)]],
                              constant ScoreArgs& a [[buffer(4)]],
                              uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
-                             ushort l [[thread_index_in_simdgroup]] LANE_PARAMS) {
+                             ushort l [[thread_index_in_simdgroup]] LANE_PARAMS KV_TAB_PARAM) {
   const uint mb = tg.y, m = a.row0 + mb, pos = ROW_POS(m);
   if (pos < a.dense_max) return;
 #ifdef LANES
   bk = lt[row_lane[m]].bk;
+#ifdef PAGED_KV
+  device const uint* kv_tab = lt[row_lane[m]].kv_tab;
+#endif
 #endif
   const uint G = pos / 4, g0 = tg.x * 256 + sg * 32;
   if (g0 >= G) return;
@@ -492,7 +520,7 @@ kernel void h4_idx_score_mma(device const float* iq [[buffer(0)]], device const 
     for (int qq = 0; qq < 4; qq++) {
       const uint g = g0 + m0 + 8 * qq;
       for (int hh = 0; hh < 2; hh++) {
-        const bfloat4 b4 = g < G ? *(device const bfloat4*)(bk + size_t(g) * 128 + ks * 32 + n0 + 16 * hh) : bfloat4(bfloat(0.0f));
+        const bfloat4 b4 = g < G ? *(device const bfloat4*)(bk + size_t(PAGED_GRP(g)) * 128 + ks * 32 + n0 + 16 * hh) : bfloat4(bfloat(0.0f));
         for (int e = 0; e < 4; e++) wb[hh * 16 + qq * 4 + e] = b4[e];
       }
     }
@@ -679,12 +707,15 @@ kernel void h4_attn_mma(device const float* qlat [[buffer(0)]], device const flo
                         constant AttnArgs& a [[buffer(6)]],
                         device const float* sinks [[buffer(7)]], device bfloat* ofrag [[buffer(8)]],
                         uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
-                        ushort l [[thread_index_in_simdgroup]] LANE_PARAMS) {
+                        ushort l [[thread_index_in_simdgroup]] LANE_PARAMS KV_TAB_PARAM) {
   threadgroup float Sp[8][16][32];
   const uint m = tg.y, h0 = tg.x * 16, split = tg.z;
   const uint pos = ROW_POS(m);
 #ifdef LANES
   lat = lt[row_lane[m]].lat;
+#ifdef PAGED_KV
+  device const uint* kv_tab = lt[row_lane[m]].kv_tab;
+#endif
 #endif
 #ifdef ATT_SLIDING
   constexpr bool sliding = (ATT_SLIDING != 0);
@@ -702,7 +733,7 @@ kernel void h4_attn_mma(device const float* qlat [[buffer(0)]], device const flo
   const uint per = (nk + a.splits - 1) / a.splits, j_begin = split * per, j_end = min(nk, j_begin + per);
   auto keyof = [&](uint j) -> uint {
     if (sliding) return (k0 + j) & (a.ring - 1u);
-    return sel[size_t(m) * a.selmax + j];
+    return PAGED_POS(sel[size_t(m) * a.selmax + j]);
   };
   const ushort m0 = ((l >> 1) & 3) + 4 * (l >> 4), n0 = 4 * (l & 1) + 8 * ((l >> 3) & 1);
   constexpr auto desc =

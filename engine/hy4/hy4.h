@@ -2,6 +2,7 @@
 // Shares the register-direct matmuls (kernels/mm2.metal) and the Metal runtime (mtl.h) with the
 // Flash-Next engine; everything model-specific is here and in kernels/hy4.metal.
 #pragma once
+#include "../core/kv_radix.h"
 #include "../core/pack.h"
 #include "../mtl.h"
 #include "config.h"
@@ -231,6 +232,11 @@ struct Model {
   uint32_t grpmmp_nf_ = gch_ >= 2 ? 2u : 1u;
   uint32_t selmax = SELMAX;  // selection list stride (HY4_DENSE: the capacity)
   bool kv8 = cfg().kv8;  // sparse layers' latent caches in int8 (default on)
+  bool paged_kv = cfg().paged_kv;  // shared 128-token paged KV block pool + radix prefix tree
+  dankattn::KvRadixPool kv_pool;
+  void ensure_kv_blocks(int slot, uint32_t need_pos);
+  void commit_kv_blocks(int slot);
+  void release_kv_blocks(int slot);
   size_t lat_row(const Layer& l) const { return l.kv8 ? 640 : 1152; }
   const Raw* ynorm_pending = nullptr;
   uint32_t cap = 0, pos = 0;
@@ -273,6 +279,7 @@ struct Model {
     anchor_p0 = ~size_t(0);
     anchor_lanes_meta.clear();
     pos = 0; history.clear(); pos3d.clear(); mrope_delta = 0; ckpts.clear(); ring_floor = 0;
+    if (paged_kv && cur_slot >= 0 && cur_slot < int(slots_.size())) release_kv_blocks(cur_slot);
     if (cur_slot >= 0 && cur_slot < int(slots_.size())) slots_[cur_slot].has_df_src = false;
   }
   // drop the newest tokens (keep the first n): valid while the sliding rings still hold n - window and the
@@ -303,6 +310,8 @@ struct Model {
     std::vector<Pos3D> pos3d;
     std::vector<Ckpt> ckpts;
     std::vector<id<MTLBuffer>> lat, tokring, bk;
+    std::vector<uint32_t> kv_blocks;  // physical block IDs in kv_pool when paged_kv is enabled
+    id<MTLBuffer> kv_tab = nil;       // [cap / 128] uint32 page table on GPU when paged_kv is enabled
     // Saved DFly2 source state (~52 KB/slot): last accepted xf row + target layers' lsel/lnsel rows,
     // so interleaved prefill chunks or other slots' steps never invalidate this slot's drafter source.
     id<MTLBuffer> df_xf = nil;

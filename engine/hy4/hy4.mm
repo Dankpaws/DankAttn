@@ -555,15 +555,21 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   }
   for (auto bg : need_grpmmp_epi3)
     P[mk(bg) + "grpmmp_epi3"] = C.pipe(mm2, "mmpg", {{"WBITS", std::to_string(bg.first)}, {"GS", std::to_string(bg.second)}, {"GROUPED", "1"}, {"EPI", "3"}, {"SWIGLU_LIMIT", lim}, {"MMP_CH", gch}, {"MMP_FAST", "1"}, {"MMP_NF", gnf}});
-  for (const char* k : {"h4_embed", "h4_embed_vis", "h4_hc_1pass", "h4_hc_part", "h4_hc_fin", "h4_rms", "h4_attn_in", "h4_q_prep", "h4_idx_pool",
+  for (const char* k : {"h4_embed", "h4_embed_vis", "h4_hc_1pass", "h4_hc_part", "h4_hc_fin", "h4_rms", "h4_q_prep",
                         "h4_idx_topk", "h4_attn_merge", "h4_gate", "h4_route", "h4_plan", "h4_combine",
                         "h4_eng_rows", "h4_eng_rows_q4", "h4_eng_mix", "h4_argmax", "h4_plan_lists", "h4_combine_c",
                         "h4_wht128_pf", "h4_wht128_dec",
                         "h4_add", "h4_dsel", "h4_add_frag", "h4_add_frag2", "h4_d_post_add_ln", "h4_draft_hc_in",
                         "h4_ac_block_attn", "h4_yv_to_frag", "h4_ac_gate_nsel",
                         "h4_ac_blk0_in", "h4_ac_in_lanes", "h4_ac_sel_lanes", "h4_draft_corr2",
-                        "h4_sample", "h4_pick_p", "h4_idx_score_mma", "h4_dgate"})
+                        "h4_sample", "h4_pick_p", "h4_dgate"})
     P[k] = C.pipe(hk, k);
+  {
+    std::map<std::string, std::string> pdefs;
+    if (paged_kv) pdefs["PAGED_KV"] = "1";
+    for (const char* k : {"h4_attn_in", "h4_idx_pool", "h4_idx_score_mma"})
+      P[k] = C.pipe(hk, k, pdefs);
+  }
   if (has_vision) {
     const std::string vk = mtl::slurp(kdir + "hy4_vit.metal");
     for (const char* k : {"vit_to_frag", "vit_patch_pos", "vit_layernorm_frag", "vit_attn_fwd",
@@ -571,7 +577,11 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
       P[k] = C.pipe(vk, k);
   }
   P["h4_attn_mma_swa"] = C.pipe(hk, "h4_attn_mma", {{"ATT_SLIDING", "1"}, {"ATT_KV8", "0"}});
-  P["h4_attn_mma_dsa"] = C.pipe(hk, "h4_attn_mma", {{"ATT_SLIDING", "0"}, {"ATT_KV8", kv8 ? "1" : "0"}});
+  {
+    std::map<std::string, std::string> ddefs = {{"ATT_SLIDING", "0"}, {"ATT_KV8", kv8 ? "1" : "0"}};
+    if (paged_kv) ddefs["PAGED_KV"] = "1";
+    P["h4_attn_mma_dsa"] = C.pipe(hk, "h4_attn_mma", ddefs);
+  }
 
   // scratch (M <= MR rows; non-overlapping Engram / Attention / FFN phases alias in scratch_heap)
   if (hy4::cfg().dense_attn) selmax = cap;
@@ -750,6 +760,11 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     Slot s0;
     s0.cap = cap;
     for (auto& l : L) { s0.lat.push_back(l.lat); s0.tokring.push_back(l.tokring); s0.bk.push_back(l.bk); }
+    if (paged_kv) {
+      kv_pool.init(cap / 128);
+      s0.kv_tab = B(size_t(cap / 128) * 4);
+      memset(s0.kv_tab.contents, 0, size_t(cap / 128) * 4);
+    }
     if (has_dfly) {
       s0.df_xf = B(size_t(H) * 4);
       for (size_t di = 0; di < D.size(); di++) {
@@ -759,6 +774,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     }
     slots_.push_back(s0);
   }
+  C.flush_shader_cache();
   row_lane_b = B(MAXM * 4);
   row_pos_b = B(MAXM * 4);
   samp_rows_b = B(MAXM * 32);
@@ -783,6 +799,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
         [slot_rs addAllocation:slots_[0].df_lnsel[di]];
       }
     }
+    if (slots_[0].kv_tab) [slot_rs addAllocation:slots_[0].kv_tab];
     [slot_rs commit];
     [slot_rs requestResidency];
     [C.q addResidencySet:slot_rs];
@@ -1538,22 +1555,53 @@ uint32_t Model::load_prefix(const std::string& path, double* ms) {
   return apply_prefix_load(cur_slot, std::move(pl));
 }
 
+void Model::ensure_kv_blocks(int slot, uint32_t need_pos) {
+  if (!paged_kv || slot < 0 || slot >= int(slots_.size())) return;
+  Slot& s = slots_[slot];
+  const uint32_t need_blks = (need_pos + 127u) / 128u;
+  uint32_t* tab = (uint32_t*)s.kv_tab.contents;
+  while (s.kv_blocks.size() < need_blks) {
+    const uint32_t blk = kv_pool.alloc_block();
+    if (blk == dankattn::KvRadixPool::INVALID_BLOCK) mtl::die("paged_kv: physical KV block pool exhausted");
+    tab[s.kv_blocks.size()] = blk;
+    s.kv_blocks.push_back(blk);
+  }
+}
+
+void Model::commit_kv_blocks(int slot) {
+  if (!paged_kv || slot < 0 || slot >= int(slots_.size())) return;
+  const auto& sh = (slot == cur_slot) ? history : slots_[slot].history;
+  kv_pool.insert_blocks(sh, slots_[slot].kv_blocks);
+}
+
+void Model::release_kv_blocks(int slot) {
+  if (!paged_kv || slot < 0 || slot >= int(slots_.size())) return;
+  kv_pool.release_blocks(slots_[slot].kv_blocks);
+  slots_[slot].kv_blocks.clear();
+}
+
 int Model::add_slot(uint32_t capacity) {
   if (capacity > slots_[0].cap || capacity % 128) mtl::die("add_slot: capacity must be <= slot 0's and a multiple of 128");
   Slot s;
   s.cap = capacity;
-  for (auto& l : L) {
-    id<MTLBuffer> la = C.buf(size_t(l.sparse ? capacity : RING) * lat_row(l));
+  for (size_t li = 0; li < L.size(); li++) {
+    auto& l = L[li];
+    id<MTLBuffer> la = (paged_kv && l.sparse) ? slots_[0].lat[li] : C.buf(size_t(l.sparse ? capacity : RING) * lat_row(l));
     id<MTLBuffer> tr = l.sparse ? C.buf(size_t(TOKR) * 128 * 4) : nil;
-    id<MTLBuffer> bk = l.sparse ? C.buf(size_t(capacity / 4) * 128 * 2) : nil;
+    id<MTLBuffer> bk = (paged_kv && l.sparse) ? slots_[0].bk[li] : (l.sparse ? C.buf(size_t(capacity / 4) * 128 * 2) : nil);
     s.lat.push_back(la);
     s.tokring.push_back(tr);
     s.bk.push_back(bk);
     if (slot_rs) {
-      if (la) [slot_rs addAllocation:la];
+      if (la && !(paged_kv && l.sparse)) [slot_rs addAllocation:la];
       if (tr) [slot_rs addAllocation:tr];
-      if (bk) [slot_rs addAllocation:bk];
+      if (bk && !(paged_kv && l.sparse)) [slot_rs addAllocation:bk];
     }
+  }
+  if (paged_kv) {
+    s.kv_tab = C.buf(size_t(capacity / 128) * 4);
+    memset(s.kv_tab.contents, 0, size_t(capacity / 128) * 4);
+    if (slot_rs) [slot_rs addAllocation:s.kv_tab];
   }
   if (has_dfly) {
     s.df_xf = C.buf(size_t(H) * 4);
@@ -1682,21 +1730,29 @@ void Model::hc_read(Rec& rc, const Raw& fn, const Raw& base, const Raw& scale, c
 void Model::ensure_lane_pipes() {
   if (lane_pipes_ready) return;
   const std::string hk = mtl::slurp(mtl::tree_root() + "/engine/kernels/hy4.metal");
-  for (const char* k : {"h4_attn_in", "h4_idx_pool", "h4_idx_score_mma", "h4_idx_topk"})
-    P[std::string(k) + "_lanes"] = C.pipe(hk, k, {{"LANES", "1"}});
+  std::map<std::string, std::string> ldefs = {{"LANES", "1"}};
+  if (paged_kv) ldefs["PAGED_KV"] = "1";
+  for (const char* k : {"h4_attn_in", "h4_idx_pool", "h4_idx_score_mma"})
+    P[std::string(k) + "_lanes"] = C.pipe(hk, k, ldefs);
+  P["h4_idx_topk_lanes"] = C.pipe(hk, "h4_idx_topk", {{"LANES", "1"}});
   P["h4_attn_mma_swa_lanes"] = C.pipe(hk, "h4_attn_mma", {{"LANES", "1"}, {"ATT_SLIDING", "1"}, {"ATT_KV8", "0"}});
-  P["h4_attn_mma_dsa_lanes"] = C.pipe(hk, "h4_attn_mma", {{"LANES", "1"}, {"ATT_SLIDING", "0"}, {"ATT_KV8", kv8 ? "1" : "0"}});
+  {
+    std::map<std::string, std::string> ddefs = {{"LANES", "1"}, {"ATT_SLIDING", "0"}, {"ATT_KV8", kv8 ? "1" : "0"}};
+    if (paged_kv) ddefs["PAGED_KV"] = "1";
+    P["h4_attn_mma_dsa_lanes"] = C.pipe(hk, "h4_attn_mma", ddefs);
+  }
   P["h4_sample_lanes"] = C.pipe(hk, "h4_sample_lanes");
   if (has_dfly) {
     for (const char* k : {"h4_draft_eh_rms", "h4_draft_eh_add", "h4_dsel_lanes",
                           "h4_draft_corr", "h4_pick_p_lanes", "h4_dgate_lanes"})
       P[k] = C.pipe(hk, k);
   }
+  C.flush_shader_cache();
   lane_pipes_ready = true;
 }
 
 void Model::rebuild_lane_tables() {
-  struct LaneStateHost { uint64_t lat, tokring, bk; };
+  struct LaneStateHost { uint64_t lat, tokring, bk, kv_tab; };
   lane_tab.resize(nL);
   const size_t ns = slots_.size();
   for (uint32_t li = 0; li < nL; li++) {
@@ -1706,6 +1762,7 @@ void Model::rebuild_lane_tables() {
       t[s].lat = slots_[s].lat[li] ? slots_[s].lat[li].gpuAddress : 0;
       t[s].tokring = slots_[s].tokring[li] ? slots_[s].tokring[li].gpuAddress : 0;
       t[s].bk = slots_[s].bk[li] ? slots_[s].bk[li].gpuAddress : 0;
+      t[s].kv_tab = slots_[s].kv_tab ? slots_[s].kv_tab.gpuAddress : 0;
     }
   }
 }
@@ -1812,6 +1869,8 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
       [e setBuffer:lane_tab[li] offset:0 atIndex:12];
       [e setBuffer:row_lane_b offset:0 atIndex:13];
       [e setBuffer:row_pos_b offset:0 atIndex:14];
+    } else if (paged_kv) {
+      [e setBuffer:slots_[cur_slot].kv_tab offset:0 atIndex:15];
     }
     [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
@@ -1830,6 +1889,8 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
       [e setBuffer:lane_tab[li] offset:0 atIndex:12];
       [e setBuffer:row_lane_b offset:0 atIndex:13];
       [e setBuffer:row_pos_b offset:0 atIndex:14];
+    } else if (paged_kv) {
+      [e setBuffer:slots_[cur_slot].kv_tab offset:0 atIndex:15];
     }
     [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
@@ -1869,6 +1930,8 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
           [e setBuffer:lane_tab[li] offset:0 atIndex:12];
           [e setBuffer:row_lane_b offset:0 atIndex:13];
           [e setBuffer:row_pos_b offset:0 atIndex:14];
+        } else if (paged_kv) {
+          [e setBuffer:slots_[cur_slot].kv_tab offset:0 atIndex:15];
         }
         [e dispatchThreadgroups:MTLSizeMake(((top_pos + 1) / 4 + 255) / 256, mb, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       }
@@ -1922,6 +1985,8 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
       [e setBuffer:lane_tab[li] offset:0 atIndex:12];
       [e setBuffer:row_lane_b offset:0 atIndex:13];
       [e setBuffer:row_pos_b offset:0 atIndex:14];
+    } else if (paged_kv && l.sparse) {
+      [e setBuffer:slots_[cur_slot].kv_tab offset:0 atIndex:15];
     }
     [e dispatchThreadgroups:MTLSizeMake(l.nh / 16, M, splits) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (!direct) {
@@ -2064,6 +2129,7 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   if (M == 0 || M > MR) mtl::die("step: too many rows (HY4_MP)");
   if (logits_out && M > MAXM) mtl::die("step: all-row logits only for <= 16 rows");
   if (pos + M > cap) mtl::die("step: KV capacity exceeded");
+  if (paged_kv) ensure_kv_blocks(cur_slot, pos + M);
   const uint32_t p0 = pos;
   const double h_entry = host_now();
   double h_commit0 = 0;
@@ -2247,6 +2313,7 @@ std::vector<uint32_t> Model::step_lanes(const std::vector<LaneBatch>& batches, d
     const int32_t sdelta = (b.slot == cur_slot) ? mrope_delta : slots_[b.slot].mrope_delta;
     const uint32_t scap = (b.slot == cur_slot) ? cap : slots_[b.slot].cap;
     if (sp + b.toks.size() > scap) mtl::die("step_lanes: lane KV capacity exceeded");
+    if (paged_kv) ensure_kv_blocks(b.slot, sp + uint32_t(b.toks.size()));
     const uint32_t p0 = sp;
     sh.insert(sh.end(), b.toks.begin(), b.toks.end());
     if (sp3.size() < p0) {
@@ -2404,6 +2471,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
   const double h_entry = host_now();
   const uint32_t W = dblock, p = pos;
   if (p + W > cap) return {};
+  if (paged_kv) ensure_kv_blocks(cur_slot, p + W);
   {
     uint32_t* di = (uint32_t*)dids.contents;
     di[0] = anchor;
@@ -2477,6 +2545,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       [e setBuffer:iw offset:0 atIndex:7];
       [e setBuffer:iw offset:0 atIndex:8];
       [e setBytes:&a length:sizeof a atIndex:9];
+      if (paged_kv) [e setBuffer:slots_[cur_slot].kv_tab offset:0 atIndex:15];
       [e dispatchThreadgroups:MTLSizeMake(W, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     mm(rc, "d_qb", d.qb, qa_frag, Yq, W);
@@ -2520,6 +2589,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       [e setBytes:&a length:sizeof a atIndex:6];
       setb(e, d.sinks, 7);
       [e setBuffer:ofrag offset:0 atIndex:8];
+      if (paged_kv) [e setBuffer:slots_[cur_slot].kv_tab offset:0 atIndex:15];
       [e dispatchThreadgroups:MTLSizeMake(d.nh / 16, W, as_draft) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       MergeArgs ma{W, d.nh, as_draft, 16};
       e = rc.op("d_attn_merge");

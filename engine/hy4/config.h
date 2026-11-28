@@ -17,6 +17,7 @@ struct Config {
   uint32_t mp = env_u("HY4_MP", 1024);
   uint32_t pf_dec_chunk = env_u("HY4_PF_DEC_CHUNK", 256);  // prefill chunk cap when decode lanes are active
   bool kv8 = env_b("HY4_KV8", true);
+  bool paged_kv = env_b("HY4_PAGED_KV", false);  // shared 128-token paged KV pool + radix prefix tree across slots
   bool dense_attn = env_set("HY4_DENSE");
   uint32_t gch = env_u("HY4_GCH", 4);
   uint32_t commit_layers = env_u("HY4_COMMIT_LAYERS", 6);
