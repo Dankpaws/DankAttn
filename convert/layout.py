@@ -47,6 +47,17 @@ def pack_codes(q, bits):
         u = e.astype(np.uint8) & 0x03
         u = u.reshape(NF, KS, 32, 8, 4)
         return (u[..., 0] | (u[..., 1] << 2) | (u[..., 2] << 4) | (u[..., 3] << 6)).reshape(-1)
+    if bits == 3:
+        # 12 bytes per lane per k-step: 8 bytes lo2 (2 bits x 32) + 4 bytes hi1 (1 bit x 32)
+        u = (e + 4).astype(np.uint8) & 0x07  # 0..7
+        lo2 = (u & 0x03).reshape(NF, KS, 32, 8, 4)
+        lo_bytes = (lo2[..., 0] | (lo2[..., 1] << 2) | (lo2[..., 2] << 4) | (lo2[..., 3] << 6))
+        hi1 = ((u >> 2) & 0x01).reshape(NF, KS, 32, 4, 8)
+        hi_bytes = (
+            hi1[..., 0] | (hi1[..., 1] << 1) | (hi1[..., 2] << 2) | (hi1[..., 3] << 3)
+            | (hi1[..., 4] << 4) | (hi1[..., 5] << 5) | (hi1[..., 6] << 6) | (hi1[..., 7] << 7)
+        )
+        return np.concatenate([lo_bytes, hi_bytes], axis=-1).reshape(-1)
     if bits == 6:
         # 24 bytes per lane per k-step: 16 bytes lo4 (same nibble order as W4) + 8 bytes hi2 (2 bits x 32)
         u = (e + 32).astype(np.uint8)  # 0..63
@@ -80,6 +91,43 @@ def pack_nvfp4_codes(u4):
     return (e[..., :4] | (e[..., 4:] << 4)).astype(np.uint8).reshape(-1)
 
 
+def pack_mxfp4_codes(u4):
+    """u4: uint8 array [N, K] of E2M1 nibble codes in 0..15 (GS=32).
+    Returns uint8 bytes in register-direct W4 order: [N/32][K/32][32 lanes][16 bytes]."""
+    return pack_nvfp4_codes(u4)
+
+
+E2M1_VALS = np.array([
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+], dtype=np.float32)
+
+
+def quantize_mxfp4(w, gs=32, e8m0=True):
+    """Quantize f32 [N, K] to MXFP4 E2M1 codes [N, K] (uint8 0..15) and scales [N, K/gs] (f32 -> f16).
+    When e8m0=True, scales are rounded to exact powers of two (OCP MXFP4 spec)."""
+    N, K = w.shape
+    assert K % gs == 0
+    g = w.reshape(N, K // gs, gs).astype(np.float32)
+    amax = np.abs(g).max(-1)
+    amax = np.where(amax == 0, 1e-12, amax)
+    raw_s = amax / 6.0
+    if e8m0:
+        # Power-of-two scale >= raw_s (clamped to f16 normal range)
+        exp = np.ceil(np.log2(np.maximum(raw_s, 2.0 ** -14)))
+        s = np.clip(2.0 ** exp, 2.0 ** -14, 2.0 ** 15).astype(np.float16).astype(np.float32)
+    else:
+        s = np.where(raw_s.astype(np.float16) == 0, np.float32(6e-8), raw_s.astype(np.float16).astype(np.float32))
+    wn = g / s[..., None]
+    # Nearest E2M1 code per element
+    pos_vals = E2M1_VALS[:8]
+    sign = (wn < 0).astype(np.uint8)
+    mag = np.abs(wn)
+    idx = np.argmin(np.abs(mag[..., None] - pos_vals), axis=-1).astype(np.uint8)
+    codes = (sign << 3) | idx
+    return codes.reshape(N, K), s
+
+
 def pack_mxfp8_codes(u8):
     """u8: uint8 array [N, K] of raw FP8 E4M3FN bytes.
     Returns uint8 bytes in register-direct W8 order: [N/32][K/32][32 lanes][32 bytes]."""
@@ -94,13 +142,19 @@ def quantize(w, bits, gs, clip_search=True):
     """Symmetric per-(row, group) quantization. w: f32 [N, K]. Returns codes, scales [N, K/gs].
     With clip_search, each group's scale minimises squared error over a small clip grid."""
     N, K = w.shape
-    qmax = 7 if bits == 4 else 127
-    qmin = -8 if bits == 4 else -128
+    if bits == 3:
+        qmin, qmax = -4, 3
+    elif bits == 4:
+        qmin, qmax = -8, 7
+    elif bits == 6:
+        qmin, qmax = -32, 31
+    else:
+        qmin, qmax = -128, 127
     g = w.reshape(N, K // gs, gs)
     amax = np.abs(g).max(-1)
     amax = np.where(amax == 0, 1e-12, amax)
     best_s = amax / qmax
-    if clip_search and bits == 4:
+    if clip_search and bits in (3, 4):
         best_err = None
         for r in (1.0, 0.95, 0.9, 0.85, 0.8, 0.75):
             s = amax * r / qmax

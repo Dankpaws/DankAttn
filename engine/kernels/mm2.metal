@@ -21,10 +21,13 @@ using namespace mpp::tensor_ops;
 #if WBITS == 2 || WBITS == 20
 #define WLOAD uint2
 #define WV 1            // uint2 per lane per k-step (8 B = 32 x 2-bit codes)
+#elif WBITS == 3
+#define WLOAD uint
+#define WV 3            // uint per lane per k-step (12 B = 8 B lo2 + 4 B hi1)
 #elif WBITS == 6
 #define WLOAD uint2
 #define WV 3            // uint2 per lane per k-step (24 B = 16 B lo4 + 8 B hi2)
-#elif WBITS == 40       // NVFP4 (E2M1, GS=16, in-unpack scaling)
+#elif WBITS == 40 || WBITS == 41  // NVFP4 (40, GS=16 in-unpack) / MXFP4 (41, GS=32 group-scaled)
 #define WLOAD uint4
 #define WV 1            // uint4 per lane per k-step (16 B = 32 E2M1 nibbles)
 #elif WBITS == 80       // MXFP8 (E4M3FN, GS=32, f16 power-of-two scales)
@@ -47,7 +50,7 @@ static inline float xsilu(float x) { return x / (1.0f + exp(-x)); }
 constant float W2_LUT[4] = {-1.0f, -0.2998f, 0.2998f, 1.0f};
 #elif WBITS == 20
 constant float W2_LUT[4] = {-1.0f, -0.33333334f, 0.33333334f, 1.0f};
-#elif WBITS == 40
+#elif WBITS == 40 || WBITS == 41
 constant float E2M1_LUT[16] = {
   0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -97,6 +100,18 @@ static inline void unpack_w(thread const WLOAD* v, thread Dst& out,
     out[16 * j + 8] = b2.x; out[16 * j + 9] = b2.y; out[16 * j + 10] = b2.z; out[16 * j + 11] = b2.w;
     out[16 * j + 12] = b3.x; out[16 * j + 13] = b3.y; out[16 * j + 14] = b3.z; out[16 * j + 15] = b3.w;
   }
+#elif WBITS == 3
+  const uint lo2[2] = {v[0], v[1]};
+  const uint hi1 = v[2];
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 2; j++) {
+    const uint lw = lo2[j];
+    const uint hw = hi1 >> (16 * j);
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 16; i++) {
+      out[16 * j + i] = bfloat(float(int(((lw >> (2 * i)) & 3u) | (((hw >> i) & 1u) << 2)) - 4));
+    }
+  }
 #elif WBITS == 4
   const uint w4[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
 #pragma clang loop unroll(full)
@@ -105,6 +120,15 @@ static inline void unpack_w(thread const WLOAD* v, thread Dst& out,
     for (int i = 0; i < 4; i++) {
       out[8 * j + i] = bfloat(float(int((w4[j] >> (8 * i)) & 15u) - 8));
       out[8 * j + 4 + i] = bfloat(float(int((w4[j] >> (8 * i + 4)) & 15u) - 8));
+    }
+#elif WBITS == 41
+  const uint w4[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4; j++)
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 4; i++) {
+      out[8 * j + i] = bfloat(E2M1_LUT[(w4[j] >> (8 * i)) & 15u]);
+      out[8 * j + 4 + i] = bfloat(E2M1_LUT[(w4[j] >> (8 * i + 4)) & 15u]);
     }
 #elif WBITS == 40
   const uint w4[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
@@ -1399,6 +1423,75 @@ kernel void mm1(device const WLOAD* W [[buffer(0)]], device const half* S [[buff
       acc0 = fma(c0, s0, acc0); acc1 = fma(c1, s1, acc1);
       acc2 = fma(c2, s2, acc2); acc3 = fma(c3, s3, acc3);
     }
+  }
+#elif WBITS == 41
+  // Continuous cross-group software-pipelined MXFP4 (E2M1, GS=32) matvec
+  if (gper > 0u) {
+    uint4 v0 = Wp[size_t(ks0) * 32u];
+    const uint ks_end = ks0 + gper * KPG;
+    auto dec_e2m1_lo = [](uint w) -> float4 {
+      return float4(E2M1_LUT[w & 15u], E2M1_LUT[(w >> 8) & 15u], E2M1_LUT[(w >> 16) & 15u], E2M1_LUT[(w >> 24) & 15u]);
+    };
+    auto dec_e2m1_hi = [](uint w) -> float4 {
+      return float4(E2M1_LUT[(w >> 4) & 15u], E2M1_LUT[(w >> 12) & 15u], E2M1_LUT[(w >> 20) & 15u], E2M1_LUT[(w >> 28) & 15u]);
+    };
+    for (uint g = 0; g < gper; g++) {
+      float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+      const uint ks_g = ks0 + g * KPG;
+      device const half* sp = Sp + (g0 + g) * 32u;
+      float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+#pragma clang loop unroll(full)
+      for (uint u = 0; u < KPG; u++) {
+        const uint ks = ks_g + u;
+        uint4 nv0;
+        if (ks + 1u < ks_end) nv0 = Wp[size_t(ks + 1u) * 32u];
+        if (u == KPG - 1u) {
+          s0 = float(sp[n_base + 0u]); s1 = float(sp[n_base + 8u]);
+          s2 = float(sp[n_base + 16u]); s3 = float(sp[n_base + 24u]);
+        }
+        device const bfloat* xp = Xbf + size_t(ks) * 512u + l_x * 16u;
+        const float4 x0 = float4(*(device const bfloat4*)(xp));
+        const float4 x1 = float4(*(device const bfloat4*)(xp + 8u));
+        c0 += dot(dec_e2m1_lo(v0.x), x0) + dot(dec_e2m1_lo(v0.z), x1);
+        c1 += dot(dec_e2m1_hi(v0.x), x0) + dot(dec_e2m1_hi(v0.z), x1);
+        c2 += dot(dec_e2m1_lo(v0.y), x0) + dot(dec_e2m1_lo(v0.w), x1);
+        c3 += dot(dec_e2m1_hi(v0.y), x0) + dot(dec_e2m1_hi(v0.w), x1);
+        if (ks + 1u < ks_end) v0 = nv0;
+      }
+      acc0 = fma(c0, s0, acc0); acc1 = fma(c1, s1, acc1);
+      acc2 = fma(c2, s2, acc2); acc3 = fma(c3, s3, acc3);
+    }
+  }
+#elif WBITS == 3
+  // 3-bit symmetric int3 (lo2 + hi1, 12 B/lane) matvec
+  for (uint g = 0; g < gper; g++) {
+    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+    const uint ks_g = ks0 + g * KPG;
+    device const half* sp = Sp + (g0 + g) * 32u;
+#pragma clang loop unroll(full)
+    for (uint u = 0; u < KPG; u++) {
+      const uint ks = ks_g + u;
+      device const uint* wp = Wp + size_t(ks) * 32u * 3u;
+      const uint lo0 = wp[0], lo1 = wp[1], hi = wp[2];
+      device const bfloat* xp = Xbf + size_t(ks) * 512u + l_x * 16u;
+      const float4 x0 = float4(*(device const bfloat4*)(xp));
+      const float4 x1 = float4(*(device const bfloat4*)(xp + 8u));
+      auto dec3 = [](uint lw, uint hw, uint off) -> float4 {
+        return float4(
+          float(int(((lw >> (2 * (off + 0))) & 3u) | (((hw >> (off + 0)) & 1u) << 2)) - 4),
+          float(int(((lw >> (2 * (off + 1))) & 3u) | (((hw >> (off + 1)) & 1u) << 2)) - 4),
+          float(int(((lw >> (2 * (off + 2))) & 3u) | (((hw >> (off + 2)) & 1u) << 2)) - 4),
+          float(int(((lw >> (2 * (off + 3))) & 3u) | (((hw >> (off + 3)) & 1u) << 2)) - 4));
+      };
+      c0 += dot(dec3(lo0, hi, 0u), x0) + dot(dec3(lo1, hi >> 16, 0u), x1);
+      c1 += dot(dec3(lo0, hi, 4u), x0) + dot(dec3(lo1, hi >> 16, 4u), x1);
+      c2 += dot(dec3(lo0, hi, 8u), x0) + dot(dec3(lo1, hi >> 16, 8u), x1);
+      c3 += dot(dec3(lo0, hi, 12u), x0) + dot(dec3(lo1, hi >> 16, 12u), x1);
+    }
+    acc0 = fma(c0, float(sp[n_base + 0u]), acc0);
+    acc1 = fma(c1, float(sp[n_base + 8u]), acc1);
+    acc2 = fma(c2, float(sp[n_base + 16u]), acc2);
+    acc3 = fma(c3, float(sp[n_base + 24u]), acc3);
   }
 #else
   for (uint g = 0; g < gper; g++) {
