@@ -3,6 +3,7 @@
 #pragma once
 #include "../core/pack.h"
 #include "../mtl.h"
+#include "../core/mtl4.h"
 #include "../mm_args.h"
 #include <cstdint>
 #include <map>
@@ -118,6 +119,7 @@ struct Model {
   id<MTLBuffer> logits_buf = nil;  // [MAXM, vocab] f32
 
   std::string mm2_src, e5_src;
+  dankattn::Mtl4Runtime mtl4;
   std::unordered_map<std::string, id<MTLComputePipelineState>> e5_pcache;
   std::unordered_map<uint64_t, id<MTLComputePipelineState>> mm_pcache;
 

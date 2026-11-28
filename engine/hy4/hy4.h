@@ -3,6 +3,7 @@
 // Flash-Next engine; everything model-specific is here and in kernels/hy4.metal.
 #pragma once
 #include "../core/kv_radix.h"
+#include "../core/mtl4.h"
 #include "../core/pack.h"
 #include "../mtl.h"
 #include "config.h"
@@ -214,6 +215,7 @@ struct Model {
                                    double* gpu_ms = nullptr);
 
   // pipelines (mm2/mmp/mmpg compiled lazily for only the (bits, gs) pairs present in this pack)
+  dankattn::Mtl4Runtime mtl4;
   std::map<std::string, id<MTLComputePipelineState>> P;
   id<MTLComputePipelineState> pipe(const std::string& k) const;
   // scratch (phase-aliased intermediates live in scratch_heap)

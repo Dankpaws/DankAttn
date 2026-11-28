@@ -1,4 +1,5 @@
 // DankAttn (ERNIE-5.5): Metal 4 engine implementation.
+#define DANKATTN_MTL4_IMPL
 #include "ernie55.h"
 #include <cerrno>
 #include <cmath>
@@ -164,6 +165,8 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   hadamard = man[@"hadamard"] ? [man[@"hadamard"] boolValue] : false;
 
   if (cap % 128) mtl::die("capacity must be a multiple of 128");
+  const bool want_mtl4 = dankattn::env_b("DANKATTN_MTL4", false);
+  if (want_mtl4) C.track = true;
 
   // Load weight shards (mmap locally, or HTTP stream into unified RAM)
   MTLResidencySetDescriptor* rsd = [MTLResidencySetDescriptor new];
@@ -204,6 +207,10 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   [rs commit];
   [rs requestResidency];
   [C.q addResidencySet:rs];
+  if (want_mtl4) {
+    mtl4.init(C.dev);
+    mtl4.add_residency_set(rs);
+  }
 
   NSDictionary* T = man[@"tensors"];
   auto lin = [&](const std::string& name, uint32_t slots = 1) {
@@ -388,6 +395,10 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   logits_buf = C.buf(size_t(MAXM) * vocab * 4);
 
   state_bytes = C.allocated - alloc0;
+  if (want_mtl4) {
+    mtl4.add_buffers(C.made);
+    fprintf(stderr, "ernie55: Metal 4 command encoding enabled (DANKATTN_MTL4=1, %zu tracked bufs)\n", C.made.size());
+  }
 
   // Load Metal sources
   const std::string root = mtl::tree_root();
@@ -683,14 +694,17 @@ const float* Model::step(const std::vector<uint32_t>& toks, double* gpu_ms,
   memcpy([ids_buf contents], toks.data(), M * 4);
 
   static const int prof = getenv("E5_PROF") ? atoi(getenv("E5_PROF")) : 0;
+  const bool use_m4 = mtl4.enabled && !prof;
   std::map<std::string, double> pt;
   std::vector<id<MTLCommandBuffer>> cbs;
-  id<MTLCommandBuffer> cb = [C.q commandBuffer];
-  id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+  id<MTLCommandBuffer> cb = use_m4 ? nil : [C.q commandBuffer];
+  double m4_t0 = use_m4 ? dankattn::host_now() : 0.0;
+  id<MTLComputeCommandEncoder> e = use_m4 ? mtl4.begin(/*auto_barrier=*/true) : [cb computeCommandEncoder];
 
   static const bool no_barr = getenv("E5_NO_BARR") && atoi(getenv("E5_NO_BARR")) != 0;
-  auto barr = [&]() { if (!no_barr) [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+  auto barr = [&]() { if (!use_m4 && !no_barr) [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
   auto flush_cb = [&]() {
+    if (use_m4) return;
     [e endEncoding];
     [cb commit];
     cbs.push_back(cb);
@@ -1388,6 +1402,13 @@ const float* Model::step(const std::vector<uint32_t>& toks, double* gpu_ms,
       [e setBytes:&ma length:sizeof(ma) atIndex:3];
       [e dispatchThreads:MTLSizeMake(vocab, lm_M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
+  }
+
+  if (use_m4) {
+    mtl4.commit_and_wait();
+    if (gpu_ms) *gpu_ms = (dankattn::host_now() - m4_t0) * 1e3;
+    pos += M;
+    return need_logits ? (const float*)[logits_buf contents] : nullptr;
   }
 
   [e endEncoding];

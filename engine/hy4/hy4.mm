@@ -1,3 +1,4 @@
+#define DANKATTN_MTL4_IMPL
 #include "hy4.h"
 #include "../core/runtime.h"
 #include "../mm_args.h"
@@ -135,6 +136,8 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
 
   size_t total = 0;
   id<MTLResidencySet> rs;
+  const bool want_mtl4 = dankattn::env_b("DANKATTN_MTL4", false);
+  if (want_mtl4) C.track = true;
   {
     MTLResidencySetDescriptor* d = [MTLResidencySetDescriptor new];
     d.label = @"hy4-weights";
@@ -803,6 +806,14 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
     [slot_rs commit];
     [slot_rs requestResidency];
     [C.q addResidencySet:slot_rs];
+  }
+  if (want_mtl4) {
+    mtl4.init(C.dev);
+    mtl4.add_residency_set(rs);
+    mtl4.add_residency_set(slot_rs);
+    mtl4.add_heap(scratch_heap);
+    mtl4.add_buffers(C.made);
+    fprintf(stderr, "hy4: Metal 4 command encoding enabled (DANKATTN_MTL4=1, %zu tracked bufs)\n", C.made.size());
   }
   {  // macOS drops the wiring soon after the GPU idles; ask again every second while recently used (mtl::keep_warm)
     const int64_t iv = hy4::cfg().residency_ms * int64_t(NSEC_PER_MSEC);
@@ -2001,11 +2012,16 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
       [e dispatchThreadgroups:MTLSizeMake(mb, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     if (l.lsel && pf && !lanes) {  // DFly2 only needs the last prefill row's selection (at row 0 of the 16-row l.lsel)
-      if (rc.e) { [rc.e endEncoding]; rc.e = nil; }
-      id<MTLBlitCommandEncoder> bl = [rc.cb blitCommandEncoder];
-      [bl copyFromBuffer:sel sourceOffset:size_t(M - 1) * selmax * 4 toBuffer:l.lsel destinationOffset:0 size:size_t(selmax) * 4];
-      [bl copyFromBuffer:nsel sourceOffset:size_t(M - 1) * 4 toBuffer:l.lnsel destinationOffset:0 size:4];
-      [bl endEncoding];
+      if (rc.mtl4_e) {
+        mtl4.copy_buffer(sel, size_t(M - 1) * selmax * 4, l.lsel, 0, size_t(selmax) * 4);
+        mtl4.copy_buffer(nsel, size_t(M - 1) * 4, l.lnsel, 0, 4);
+      } else {
+        if (rc.e) { [rc.e endEncoding]; rc.e = nil; }
+        id<MTLBlitCommandEncoder> bl = [rc.cb blitCommandEncoder];
+        [bl copyFromBuffer:sel sourceOffset:size_t(M - 1) * selmax * 4 toBuffer:l.lsel destinationOffset:0 size:size_t(selmax) * 4];
+        [bl copyFromBuffer:nsel sourceOffset:size_t(M - 1) * 4 toBuffer:l.lnsel destinationOffset:0 size:4];
+        [bl endEncoding];
+      }
     }
   }
   {
@@ -2225,12 +2241,20 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
     memcpy(vis_idx_b.contents, vis_idx, M * 4);
   }
 
+  const bool use_m4 = mtl4.enabled && profile == nullptr && !vis_buf;
   Rec rc;
-  rc.cb = [C.q commandBuffer];
   rc.prof = profile != nullptr;
+  double m4_t0 = 0.0;
+  if (use_m4) {
+    m4_t0 = host_now();
+    rc.mtl4_e = mtl4.begin(/*auto_barrier=*/false);
+  } else {
+    rc.cb = [C.q commandBuffer];
+  }
   std::vector<id<MTLCommandBuffer>> sent;  // early commits: the GPU starts while later layers are encoded
   const uint32_t chunk_layers = cfg().commit_layers;
   auto commit_now = [&]() {
+    if (use_m4) return;
     if (rc.e) { [rc.e endEncoding]; rc.e = nil; }
     [rc.cb commit];
     if (!h_commit0) h_commit0 = host_now();
@@ -2295,13 +2319,19 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   // prefill: only the last row goes through the head (its streams moved to row 0 first)
   const uint32_t MH = M > MAXM ? 1 : M;
   if (M > MAXM) {
-    id<MTLBlitCommandEncoder> bl;
-    if (rc.e) { [rc.e endEncoding]; rc.e = nil; }
-    bl = [rc.cb blitCommandEncoder];
-    [bl copyFromBuffer:h sourceOffset:size_t(M - 1) * HC * H * 4 toBuffer:h destinationOffset:0 size:size_t(HC) * H * 4];
-    [bl copyFromBuffer:(ynorm_pending ? Yo : y) sourceOffset:size_t(M - 1) * H * 4 toBuffer:(ynorm_pending ? Yo : y) destinationOffset:0 size:size_t(H) * 4];
-    [bl copyFromBuffer:post_f sourceOffset:size_t(M - 1) * 16 toBuffer:post_f destinationOffset:0 size:16];
-    [bl endEncoding];
+    if (use_m4) {
+      mtl4.copy_buffer(h, size_t(M - 1) * HC * H * 4, h, 0, size_t(HC) * H * 4);
+      mtl4.copy_buffer(ynorm_pending ? Yo : y, size_t(M - 1) * H * 4, ynorm_pending ? Yo : y, 0, size_t(H) * 4);
+      mtl4.copy_buffer(post_f, size_t(M - 1) * 16, post_f, 0, 16);
+    } else {
+      id<MTLBlitCommandEncoder> bl;
+      if (rc.e) { [rc.e endEncoding]; rc.e = nil; }
+      bl = [rc.cb blitCommandEncoder];
+      [bl copyFromBuffer:h sourceOffset:size_t(M - 1) * HC * H * 4 toBuffer:h destinationOffset:0 size:size_t(HC) * H * 4];
+      [bl copyFromBuffer:(ynorm_pending ? Yo : y) sourceOffset:size_t(M - 1) * H * 4 toBuffer:(ynorm_pending ? Yo : y) destinationOffset:0 size:size_t(H) * 4];
+      [bl copyFromBuffer:post_f sourceOffset:size_t(M - 1) * 16 toBuffer:post_f destinationOffset:0 size:16];
+      [bl endEncoding];
+    }
   }
   hc_read(rc, hch_fn, hch_base, hch_scale, norm, post_f, post_a, 1, 1, MH, "hc_head");
   mm(rc, "mm.lm_head", lm_head, xn_frag, logits, MH);
@@ -2314,6 +2344,19 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
     [e setBuffer:amax offset:0 atIndex:1];
     if (temp > 0) [e setBytes:&sa length:sizeof sa atIndex:2]; else [e setBytes:&a length:sizeof a atIndex:2];
     [e dispatchThreadgroups:MTLSizeMake(MH, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+  }
+  if (use_m4) {
+    mtl4.commit_and_wait();
+    const double h_wake = host_now();
+    if (gpu_ms) *gpu_ms = (h_wake - m4_t0) * 1e3;
+    pos += M;
+    std::vector<uint32_t> out(MH);
+    memcpy(out.data(), amax.contents, MH * 4);
+    if (logits_out) {
+      logits_out->resize(size_t(MH) * lm_head.N);
+      memcpy(logits_out->data(), logits.contents, logits_out->size() * 4);
+    }
+    return out;
   }
   if (rc.e) [rc.e endEncoding];
   [rc.cb commit];
