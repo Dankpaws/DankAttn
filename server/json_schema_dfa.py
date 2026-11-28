@@ -447,6 +447,94 @@ class JsonSchemaDFA:
         c = self.clone()
         return c.feed(tok_str)
 
+    def _next_forced_chunk(self) -> str:
+        """Return the next uniquely-determined JSON syntax/key/const chunk, or '' if branching."""
+        if self.dead or self.mode == "done":
+            return ""
+        if self.mode == "lit":
+            return self.lit_target[self.lit_pos:]
+        if self.mode == "string" and self.str_is_key:
+            top = self.stack[-1]
+            sch = _resolve_ref(top.schema, self.root)
+            if sch.get("additionalProperties", True) is False:
+                props = sch.get("properties") or {}
+                cands = [k for k in props if k not in top.seen_keys and k.startswith(self.str_buf)]
+                if len(cands) == 1:
+                    return cands[0][len(self.str_buf):] + '"'
+                if len(cands) > 1:
+                    lcp = cands[0]
+                    for k in cands[1:]:
+                        i = 0
+                        lim = min(len(lcp), len(k))
+                        while i < lim and lcp[i] == k[i]:
+                            i += 1
+                        lcp = lcp[:i]
+                    if len(lcp) > len(self.str_buf):
+                        return lcp[len(self.str_buf):]
+            return ""
+        if self.mode == "value":
+            sch = _resolve_ref(self.cur_schema, self.root)
+            if "const" in sch:
+                return json.dumps(sch["const"], ensure_ascii=False, separators=(",", ":"))
+            if "enum" in sch and len(sch["enum"]) == 1:
+                return json.dumps(sch["enum"][0], ensure_ascii=False, separators=(",", ":"))
+            allowed = self._allowed_types(sch)
+            if allowed == {"object"}:
+                return "{"
+            if allowed == {"array"}:
+                return "["
+            if allowed == {"string"}:
+                return '"'
+            if allowed == {"null"}:
+                return "null"
+            return ""
+        if self.mode == "container":
+            top = self.stack[-1]
+            if top.kind == "obj":
+                if top.expect == "colon":
+                    return ":"
+                sch = _resolve_ref(top.schema, self.root)
+                addl = sch.get("additionalProperties", True)
+                props = sch.get("properties") or {}
+                req = sch.get("required") or []
+                unseen_props = [k for k in props if k not in top.seen_keys]
+                unseen_req = [k for k in req if k not in top.seen_keys]
+                if top.expect in ("key_or_end", "key"):
+                    if addl is False:
+                        if not unseen_props and top.expect == "key_or_end":
+                            return "}"
+                        if len(unseen_props) == 1 and (top.expect == "key" or unseen_props[0] in unseen_req):
+                            return json.dumps(unseen_props[0], ensure_ascii=False)
+                        if len(unseen_props) >= 1 and (top.expect == "key" or len(unseen_req) >= 1):
+                            return '"'
+                    elif top.expect == "key":
+                        return '"'
+                    return ""
+                if top.expect == "comma_or_end":
+                    if addl is False and not unseen_props:
+                        return "}"
+                    if len(unseen_req) >= 1:
+                        return ","
+                    return ""
+        return ""
+
+    def forced_prefix(self, max_chars: int = 128) -> str:
+        """Compute the maximal deterministic JSON prefix forced by the schema from the current state."""
+        if self.dead or self.mode == "done":
+            return ""
+        c = self.clone()
+        out: list[str] = []
+        total = 0
+        while total < max_chars:
+            chunk = c._next_forced_chunk()
+            if not chunk or total + len(chunk) > max_chars:
+                break
+            if not c.feed(chunk):
+                break
+            out.append(chunk)
+            total += len(chunk)
+        return "".join(out)
+
 
 class VocabMasker:
     """Computes allowed token IDs for any JsonSchemaDFA state over a HuggingFace Tokenizer."""

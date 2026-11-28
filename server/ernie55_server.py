@@ -415,7 +415,7 @@ async def chat(request: Request):
 
     rf = p["response_format"]
     top_lp = p["top_logprobs"]
-    cdrv = ConstrainedDriver(eng, tok, rf, tuple(eng.default_stops) + tuple(extra_stops), thinking, THINK_CLOSE) if rf else None
+    cdrv = ConstrainedDriver(eng, tok, rf, tuple(eng.default_stops) + tuple(extra_stops), thinking, THINK_CLOSE, allow_ff=(top_lp is None)) if rf else None
 
     def track(item):
         if isinstance(item, int):

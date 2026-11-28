@@ -725,6 +725,7 @@ async def chat(request: Request):
         ConstrainedDriver(
             eng, tok, rf, tuple(STOPS) + tuple(extra_stops),
             prompt.endswith("<|content_thinking|>"), "<|content_text|>",
+            allow_ff=(top_lp is None),
         )
         if (rf and group_arg is None) else None
     )

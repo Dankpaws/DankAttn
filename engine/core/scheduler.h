@@ -24,13 +24,18 @@ namespace dankattn::sched {
 using Req = proto::OpusReq;
 using ReqP = std::shared_ptr<Req>;
 
-// Thread-safe OPUS/OPCX/OPMK packet reader, request inbox, cancel tracker, and mask queue.
+// Thread-safe OPUS/OPCX/OPMK/OPFF packet reader, request inbox, cancel tracker, and control queue.
 struct Inbox {
+  struct CtrlMsg {
+    bool is_ff = false;  // true: OPFF jump-forward token span; false: OPMK allowed-token list
+    std::vector<uint32_t> ids;
+  };
+
   std::mutex mu;
   std::condition_variable cv;
   std::deque<ReqP> queue;
   std::map<uint32_t, ReqP> live;
-  std::map<uint32_t, std::deque<std::vector<uint32_t>>> mask_q;
+  std::map<uint32_t, std::deque<CtrlMsg>> mask_q;
   bool closed = false;
   std::thread reader_th;
 
@@ -48,9 +53,9 @@ struct Inbox {
           cv.notify_all();
           continue;
         }
-        if (kind == proto::PacketKind::Mask) {
+        if (kind == proto::PacketKind::Mask || kind == proto::PacketKind::FastForward) {
           std::lock_guard<std::mutex> g(mu);
-          mask_q[ctrl_rid].push_back(std::move(mask_ids));
+          mask_q[ctrl_rid].push_back(CtrlMsg{kind == proto::PacketKind::FastForward, std::move(mask_ids)});
           cv.notify_all();
           continue;
         }
@@ -84,8 +89,8 @@ struct Inbox {
     queue.push_front(std::move(q));
   }
 
-  // Block until an OPMK allowed-token list arrives for `rid`, or until cancelled / EOF.
-  bool pop_mask(uint32_t rid, const std::atomic<bool>& cancel, std::vector<uint32_t>& out) {
+  // Block until an OPMK mask or OPFF fast-forward span arrives for `rid`, or until cancelled / EOF.
+  bool pop_ctrl(uint32_t rid, const std::atomic<bool>& cancel, bool& out_is_ff, std::vector<uint32_t>& out) {
     std::unique_lock<std::mutex> g(mu);
     cv.wait(g, [&] {
       if (closed || cancel.load()) return true;
@@ -94,9 +99,15 @@ struct Inbox {
     });
     auto it = mask_q.find(rid);
     if (it == mask_q.end() || it->second.empty()) return false;
-    out = std::move(it->second.front());
+    out_is_ff = it->second.front().is_ff;
+    out = std::move(it->second.front().ids);
     it->second.pop_front();
     return true;
+  }
+
+  bool pop_mask(uint32_t rid, const std::atomic<bool>& cancel, std::vector<uint32_t>& out) {
+    bool is_ff = false;
+    return pop_ctrl(rid, cancel, is_ff, out);
   }
 
   // Wait while idle until either EOF or a queued request is ready (and `extra_ready()` is true).
@@ -192,6 +203,64 @@ inline bool sample_masked_or_logprobs_gpu(
   }
   if (want_lp) proto::send_logprob(req.rid, out_tok, lp_val, tops);
   return true;
+}
+
+// Jump-forward + masked/logprobs sampler: handles any queued OPFF forced-token spans in a single
+// batched forward pass (`feed_ff_fn`) before sampling the next branching token under OPMK.
+// `emit_fn(tok)` returns true if the request should stop (EOS/stop/max_new/cap/cancel).
+// `feed_ff_fn(toks)` feeds `toks` into the model and returns the byte offset of the final row in `logits_buf`.
+// Returns false if the request ended or was cancelled during jump-forward / waiting for a mask.
+template <typename EmitFn, typename FeedFfFn>
+inline bool sample_or_jump_forward_gpu(
+    Inbox& inbox, const Req& req, GpuSampler& gs, mtl::Ctx& C,
+    id<MTLBuffer> logits_buf, size_t logits_byte_off, uint32_t vocab,
+    float default_min_p, uint32_t& pos_ref, uint32_t& out_tok,
+    EmitFn&& emit_fn, FeedFfFn&& feed_ff_fn) {
+  const bool constrained = (req.flags & 64u) != 0u;
+  const bool want_lp = (req.flags & 128u) != 0u;
+  std::vector<uint32_t> ctrl_ids;
+  for (;;) {
+    if (constrained) {
+      bool is_ff = false;
+      if (!inbox.pop_ctrl(req.rid, req.cancel, is_ff, ctrl_ids)) return false;
+      if (is_ff) {
+        if (ctrl_ids.empty()) continue;
+        std::vector<uint32_t> fed;
+        fed.reserve(ctrl_ids.size());
+        bool stopped = false;
+        for (uint32_t t : ctrl_ids) {
+          fed.push_back(t);
+          if (emit_fn(t)) { stopped = true; break; }
+        }
+        fflush(stdout);
+        if (stopped) return false;
+        logits_byte_off = feed_ff_fn(fed);
+        if (req.cancel.load()) return false;
+        continue;
+      }
+    }
+    static const bool use_gpu = getenv("DANKATTN_GPU_SAMPLE") && atoi(getenv("DANKATTN_GPU_SAMPLE")) != 0;
+    float lp_val = 0.0f;
+    std::vector<std::pair<uint32_t, float>> tops;
+    const float eff_temp = req.temp > 0.0f ? req.temp : 0.0f;
+    const float eff_top_p = (req.top_p > 0.0f && req.top_p <= 1.0f) ? req.top_p : 1.0f;
+    const float eff_min_p = req.min_p >= 0.0f ? req.min_p : default_min_p;
+    if (use_gpu) {
+      out_tok = gs.sample(
+          C, logits_buf, logits_byte_off, vocab,
+          constrained ? &ctrl_ids : nullptr,
+          eff_temp, eff_top_p, req.top_k, eff_min_p,
+          req.seed, pos_ref, want_lp, req.top_logprobs, lp_val, tops);
+    } else {
+      const float* lg = (const float*)((const uint8_t*)logits_buf.contents + logits_byte_off);
+      out_tok = sample::sample_and_logprobs(
+          lg, vocab, constrained ? &ctrl_ids : nullptr,
+          eff_temp, eff_top_p, req.top_k, eff_min_p,
+          req.seed, pos_ref, want_lp, req.top_logprobs, lp_val, tops);
+    }
+    if (want_lp) proto::send_logprob(req.rid, out_tok, lp_val, tops);
+    return true;
+  }
 }
 
 inline void finish_request(

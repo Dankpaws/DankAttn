@@ -860,8 +860,17 @@ int main(ink2::Model& m) {
         if (need_lg && end >= a.rest.size()) {
           const size_t row_i = (c.size() > ink2::MAXM) ? 0u : (c.size() - 1u);
           const size_t lg_off = row_i * size_t(m.vocab_pad) * 4u;
-          dankattn::sched::sample_masked_or_logprobs_gpu(
-              in, *a.q, gpu_sampler(), m.C, m.b_logits, lg_off, m.vocab_valid, 0.0f, m.pos, a.b);
+          auto emit_ff = [&](uint32_t t) { return emit_tok(m, a, t); };
+          auto feed_ff = [&](const std::vector<uint32_t>& ftoks) -> size_t {
+            a.b = feed(m, a, ftoks, nullptr);
+            const size_t r = (ftoks.size() > ink2::MAXM) ? 0u : (ftoks.size() - 1u);
+            return r * size_t(m.vocab_pad) * 4u;
+          };
+          if (!dankattn::sched::sample_or_jump_forward_gpu(
+                  in, *a.q, gpu_sampler(), m.C, m.b_logits, lg_off, m.vocab_valid, 0.0f, m.pos, a.b,
+                  emit_ff, feed_ff)) {
+            a.q->cancel = true;
+          }
         }
         a.pref_off = end;
         if (a.pref_off >= a.rest.size()) {
@@ -915,8 +924,15 @@ int main(ink2::Model& m) {
         lane_hist()[a.lane].push_back(tok_in);
         a.rounds++;
         a.accepted++;
-        if (!dankattn::sched::sample_masked_or_logprobs_gpu(
-                in, *a.q, gpu_sampler(), m.C, m.b_logits, 0u, m.vocab_valid, 0.0f, m.pos, a.b)) {
+        auto emit_ff = [&](uint32_t t) { return emit_tok(m, a, t); };
+        auto feed_ff = [&](const std::vector<uint32_t>& ftoks) -> size_t {
+          a.b = feed(m, a, ftoks, nullptr);
+          const size_t r = (ftoks.size() > ink2::MAXM) ? 0u : (ftoks.size() - 1u);
+          return r * size_t(m.vocab_pad) * 4u;
+        };
+        if (!dankattn::sched::sample_or_jump_forward_gpu(
+                in, *a.q, gpu_sampler(), m.C, m.b_logits, 0u, m.vocab_valid, 0.0f, m.pos, a.b,
+                emit_ff, feed_ff)) {
           done[idx] = true;
         }
       }

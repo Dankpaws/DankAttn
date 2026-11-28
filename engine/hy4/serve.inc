@@ -530,8 +530,18 @@ int main(hy4::Model& m) {
         if (need_logits && end >= a.rest.size()) {
           const size_t row_i = (c.size() > hy4::MAXM) ? 0u : (c.size() - 1u);
           const size_t lg_off = row_i * size_t(m.lm_head.N) * 4u;
-          dankattn::sched::sample_masked_or_logprobs_gpu(
-              in, *a.q, gpu_sampler(), m.C, m.logits, lg_off, m.vocab, m.default_min_p, m.pos, a.b);
+          auto emit_ff = [&](uint32_t t) { return emit_tok(m, a, t); };
+          auto feed_ff = [&](const std::vector<uint32_t>& ftoks) -> size_t {
+            uint32_t sx = 0, ss = 0;
+            a.b = feed(m, ftoks, sx, ss, nullptr, &a.q->cancel);
+            const size_t r = (ftoks.size() > hy4::MAXM) ? 0u : (ftoks.size() - 1u);
+            return r * size_t(m.lm_head.N) * 4u;
+          };
+          if (!dankattn::sched::sample_or_jump_forward_gpu(
+                  in, *a.q, gpu_sampler(), m.C, m.logits, lg_off, m.vocab, m.default_min_p, m.pos, a.b,
+                  emit_ff, feed_ff)) {
+            a.q->cancel = true;
+          }
         }
         a.pms += g;
         a.pref_off = end;
@@ -590,8 +600,16 @@ int main(hy4::Model& m) {
             const bool need_lg = (a.q->flags & (64u | 128u)) != 0u;
             if (need_lg) {
               a.b = m.step({a.b}).back();
-              if (!dankattn::sched::sample_masked_or_logprobs_gpu(
-                      in, *a.q, gpu_sampler(), m.C, m.logits, 0u, m.vocab, m.default_min_p, m.pos, a.b)) {
+              auto emit_ff = [&](uint32_t t) { return emit_tok(m, a, t); };
+              auto feed_ff = [&](const std::vector<uint32_t>& ftoks) -> size_t {
+                uint32_t sx = 0, ss = 0;
+                a.b = feed(m, ftoks, sx, ss, nullptr, &a.q->cancel);
+                const size_t r = (ftoks.size() > hy4::MAXM) ? 0u : (ftoks.size() - 1u);
+                return r * size_t(m.lm_head.N) * 4u;
+              };
+              if (!dankattn::sched::sample_or_jump_forward_gpu(
+                      in, *a.q, gpu_sampler(), m.C, m.logits, 0u, m.vocab, m.default_min_p, m.pos, a.b,
+                      emit_ff, feed_ff)) {
                 stop = true;
               }
             } else {

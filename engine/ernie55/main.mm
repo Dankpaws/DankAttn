@@ -273,17 +273,6 @@ static int run_serve(ernie55::Model& m) {
     bool in_think = (r.budget > 0);
     uint32_t think_toks = 0;
 
-    auto sample_step = [&](const float* logits_ptr, bool& ok_out) -> uint32_t {
-      ok_out = true;
-      if (!constrained && !want_lp) return sample_logits(logits_ptr, m.vocab, sc, rng, cand);
-      uint32_t t = m.eos;
-      ok_out = dankattn::sched::sample_masked_or_logprobs_gpu(
-          in, r, gs, m.C, m.logits_buf, 0u, m.vocab, 0.0f, m.pos, t);
-      return t;
-    };
-
-    bool sok = true;
-    uint32_t next_tok = sample_step(lg, sok);
     auto emit_tok = [&](uint32_t t) -> bool {
       if (stop_set.count(t)) { hit_stop = true; return false; }
       send_u32_pair(r.rid, t);
@@ -294,6 +283,28 @@ static int run_serve(ernie55::Model& m) {
       }
       return generated < r.max_new;
     };
+
+    auto sample_step = [&](const float* logits_ptr, bool& ok_out) -> uint32_t {
+      ok_out = true;
+      if (!constrained && !want_lp) return sample_logits(logits_ptr, m.vocab, sc, rng, cand);
+      uint32_t t = m.eos;
+      auto emit_ff = [&](uint32_t ft) -> bool {
+        if (!emit_tok(ft)) return true;
+        return m.pos + 1 >= m.cap || r.cancel.load(std::memory_order_relaxed);
+      };
+      auto feed_ff = [&](const std::vector<uint32_t>& ftoks) -> size_t {
+        double gms = 0;
+        m.step(ftoks, &gms, true, true);
+        cached_ids.insert(cached_ids.end(), ftoks.begin(), ftoks.end());
+        return 0u;
+      };
+      ok_out = dankattn::sched::sample_or_jump_forward_gpu(
+          in, r, gs, m.C, m.logits_buf, 0u, m.vocab, 0.0f, m.pos, t, emit_ff, feed_ff);
+      return t;
+    };
+
+    bool sok = true;
+    uint32_t next_tok = sample_step(lg, sok);
 
     if (sok && emit_tok(next_tok)) {
       while (generated < r.max_new && m.pos + 1 < m.cap && !hit_stop) {

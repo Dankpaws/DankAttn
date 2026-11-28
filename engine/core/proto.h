@@ -13,6 +13,7 @@ namespace dankattn::proto {
 constexpr uint32_t MAGIC_REQ = 0x5355504Fu;     // 'OPUS'
 constexpr uint32_t MAGIC_CANCEL = 0x5843504Fu;  // 'OPCX'
 constexpr uint32_t MAGIC_MASK = 0x4B4D504Fu;    // 'OPMK' (constrained-decoding allowed token IDs)
+constexpr uint32_t MAGIC_FF = 0x4646504Fu;      // 'OPFF' (jump-forward forced token span)
 
 constexpr uint32_t END = 0xFFFFFFFFu;
 constexpr uint32_t ERR = 0xFFFFFFFEu;
@@ -78,7 +79,7 @@ struct OpusReq {
   std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now();
 };
 
-enum class PacketKind { Eof, Cancel, Request, Mask };
+enum class PacketKind { Eof, Cancel, Request, Mask, FastForward };
 
 struct ReadOpts {
   bool keep_images = false;         // true for vision-capable engines (hy4); false drains stream cleanly
@@ -95,7 +96,7 @@ inline PacketKind read_packet(OpusReq& out_req, uint32_t& out_ctrl_rid,
     if (!rd(&out_ctrl_rid, 4, in)) return PacketKind::Eof;
     return PacketKind::Cancel;
   }
-  if (magic == MAGIC_MASK) {
+  if (magic == MAGIC_MASK || magic == MAGIC_FF) {
     uint32_t mh[2];
     if (!rd(mh, 8, in)) return PacketKind::Eof;
     out_ctrl_rid = mh[0];
@@ -107,7 +108,7 @@ inline PacketKind read_packet(OpusReq& out_req, uint32_t& out_ctrl_rid,
       std::vector<uint32_t> skip(n);
       if (!rd(skip.data(), size_t(n) * 4u, in)) return PacketKind::Eof;
     }
-    return PacketKind::Mask;
+    return magic == MAGIC_FF ? PacketKind::FastForward : PacketKind::Mask;
   }
   if (magic != MAGIC_REQ) return PacketKind::Eof;
 

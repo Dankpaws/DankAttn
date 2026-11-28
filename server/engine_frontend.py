@@ -355,6 +355,19 @@ class EngineProc:
         except (OSError, ValueError):
             pass
 
+    def send_ff(self, rid, tok_ids):
+        """Send an OPFF jump-forward forced token span for a constrained-decoding request."""
+        n = len(tok_ids)
+        if not n:
+            return
+        pkt = struct.pack("<III", 0x4646504F, rid, n) + struct.pack(f"<{n}I", *tok_ids)
+        try:
+            with self.write_lock:
+                self.engine.stdin.write(pkt)
+                self.engine.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
     def cancel(self, rid):
         with self.streams_lock:
             if rid not in self.streams:
@@ -813,10 +826,10 @@ def get_vocab_masker(tok) -> VocabMasker:
 
 
 class ConstrainedDriver:
-    """Drives OPMK token-level JSON-schema masks from the demux thread on every emitted token."""
+    """Drives OPMK token-level JSON-schema masks and OPFF jump-forward spans from the demux thread."""
 
     def __init__(self, eng: EngineProc, tok, rf: dict, eos_ids: tuple[int, ...], thinking: bool = False,
-                 think_close: str = ""):
+                 think_close: str = "", allow_ff: bool = True):
         self.eng = eng
         self.tok = tok
         self.masker = get_vocab_masker(tok)
@@ -824,18 +837,40 @@ class ConstrainedDriver:
         self.eos_ids = tuple(int(x) for x in eos_ids if x is not None)
         self.in_think = bool(thinking and think_close)
         self.think_close = think_close
+        self.allow_ff = bool(allow_ff)
         self._think_buf = ""
+        self._skip_ff = 0
         self.rid: int | None = None
+
+    def _send_next(self):
+        if self.rid is None:
+            return
+        if self.allow_ff:
+            fp = self.dfa.forced_prefix()
+            if fp:
+                ff_ids = self.tok.encode(fp, add_special_tokens=False).ids
+                if (
+                    ff_ids
+                    and all(tid not in self.eos_ids for tid in ff_ids)
+                    and self.tok.decode(ff_ids, skip_special_tokens=False) == fp
+                ):
+                    self.dfa.feed(fp)
+                    self._skip_ff += len(ff_ids)
+                    self.eng.send_ff(self.rid, ff_ids)
+        self.eng.send_mask(self.rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
 
     def start(self, rid: int):
         self.rid = rid
         if self.in_think:
             self.eng.send_mask(rid, ())
         else:
-            self.eng.send_mask(rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
+            self._send_next()
 
     def on_token(self, tok_id: int):
         if self.rid is None:
+            return
+        if self._skip_ff > 0:
+            self._skip_ff -= 1
             return
         if tok_id in self.eos_ids:
             return
@@ -849,12 +884,12 @@ class ConstrainedDriver:
                 self._think_buf = ""
                 if tail:
                     self.dfa.feed(tail)
-                self.eng.send_mask(self.rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
+                self._send_next()
             else:
                 self.eng.send_mask(self.rid, ())
             return
         self.dfa.feed(piece)
-        self.eng.send_mask(self.rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
+        self._send_next()
 
 
 def format_logprob_entry(tok, tok_id: int, lp: float, tops) -> dict:
