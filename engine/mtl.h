@@ -5,13 +5,16 @@
 #include <atomic>
 #include <chrono>
 #include <mach-o/dyld.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <unistd.h>
 #import <Metal/Metal.h>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -27,11 +30,86 @@ struct Ctx {
   id<MTLCommandQueue> q;
   std::map<std::string, id<MTLLibrary>> lib_cache;
   std::map<std::string, id<MTLComputePipelineState>> cache;
+  std::map<std::string, id<MTLBinaryArchive>> bin_archives;
+  std::set<std::string> dirty_archives;
+  std::string shader_cache_dir;
+  std::string device_os_tag;
+  uint32_t archive_hits = 0, archive_misses = 0;
+
+  static uint64_t fnv1a_str(const std::string& s, uint64_t h = 1469598103934665603ull) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+  }
+
+  static void mkdir_p(const std::string& dir) {
+    for (size_t i = 1; i < dir.size(); i++) {
+      if (dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0700);
+    }
+    mkdir(dir.c_str(), 0700);
+  }
 
   Ctx() {
     dev = MTLCreateSystemDefaultDevice();
     if (!dev) die("no Metal device");
     q = [dev newCommandQueueWithMaxCommandBufferCount:64];
+    const char* sc = getenv("DANKATTN_SHADER_CACHE");
+    if (sc) {
+      if (std::string(sc) != "0" && *sc) shader_cache_dir = sc;
+    } else if (const char* home = getenv("HOME")) {
+      shader_cache_dir = std::string(home) + "/Library/Caches/DankAttn/metallib";
+    }
+    if (!shader_cache_dir.empty()) {
+      char osver[128] = {};
+      size_t osz = sizeof(osver) - 1;
+      if (sysctlbyname("kern.osversion", osver, &osz, nullptr, 0) != 0) osver[0] = 0;
+      const char* dname = dev.name ? [dev.name UTF8String] : "metal";
+      device_os_tag = std::string(dname) + "|" + std::string(osver) + "|msl4_safe_v1";
+      mkdir_p(shader_cache_dir);
+    }
+  }
+
+  ~Ctx() { flush_shader_cache(); }
+
+  void flush_shader_cache() {
+    if (shader_cache_dir.empty() || dirty_archives.empty()) return;
+    for (const auto& path : dirty_archives) {
+      auto it = bin_archives.find(path);
+      if (it == bin_archives.end() || !it->second) continue;
+      const std::string tmp = path + ".tmp." + std::to_string(getpid());
+      NSURL* url = [NSURL fileURLWithPath:@(tmp.c_str())];
+      NSError* err = nil;
+      if ([it->second serializeToURL:url error:&err]) {
+        rename(tmp.c_str(), path.c_str());
+      } else {
+        unlink(tmp.c_str());
+      }
+    }
+    dirty_archives.clear();
+  }
+
+  id<MTLBinaryArchive> get_archive(const std::string& lib_key, std::string& out_path) {
+    if (shader_cache_dir.empty()) return nil;
+    const uint64_t h = fnv1a_str(lib_key, fnv1a_str(device_os_tag));
+    char buf[32];
+    snprintf(buf, sizeof buf, "/%016llx.metallib", (unsigned long long)h);
+    out_path = shader_cache_dir + buf;
+    auto it = bin_archives.find(out_path);
+    if (it != bin_archives.end()) return it->second;
+    MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+    struct stat st{};
+    if (stat(out_path.c_str(), &st) == 0 && st.st_size > 0) {
+      d.url = [NSURL fileURLWithPath:@(out_path.c_str())];
+    }
+    NSError* err = nil;
+    id<MTLBinaryArchive> ba = [dev newBinaryArchiveWithDescriptor:d error:&err];
+    if (!ba && d.url) {
+      // Corrupt or stale archive from an OS update: recreate cleanly.
+      unlink(out_path.c_str());
+      d.url = nil;
+      ba = [dev newBinaryArchiveWithDescriptor:d error:&err];
+    }
+    if (ba) bin_archives[out_path] = ba;
+    return ba;
   }
 
   size_t allocated = 0;  // bytes handed out by buf()
@@ -86,8 +164,33 @@ struct Ctx {
     }
     id<MTLFunction> f = [lib newFunctionWithName:@(fn.c_str())];
     if (!f) die(("no function " + fn).c_str());
-    id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:f error:&e];
-    if (!p) die(("pipeline " + fn).c_str(), e);
+    id<MTLComputePipelineState> p = nil;
+    std::string apath;
+    id<MTLBinaryArchive> ba = get_archive(lib_key, apath);
+    if (ba) {
+      MTLComputePipelineDescriptor* pd = [MTLComputePipelineDescriptor new];
+      pd.computeFunction = f;
+      pd.binaryArchives = @[ba];
+      NSError* herr = nil;
+      p = [dev newComputePipelineStateWithDescriptor:pd
+                                             options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                          reflection:nil
+                                               error:&herr];
+      if (p) {
+        archive_hits++;
+      } else {
+        archive_misses++;
+        p = [dev newComputePipelineStateWithDescriptor:pd options:MTLPipelineOptionNone reflection:nil error:&e];
+        if (!p) die(("pipeline " + fn).c_str(), e);
+        NSError* aerr = nil;
+        if ([ba addComputePipelineFunctionsWithDescriptor:pd error:&aerr]) {
+          dirty_archives.insert(apath);
+        }
+      }
+    } else {
+      p = [dev newComputePipelineStateWithFunction:f error:&e];
+      if (!p) die(("pipeline " + fn).c_str(), e);
+    }
     cache[key] = p;
     return p;
   }
