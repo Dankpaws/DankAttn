@@ -274,10 +274,47 @@ static inline void rope_pair(thread float& x0, thread float& x1, float c, float 
 }
 
 // ------------------------------------------------------------------ latent cache rows
-// bf16: 576 values (1152 B). kv8 (sparse layers' full caches): 576 int8 then 18 f16 scales, one per 32 dims,
-// in a 640-byte row. Readers take the layer's mode from their args.
+// bf16 (kv8=0): 576 values (1152 B).
+// kv8  (kv8=1): 576 int8 then 18 f16 scales, one per 32 dims, in a 640-byte row.
+// tq4  (kv8=2): TurboQuant 4-bit — Rademacher + H_32 rotated 512-dim kv_nope in 4-bit Lloyd-Max
+//               Gaussian (256 B, 2 nibbles/byte in lat_phys order) + unrotated 64-dim k_rope in
+//               int8 (64 B at offset 256) + 18 f16 scales (36 B at offset 320), padded to 368 B/row.
 constant uint KV8_ROW = 640;
+constant uint KV4_ROW = 368;
+constant float TQ4_LUT[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
+     0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
+};
+static inline float tq_sign(uint c, uint l) {
+  uint h = (c * 32u + l) * 2654435761u;
+  h ^= h >> 16;
+  return (h & 1u) ? -1.0f : 1.0f;
+}
+static inline float tq_hadamard32(float x, ushort l) {
+#pragma clang loop unroll(full)
+  for (ushort s = 1; s < 32; s <<= 1) {
+    const float o = simd_shuffle_xor(x, s);
+    x = (l & s) ? (o - x) : (x + o);
+  }
+  return x * 0.176776695f;  // 1 / sqrt(32)
+}
+static inline uint tq4_quant(float u) {
+  const float ax = abs(u);
+  const uint q = uint(ax >= 0.2582f) + uint(ax >= 0.5224f) + uint(ax >= 0.7996f) + uint(ax >= 1.0993f) +
+                 uint(ax >= 1.4371f) + uint(ax >= 1.8435f) + uint(ax >= 2.4008f);
+  return u >= 0.0f ? (8u + q) : (7u - q);
+}
 static inline float latv(device const uchar* lat, uint row, uint d, uint kv8) {
+  if (kv8 == 2u) {
+    device const uchar* r = lat + size_t(row) * KV4_ROW;
+    const float sc = float(((device const half*)(r + 320))[d >> 5]);
+    if (d < 512u) {
+      const uchar b = r[d >> 1];
+      const uint code = (d & 1u) ? (b >> 4) : (b & 15u);
+      return TQ4_LUT[code] * sc;
+    }
+    return float(as_type<char>(r[256u + (d - 512u)])) * sc;
+  }
   if (kv8) {
     device const uchar* r = lat + size_t(row) * KV8_ROW;
     return float(as_type<char>(r[d])) * float(((device const half*)(r + 576))[d >> 5]);
@@ -286,6 +323,17 @@ static inline float latv(device const uchar* lat, uint row, uint d, uint kv8) {
 }
 // 4 consecutive dims d..d+3 (one scale group) as bf16 operands
 static inline bfloat4 latv4(device const uchar* lat, uint row, uint d, uint kv8) {
+  if (kv8 == 2u) {
+    device const uchar* r = lat + size_t(row) * KV4_ROW;
+    const float sc = float(((device const half*)(r + 320))[d >> 5]);
+    if (d < 512u) {
+      const ushort p = *(device const ushort*)(r + (d >> 1));
+      return bfloat4(bfloat(TQ4_LUT[p & 15u] * sc), bfloat(TQ4_LUT[(p >> 4) & 15u] * sc),
+                     bfloat(TQ4_LUT[(p >> 8) & 15u] * sc), bfloat(TQ4_LUT[(p >> 12) & 15u] * sc));
+    }
+    const char4 c = as_type<char4>(*(device const uint*)(r + 256u + (d - 512u)));
+    return bfloat4(bfloat(float(c.x) * sc), bfloat(float(c.y) * sc), bfloat(float(c.z) * sc), bfloat(float(c.w) * sc));
+  }
   if (kv8) {
     device const uchar* r = lat + size_t(row) * KV8_ROW;
     const char4 c = as_type<char4>(*(device const uint*)(r + d));
@@ -356,7 +404,35 @@ kernel void h4_attn_in(device const float* Y [[buffer(0)]], device const float* 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid < 64) lv[512 + tid] = kr[tid];
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (a.kv8) {
+  if (a.kv8 == 2u) {
+    device uchar* lr = lat + size_t(row) * KV4_ROW;
+    const ushort sgi = tid >> 5, l = tid & 31u;
+    for (uint c = sgi; c < 16u; c += 8u) {
+      float x = lv[c * 32u + l] * tq_sign(c, l);
+      x = tq_hadamard32(x, l);
+      const float rms = sqrt(simd_sum(x * x) / 32.0f);
+      const half sc_h = half(rms);
+      const float sc = float(sc_h);
+      if (l == 0u) ((device half*)(lr + 320))[c] = sc_h;
+      const uint code = tq4_quant(sc > 0.0f ? (x / sc) : 0.0f);
+      const ushort l0 = ushort(lat_logic(2u * (l & 15u)));
+      const ushort l1 = ushort(lat_logic(2u * (l & 15u) + 1u));
+      const uint c0 = simd_shuffle(code, l0);
+      const uint c1 = simd_shuffle(code, l1);
+      if (l < 16u) lr[c * 16u + l] = uchar(c0 | (c1 << 4));
+    }
+    // Keep 64-dim k_rope (chunks 16..17) in int8 to preserve long-context RoPE phase accuracy
+    if (sgi < 2u) {
+      const uint c = 16u + sgi;
+      const float v_log = lv[c * 32u + l];
+      const float mx = simd_max(abs(v_log));
+      const half sc_h = half(mx / 127.0f);
+      const float sc = float(sc_h);
+      if (l == 0u) ((device half*)(lr + 320))[c] = sc_h;
+      const float v_phys = lv[c * 32u + lat_logic(l)];
+      lr[256u + sgi * 32u + l] = as_type<uchar>(char(sc > 0.0f ? clamp(rint(v_phys / sc), -127.0f, 127.0f) : 0.0f));
+    }
+  } else if (a.kv8) {
     device uchar* lr = lat + size_t(row) * KV8_ROW;
     if (tid < 18) {
       float mx = 0.0f;
@@ -739,11 +815,27 @@ kernel void h4_attn_mma(device const float* qlat [[buffer(0)]], device const flo
   const uint nks = sg < 2 ? 3 : 2;  // k-steps sg, sg + 8, sg + 16 (< 18)
   for (uint t = 0; t < nks; t++) {
     const uint ks = sg + 8 * t;
-    for (int i = 0; i < 16; i++) {
-      const uint hh = h0 + m0 + 8 * ((i >> 2) & 1), d = lat_logic(ks * 32 + n0 + (i & 3) + 16 * (i >> 3));
-      const float v = d < 512 ? qlat[(size_t(hh) * a.rs + m) * 512 + d] : qr[(size_t(m) * a.nh + hh) * 64 + d - 512];
-      const bfloat hi = bfloat(v);
-      if (t == 0) qh0[i] = hi; else if (t == 1) qh1[i] = hi; else qh2[i] = hi;
+    if (kv8_ == 2u && ks < 16u) {
+      for (uint r = 0; r < 16; r++) {
+        const uint hh = h0 + r, d = ks * 32 + l;
+        float v = d < 512 ? qlat[(size_t(hh) * a.rs + m) * 512 + d] : qr[(size_t(m) * a.nh + hh) * 64 + d - 512];
+        Sp[sg][r][l] = tq_hadamard32(v * tq_sign(ks, l), l);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < 16; i++) {
+        const uint r = m0 + 8 * ((i >> 2) & 1);
+        const uint dl = lat_logic(n0 + (i & 3) + 16 * (i >> 3));
+        const bfloat hi = bfloat(Sp[sg][r][dl]);
+        if (t == 0) qh0[i] = hi; else if (t == 1) qh1[i] = hi; else qh2[i] = hi;
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+      for (int i = 0; i < 16; i++) {
+        const uint hh = h0 + m0 + 8 * ((i >> 2) & 1), d = lat_logic(ks * 32 + n0 + (i & 3) + 16 * (i >> 3));
+        const float v = d < 512 ? qlat[(size_t(hh) * a.rs + m) * 512 + d] : qr[(size_t(m) * a.nh + hh) * 64 + d - 512];
+        const bfloat hi = bfloat(v);
+        if (t == 0) qh0[i] = hi; else if (t == 1) qh1[i] = hi; else qh2[i] = hi;
+      }
     }
   }
   for (int i = 0; i < 16; i++) { o0[i] = 0.0f; o1[i] = 0.0f; }
@@ -805,6 +897,33 @@ kernel void h4_attn_mma(device const float* qlat [[buffer(0)]], device const flo
   }
   if (a.direct) {
 #pragma clang fp contract(off)  // h4_attn_merge rounds w * l before adding the sink term (a simd_sum between)
+    if (kv8_ == 2u) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);  // wait for all sgs to finish reading Sp from last j0 tile
+      for (uint nc = 0; nc < 2; nc++) {
+        const uint c = sg * 2 + nc;
+        for (int r = 0; r < 2; r++) {
+          const uint hh = h0 + m0 + 8 * r;
+          const float sk = sinks[hh];
+          const float M_ = max(lsum[r] > 0.0f ? mx[r] : -INFINITY, sk);
+          const float w = lsum[r] > 0.0f ? exp(mx[r] - M_) : 0.0f;
+          const float inv = 1.0f / (w * lsum[r] + exp(sk - M_));
+          for (int i = 0; i < 16; i++) {
+            if (((i >> 2) & 1) != r) continue;
+            const uint dn = n0 + (i & 3) + 16 * (i >> 3);
+            const float v = w != 0.0f ? 0.0f + w * (nc == 0 ? o0[i] : o1[i]) : 0.0f;
+            Sp[sg][m0 + 8 * r][dn] = v * inv;
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint rh = 0; rh < 16; rh++) {
+          const float v = tq_hadamard32(Sp[sg][rh][l], l) * tq_sign(c, l);
+          device bfloat* fr = ofrag + size_t(h0 + rh) * a.rsf * 512;
+          fr[frag_off(m, c * 32 + l, 512)] = bfloat(v);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      return;
+    }
     for (int r = 0; r < 2; r++) {
       const uint hh = h0 + m0 + 8 * r;
       const float sk = sinks[hh];
@@ -836,7 +955,7 @@ kernel void h4_attn_mma(device const float* qlat [[buffer(0)]], device const flo
 }
 
 // merge the splits with the sink and write the per-head frag for vb: [head][16 rows][512]
-struct MergeArgs { uint M, nh, splits, rs; };
+struct MergeArgs { uint M, nh, splits, rs, kv_mode; };
 kernel void h4_attn_merge(device const float* part [[buffer(0)]], device const float* sinks [[buffer(1)]],
                           device bfloat* ofrag [[buffer(2)]], constant MergeArgs& a [[buffer(3)]],
                           uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
@@ -858,7 +977,12 @@ kernel void h4_attn_merge(device const float* part [[buffer(0)]], device const f
   for (uint d = tid; d < 512; d += 128) {
     float v = 0.0f;
     for (uint s = 0; s < a.splits; s++) if (wsp[s] != 0.0f) v += wsp[s] * pp[s * 514 + 2 + d];
-    fr[frag_off(m, d, 512)] = bfloat(v * inv);
+    v *= inv;
+    if (a.kv_mode == 2u) {
+      const uint c = d >> 5, lane = d & 31u;
+      v = tq_hadamard32(v, lane) * tq_sign(c, lane);
+    }
+    fr[frag_off(m, d, 512)] = bfloat(v);
   }
 }
 

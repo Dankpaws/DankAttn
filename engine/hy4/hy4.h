@@ -62,7 +62,7 @@ using dankattn::Raw;
 
 struct Layer {
   bool sparse = false, dense = false, eng = false;
-  bool kv8 = false;  // latent cache rows int8 + f16 scales (640 B) instead of bf16 (1152 B); sparse layers
+  uint32_t kv_mode = 0;  // latent cache row format: 0=bf16 (1152 B), 1=kv8 (640 B), 2=tq4 (336 B); sparse layers
   uint32_t nh = 0;
   Raw ahc_fn, ahc_base, ahc_scale, mhc_fn, mhc_base, mhc_scale, attn_norm, ffn_norm;
   Lin in, gate, qb, kb, vb, o;
@@ -233,13 +233,13 @@ struct Model {
   uint32_t mmp_nf_ = 2u;
   uint32_t grpmmp_nf_ = gch_ >= 2 ? 2u : 1u;
   uint32_t selmax = SELMAX;  // selection list stride (HY4_DENSE: the capacity)
-  bool kv8 = cfg().kv8;  // sparse layers' latent caches in int8 (default on)
+  uint32_t kv_mode = cfg().kv_mode();  // sparse layers' latent caches: 0=bf16, 1=kv8 (default), 2=tq4 (HY4_KV4=1)
   bool paged_kv = cfg().paged_kv;  // shared 128-token paged KV block pool + radix prefix tree
   dankattn::KvRadixPool kv_pool;
   void ensure_kv_blocks(int slot, uint32_t need_pos);
   void commit_kv_blocks(int slot);
   void release_kv_blocks(int slot);
-  size_t lat_row(const Layer& l) const { return l.kv8 ? 640 : 1152; }
+  size_t lat_row(const Layer& l) const { return l.kv_mode == 2 ? 368 : (l.kv_mode == 1 ? 640 : 1152); }
   const Raw* ynorm_pending = nullptr;
   uint32_t cap = 0, pos = 0;
   // sampling: temp <= 0 greedy; else Gumbel-max keyed by (seed, position); drafts draw with the same keys

@@ -17,6 +17,8 @@ struct Config {
   uint32_t mp = env_u("HY4_MP", 1024);
   uint32_t pf_dec_chunk = env_u("HY4_PF_DEC_CHUNK", 256);  // prefill chunk cap when decode lanes are active
   bool kv8 = env_b("HY4_KV8", true);
+  bool kv4 = env_b("HY4_KV4", false);  // TurboQuant 4-bit (Hadamard H_32 + Lloyd-Max Gaussian, 336 B/row)
+  uint32_t kv_mode() const { return kv4 ? 2u : (kv8 ? 1u : 0u); }
   bool paged_kv = env_b("HY4_PAGED_KV", false);  // shared 128-token paged KV pool + radix prefix tree across slots
   bool dense_attn = env_set("HY4_DENSE");
   uint32_t gch = env_u("HY4_GCH", 4);

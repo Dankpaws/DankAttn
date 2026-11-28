@@ -263,7 +263,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
       l.idx_kgp = raw(d + ".idx.kgp");
       l.idx_ape = raw(d + ".idx.ape");
       l.idx_key_norm = raw(d + ".idx.key_norm");
-      l.kv8 = kv8;
+      l.kv_mode = kv_mode;
       l.lat = C.buf(size_t(cap) * lat_row(l));
       l.tokring = C.buf(size_t(TOKR) * 128 * 4);
       l.bk = C.buf(size_t(cap / 4) * 128 * 2);
@@ -583,7 +583,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
   }
   P["h4_attn_mma_swa"] = C.pipe(hk, "h4_attn_mma", {{"ATT_SLIDING", "1"}, {"ATT_KV8", "0"}});
   {
-    std::map<std::string, std::string> ddefs = {{"ATT_SLIDING", "0"}, {"ATT_KV8", kv8 ? "1" : "0"}};
+    std::map<std::string, std::string> ddefs = {{"ATT_SLIDING", "0"}, {"ATT_KV8", std::to_string(kv_mode)}};
     if (paged_kv) ddefs["PAGED_KV"] = "1";
     P["h4_attn_mma_dsa"] = C.pipe(hk, "h4_attn_mma", ddefs);
   }
@@ -829,7 +829,7 @@ Model::Model(const std::string& pack, uint32_t capacity) : dir(pack), cap(capaci
       dispatch_resume(tm);
     }
   }
-  for (uint64_t v : {uint64_t(PREFIX_LAYOUT), uint64_t(kv8), uint64_t(window), uint64_t(RING), uint64_t(TOKR), uint64_t(nL)}) {
+  for (uint64_t v : {uint64_t(PREFIX_LAYOUT), uint64_t(kv_mode), uint64_t(window), uint64_t(RING), uint64_t(TOKR), uint64_t(nL)}) {
     fingerprint ^= v + 0x9E3779B97F4A7C15ull + (fingerprint << 6) + (fingerprint >> 2);
   }
   mapped_bytes = total;
@@ -1726,7 +1726,7 @@ struct PoolArgs { uint32_t M, p0; float eps; };
 struct ScoreArgs { uint32_t M, p0, dense_max, gmax, row0; };
 struct TopArgs { uint32_t M, p0, dense_max, gmax, ktop, selmax, row0; };
 struct AttnArgs { uint32_t M, nh, p0, sliding, window, ring, splits, selmax; float scale; uint32_t rs; uint32_t kv8; uint32_t direct = 0, rsf = 0; };
-struct MergeArgs { uint32_t M, nh, splits, rs; };
+struct MergeArgs { uint32_t M, nh, splits, rs, kv_mode; };
 struct GateArgs { uint32_t M, nh, rs; };
 struct RouteArgs { uint32_t M, E, topk, Nin, lat, I; float scale; };
 struct PlanArgs { uint32_t M, topk, E; };
@@ -1799,7 +1799,7 @@ void Model::ensure_lane_pipes() {
   P["h4_idx_topk_lanes"] = C.pipe(hk, "h4_idx_topk", {{"LANES", "1"}});
   P["h4_attn_mma_swa_lanes"] = C.pipe(hk, "h4_attn_mma", {{"LANES", "1"}, {"ATT_SLIDING", "1"}, {"ATT_KV8", "0"}});
   {
-    std::map<std::string, std::string> ddefs = {{"LANES", "1"}, {"ATT_SLIDING", "0"}, {"ATT_KV8", kv8 ? "1" : "0"}};
+    std::map<std::string, std::string> ddefs = {{"LANES", "1"}, {"ATT_SLIDING", "0"}, {"ATT_KV8", std::to_string(kv_mode)}};
     if (paged_kv) ddefs["PAGED_KV"] = "1";
     P["h4_attn_mma_dsa_lanes"] = C.pipe(hk, "h4_attn_mma", ddefs);
   }
@@ -1915,7 +1915,7 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
   const uint32_t Nin = l.in.N, kvoff = l.in.rows.at("kva").first;
   {
     KvArgs a{M, Nin, p0, l.sparse ? 0u : RING, l.sparse ? 1u : 0u, l.sparse ? l.in.rows.at("idxk").first : 0,
-             l.sparse ? l.in.rows.at("idxw").first : 0, kvoff, eps, 1.0f / sqrtf(16.0f * 128.0f), l.kv8 ? 1u : 0u};
+             l.sparse ? l.in.rows.at("idxw").first : 0, kvoff, eps, 1.0f / sqrtf(16.0f * 128.0f), l.kv_mode};
     e = rc.op("attn_in");
     [e setComputePipelineState:pipe(lanes ? "h4_attn_in_lanes" : "h4_attn_in")];
     [e setBuffer:Yin offset:0 atIndex:0];
@@ -2031,7 +2031,7 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
     // fixed per layer type for every decode M (verify rows keep decode bits); sliding layers see <= 512 keys
     // (sweep 2026-11-18, 3k context: 8 / 16 beat 32 / 32 by 0.4 / 3.9 / 4.4 ms at 1 / 4 / 6 rows)
     const uint32_t splits = pf ? 1 : (l.sparse ? cfg().as_dsa : cfg().as_swa);
-    AttnArgs a{M, l.nh, p0, l.sparse ? 0u : 1u, window, l.sparse ? 0u : RING, splits, selmax, 1.0f / 16.0f, rsy, l.kv8 ? 1u : 0u};
+    AttnArgs a{M, l.nh, p0, l.sparse ? 0u : 1u, window, l.sparse ? 0u : RING, splits, selmax, 1.0f / 16.0f, rsy, l.kv_mode};
     const bool direct = pf;  // prefill: the one split's merge inside the attention kernel
     a.direct = direct ? 1u : 0u;
     a.rsf = rsf;
@@ -2057,7 +2057,7 @@ void Model::encode_layer(Rec& rc, Layer& l, uint32_t li, uint32_t M, uint32_t p0
     }
     [e dispatchThreadgroups:MTLSizeMake(l.nh / 16, M, splits) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (!direct) {
-    MergeArgs ma{M, l.nh, splits, rsf};
+    MergeArgs ma{M, l.nh, splits, rsf, l.kv_mode};
     e = rc.op("attn_merge");
     [e setComputePipelineState:pipe("h4_attn_merge")];
     [e setBuffer:part offset:0 atIndex:0];
@@ -2638,7 +2638,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
     const bool ov_dgate = d.in.ksplit == 1 || d.gate.ksplit == 1;
     mm(rc, "d_gate", d.gate, xn_frag, Yg, W, nil, nil, 0, 0, 0, false, nil, 0, 1, false, !ov_dgate);
     {
-      KvArgs a{W, d.in.N, p, 0, 0, 0, 0, d.in.rows.at("kva").first, eps, 1.0f, t.kv8 ? 1u : 0u};
+      KvArgs a{W, d.in.N, p, 0, 0, 0, 0, d.in.rows.at("kva").first, eps, 1.0f, t.kv_mode};
       e = rc.op("d_attn_in_k");
       [e setComputePipelineState:pipe("h4_attn_in")];
       [e setBuffer:Yin offset:0 atIndex:0];
@@ -2681,7 +2681,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       [e dispatchThreads:MTLSizeMake(DSELMAX, W, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     {
-      AttnArgs a{W, d.nh, p, 0, window, 0, as_draft, DSELMAX, 1.0f / 16.0f, 16, t.kv8 ? 1u : 0u};
+      AttnArgs a{W, d.nh, p, 0, window, 0, as_draft, DSELMAX, 1.0f / 16.0f, 16, t.kv_mode};
       e = rc.op("d_attn");
       [e setComputePipelineState:pipe("h4_attn_mma_dsa")];
       [e setBuffer:qlat offset:0 atIndex:0];
@@ -2695,7 +2695,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       [e setBuffer:ofrag offset:0 atIndex:8];
       if (paged_kv) [e setBuffer:slots_[cur_slot].kv_tab offset:0 atIndex:15];
       [e dispatchThreadgroups:MTLSizeMake(d.nh / 16, W, as_draft) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-      MergeArgs ma{W, d.nh, as_draft, 16};
+      MergeArgs ma{W, d.nh, as_draft, 16, t.kv_mode};
       e = rc.op("d_attn_merge");
       [e setComputePipelineState:pipe("h4_attn_merge")];
       [e setBuffer:part offset:0 atIndex:0];
@@ -2919,7 +2919,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
       }
       mm(rc, "d_ac_kb", df_ac_kb, qn_frag, qlat, 1, head_slots, nsh_ac, df_ac_nh, 16 * 192 / 8, 16 * 512);
       {
-        AttnArgs a{1, df_ac_nh, p + slot, 0, window, 0, as_draft, selmax, 1.0f / 16.0f, 16, t_ac.kv8 ? 1u : 0u};
+        AttnArgs a{1, df_ac_nh, p + slot, 0, window, 0, as_draft, selmax, 1.0f / 16.0f, 16, t_ac.kv_mode};
         e = rc.op("d_ac_attn");
         [e setComputePipelineState:pipe("h4_attn_mma_dsa")];
         [e setBuffer:qlat offset:0 atIndex:0];
@@ -2932,7 +2932,7 @@ std::vector<uint32_t> Model::draft(uint32_t anchor, uint32_t src_x, uint32_t src
         setb(e, df_ac_sinks, 7);
         [e setBuffer:ofrag offset:0 atIndex:8];
         [e dispatchThreadgroups:MTLSizeMake(df_ac_nh / 16, 1, as_draft) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        MergeArgs ma{1, df_ac_nh, as_draft, 16};
+        MergeArgs ma{1, df_ac_nh, as_draft, 16, t_ac.kv_mode};
         e = rc.op("d_ac_merge");
         [e setComputePipelineState:pipe("h4_attn_merge")];
         [e setBuffer:part offset:0 atIndex:0];
@@ -3224,7 +3224,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
     const bool ov_dgate = d.in.ksplit == 1 || d.gate.ksplit == 1;
     mm(rc, "dl_gate", d.gate, xn_frag, Yg, M, nil, nil, 0, 0, 0, false, nil, 0, 1, false, !ov_dgate);
     {
-      KvArgs a{M, d.in.N, 0, 0, 0, 0, 0, d.in.rows.at("kva").first, eps, 1.0f, t.kv8 ? 1u : 0u};
+      KvArgs a{M, d.in.N, 0, 0, 0, 0, 0, d.in.rows.at("kva").first, eps, 1.0f, t.kv_mode};
       e = rc.op("dl_attn_in_k");
       [e setComputePipelineState:pipe("h4_attn_in_lanes")];
       [e setBuffer:Yin offset:0 atIndex:0];
@@ -3267,7 +3267,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       [e dispatchThreads:MTLSizeMake(DSELMAX, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     {
-      AttnArgs a{M, d.nh, 0, 0, window, 0, as_draft, DSELMAX, 1.0f / 16.0f, 16, t.kv8 ? 1u : 0u};
+      AttnArgs a{M, d.nh, 0, 0, window, 0, as_draft, DSELMAX, 1.0f / 16.0f, 16, t.kv_mode};
       e = rc.op("dl_attn");
       [e setComputePipelineState:pipe("h4_attn_mma_dsa_lanes")];
       [e setBuffer:qlat offset:0 atIndex:0];
@@ -3283,7 +3283,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       [e setBuffer:row_lane_b offset:0 atIndex:13];
       [e setBuffer:row_pos_b offset:0 atIndex:14];
       [e dispatchThreadgroups:MTLSizeMake(d.nh / 16, M, as_draft) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-      MergeArgs ma{M, d.nh, as_draft, 16};
+      MergeArgs ma{M, d.nh, as_draft, 16, t.kv_mode};
       e = rc.op("dl_attn_merge");
       [e setComputePipelineState:pipe("h4_attn_merge")];
       [e setBuffer:part offset:0 atIndex:0];
@@ -3502,7 +3502,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
       id<MTLBuffer> nsh_ac = gate ? ac_nh_gate : (df_ac_nh == 64 ? nslots64 : nslots32);
       mm(rc, "dl_ac_kb", df_ac_kb, qn_frag, qlat, n, head_slots, nsh_ac, df_ac_nh, 16 * 192 / 8, 16 * 512);
       {
-        AttnArgs a{n, df_ac_nh, 0, 0, window, 0, as_draft, DSELMAX, 1.0f / 16.0f, 16, t_ac.kv8 ? 1u : 0u};
+        AttnArgs a{n, df_ac_nh, 0, 0, window, 0, as_draft, DSELMAX, 1.0f / 16.0f, 16, t_ac.kv_mode};
         e = rc.op("dl_ac_attn");
         [e setComputePipelineState:pipe("h4_attn_mma_dsa_lanes")];
         [e setBuffer:qlat offset:0 atIndex:0];
@@ -3518,7 +3518,7 @@ std::vector<Model::DraftRes> Model::draft_lanes(const std::vector<DraftReq>& req
         [e setBuffer:dl_ac_rlane offset:0 atIndex:13];
         [e setBuffer:row_pos_b offset:0 atIndex:14];
         [e dispatchThreadgroups:MTLSizeMake(df_ac_nh / 16, n, as_draft) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        MergeArgs ma{n, df_ac_nh, as_draft, 16};
+        MergeArgs ma{n, df_ac_nh, as_draft, 16, t_ac.kv_mode};
         e = rc.op("dl_ac_merge");
         [e setComputePipelineState:pipe("h4_attn_merge")];
         [e setBuffer:part offset:0 atIndex:0];
