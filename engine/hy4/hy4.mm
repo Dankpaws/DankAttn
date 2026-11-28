@@ -2254,7 +2254,12 @@ std::vector<uint32_t> Model::step(const std::vector<uint32_t>& toks, double* gpu
   std::vector<id<MTLCommandBuffer>> sent;  // early commits: the GPU starts while later layers are encoded
   const uint32_t chunk_layers = cfg().commit_layers;
   auto commit_now = [&]() {
-    if (use_m4) return;
+    if (use_m4) {
+      rc.mtl4_e = mtl4.flush();
+      rc.mtl4_dispatched = false;
+      if (!h_commit0) h_commit0 = host_now();
+      return;
+    }
     if (rc.e) { [rc.e endEncoding]; rc.e = nil; }
     [rc.cb commit];
     if (!h_commit0) h_commit0 = host_now();

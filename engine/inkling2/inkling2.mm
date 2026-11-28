@@ -1452,7 +1452,11 @@ std::vector<uint32_t> Model::step_core(const std::vector<uint32_t>& ids, const s
   static const bool route_fast = !(getenv("INK_ROUTE_FAST") && atoi(getenv("INK_ROUTE_FAST")) == 0);
   std::vector<id<MTLCommandBuffer>> done_cbs;
   auto early_commit = [&]() {
-    if (prof || !early || use_m4) return;
+    if (prof || !early) return;
+    if (use_m4) {
+      enc = mtl4.flush();
+      return;
+    }
     [enc endEncoding];
     [cb commit];
     done_cbs.push_back(cb);

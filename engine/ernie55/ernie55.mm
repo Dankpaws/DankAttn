@@ -704,7 +704,10 @@ const float* Model::step(const std::vector<uint32_t>& toks, double* gpu_ms,
   static const bool no_barr = getenv("E5_NO_BARR") && atoi(getenv("E5_NO_BARR")) != 0;
   auto barr = [&]() { if (!use_m4 && !no_barr) [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
   auto flush_cb = [&]() {
-    if (use_m4) return;
+    if (use_m4) {
+      e = mtl4.flush();
+      return;
+    }
     [e endEncoding];
     [cb commit];
     cbs.push_back(cb);
