@@ -455,16 +455,23 @@ class VocabMasker:
         vocab = tok.get_vocab()
         self.size = max(vocab.values()) + 1 if vocab else 0
         self.id_to_str: list[str] = [""] * self.size
+        self.by_first: dict[str, list[tuple[int, str]]] = {}
         for s, tid in vocab.items():
-            self.id_to_str[tid] = tok.decode([tid], skip_special_tokens=False)
+            dec = tok.decode([tid], skip_special_tokens=False)
+            self.id_to_str[tid] = dec
+            if dec:
+                self.by_first.setdefault(dec[0], []).append((tid, dec))
 
     def allowed_ids(self, dfa: JsonSchemaDFA, eos_ids: tuple[int, ...] = ()) -> list[int]:
         if dfa.is_complete():
             return list(eos_ids)
         out: list[int] = []
-        for tid, s in enumerate(self.id_to_str):
-            if s and dfa.accepts_token(s):
-                out.append(tid)
+        for ch, items in self.by_first.items():
+            if not dfa.accepts_token(ch):
+                continue
+            for tid, s in items:
+                if len(s) == 1 or dfa.accepts_token(s):
+                    out.append(tid)
         return out
 
 

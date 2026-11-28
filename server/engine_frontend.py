@@ -848,12 +848,12 @@ class ConstrainedDriver:
                 self.in_think = False
                 self._think_buf = ""
                 if tail:
-                    self.dfa.advance_str(tail)
+                    self.dfa.feed(tail)
                 self.eng.send_mask(self.rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
             else:
                 self.eng.send_mask(self.rid, ())
             return
-        self.dfa.advance_str(piece)
+        self.dfa.feed(piece)
         self.eng.send_mask(self.rid, self.masker.allowed_ids(self.dfa, self.eos_ids))
 
 
